@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -35,22 +34,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _warn_if_missing_binaries(exec_cfg) -> None:
-    """Print actionable warnings for missing profiler tools (do not exit)."""
-    for attr, label in [
-        ("nvcc_bin", "nvcc (CUDA compiler)"),
-        ("ncu_bin",  "ncu  (Nsight Compute)"),
-        ("nsys_bin", "nsys (Nsight Systems)"),
-    ]:
-        name = getattr(exec_cfg, attr)
-        if shutil.which(name) is None:
-            print(
-                f"[warn] {label} not found on PATH ('{name}'). "
-                f"Tools using this backend will return errors. "
-                f"Set AGENT_{attr.upper()} if it is installed elsewhere.",
-                file=sys.stderr,
-            )
-
 
 def main() -> None:
     # Load .env before any config reads
@@ -61,7 +44,7 @@ def main() -> None:
     # Import after load_dotenv so env vars are available
     from agent.loop import AgentLoop
     from agent.tool_registry import build_default_registry
-    from agent.types import AgentContext, MemoryStore, Task
+    from agent.types import AgentContext, CircuitBreaker, MemoryStore, Task
     from config import AgentConfig, ExecutorConfig, LLMConfig
     from executor import Executor
     from llm.client import LLMClient
@@ -79,8 +62,6 @@ def main() -> None:
         agent_cfg.max_iterations = args.max_iterations
     if args.keep_workspace:
         agent_cfg.keep_workspace = True
-
-    _warn_if_missing_binaries(exec_cfg)
 
     # --- Load spec --------------------------------------------------------
     spec_path = Path(args.spec)
@@ -106,12 +87,19 @@ def main() -> None:
         constraints={},
     )
 
-    ctx = AgentContext(task=task, memory=MemoryStore())
+    ctx = AgentContext(
+        task=task,
+        memory=MemoryStore(),
+        circuit_breaker=CircuitBreaker(threshold=agent_cfg.circuit_breaker_threshold),
+    )
 
     executor = Executor(
         exec_cfg,
         on_job_complete=lambda r: ctx.job_history.append(r.to_log_dict()),
     )
+    # Always print auto-detection notes so users know what was found/missing
+    for note in executor.detect_notes:
+        print(note, file=sys.stderr)
 
     llm      = LLMClient(llm_cfg)
     registry = build_default_registry(executor)

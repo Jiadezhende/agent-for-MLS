@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 import jsonschema
 
-from agent.types import AgentContext
+from agent.types import AgentContext, CircuitBreaker
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +26,29 @@ class _Terminated(Exception):
     def __init__(self, summary: str) -> None:
         self.summary = summary
         super().__init__(summary)
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker — only applies to executor tools
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_TOOL_NAMES: frozenset[str] = frozenset({
+    "run_cuda_probe",
+    "profile_with_ncu",
+    "profile_with_nsys",
+    "profile_with_torch",
+})
+
+
+def _update_circuit_breaker(cb: CircuitBreaker, tool: str, result: dict) -> None:
+    """Update circuit breaker state based on a tool result dict."""
+    status = result.get("status", "")
+    kind = result.get("error", "")
+    if status == "error" and kind:
+        cb.record_failure(tool, kind)
+    elif status == "done":
+        cb.record_success(tool)
+    # timed_out does not count toward the circuit — it may just be a slow kernel
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +98,30 @@ class ToolRegistry:
             return {"error": "unknown_tool", "name": name,
                     "hint": f"Valid tools: {list(self._entries.keys())}"}
 
-        # 2. Ensure args_dict is a dict (LLM sometimes sends null for no-arg tools)
+        # 2. Circuit breaker pre-call check (executor tools only)
+        if name in _EXECUTOR_TOOL_NAMES:
+            open_for_tool = [(t, ek) for (t, ek) in ctx.circuit_breaker.open_circuits() if t == name]
+            if open_for_tool:
+                open_kinds = [ek for _, ek in open_for_tool]
+                return {
+                    "status": "circuit_open",
+                    "tool": name,
+                    "open_error_kinds": open_kinds,
+                    "failure_counts": {
+                        ek: ctx.circuit_breaker.failure_count(name, ek) for ek in open_kinds
+                    },
+                    "message": (
+                        f"Tool '{name}' has failed {ctx.circuit_breaker.threshold}+ times "
+                        f"with errors {open_kinds}. Circuit is open — stop retrying this approach. "
+                        f"Use a different tool or call submit_results with current findings."
+                    ),
+                }
+
+        # 3. Ensure args_dict is a dict (LLM sometimes sends null for no-arg tools)
         if args_dict is None:
             args_dict = {}
 
-        # 3. Schema validation
+        # 4. Schema validation
         param_schema = entry.schema.get("function", {}).get("parameters", {})
         if param_schema:
             validator = jsonschema.Draft202012Validator(
@@ -95,7 +137,7 @@ class ToolRegistry:
                     "path": list(first.absolute_path),
                 }
 
-        # 4. Inject ctx if needed
+        # 5. Inject ctx if needed
         try:
             if entry.needs_ctx:
                 result = entry.fn(ctx, **args_dict)
@@ -106,9 +148,14 @@ class ToolRegistry:
         except Exception as exc:  # noqa: BLE001
             return {"error": exc.__class__.__name__, "detail": str(exc)}
 
-        # 5. Ensure the result is JSON-serializable
+        # 6. Ensure the result is JSON-serializable
         if not isinstance(result, dict):
             result = {"result": result}
+
+        # 7. Circuit breaker post-call update (executor tools only)
+        if name in _EXECUTOR_TOOL_NAMES:
+            _update_circuit_breaker(ctx.circuit_breaker, name, result)
+
         return result
 
 

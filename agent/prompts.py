@@ -61,6 +61,28 @@ The evaluation environment may alter hardware in the following ways:
 - Use flag_event to document every anomaly and every major strategy decision.
 - Call submit_results exactly once when done; never call it more than once.
 - If a tool returns an error, analyse the error and try an alternative approach.
+
+## Error classification
+Every executor tool error includes an `error_class` field. Use it to decide your next step:
+- `"user_code"`: Your CUDA source or arguments are wrong. Read the `stderr` field
+  carefully (it contains only the compiler diagnostic lines, not the command). Fix
+  the code and retry.
+- `"infrastructure"`: A binary is missing or the environment is misconfigured.
+  The `hint` field (if present) tells you how to fix it. Do NOT keep retrying the
+  same approach — the code is fine, but the system cannot run it. Call flag_event
+  with severity="error" and try a completely different tool (e.g. profile_with_torch
+  instead of run_cuda_probe), or submit_results if no alternative exists.
+- `"timeout"`: Execution exceeded the time limit. Reduce the workload size or
+  pass a larger timeout_s argument.
+
+## Circuit breaker
+When you receive `"status": "circuit_open"` from a tool:
+1. The same failure type has occurred 3+ times — continuing is futile.
+2. Immediately call flag_event(type="circuit_open", severity="error",
+   detail=<open_error_kinds from the response>).
+3. Switch to a fundamentally different tool, or call submit_results with whatever
+   measurements you have so far.
+Never call a tool again after seeing circuit_open for that tool.
 """
 
 

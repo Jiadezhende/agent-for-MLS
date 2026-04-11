@@ -56,12 +56,14 @@ class LLMConfig:
 class AgentConfig:
     max_iterations: int = 40
     keep_workspace: bool = False
+    circuit_breaker_threshold: int = 3  # open circuit after N consecutive failures
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
         return cls(
             max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS") or "40"),
             keep_workspace=(os.getenv("AGENT_KEEP_WORKSPACE") or "false").lower() == "true",
+            circuit_breaker_threshold=int(os.getenv("AGENT_CB_THRESHOLD") or "3"),
         )
 
 

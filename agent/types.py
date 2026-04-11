@@ -5,6 +5,7 @@ No business logic; no imports from the rest of this project.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,54 @@ class MemoryStore:
 
 
 # ---------------------------------------------------------------------------
+# CircuitBreaker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CircuitBreaker:
+    """Tracks consecutive failures per (tool_name, error_kind) pair.
+
+    The circuit opens after `threshold` consecutive failures of the same pair.
+    Any successful result from that tool resets all its counters.
+    Only executor tools participate (enforced in tool_registry.py).
+    """
+    threshold: int = 3
+    _counts: dict = field(default_factory=lambda: defaultdict(int))
+    _open: set = field(default_factory=set)
+
+    def record_failure(self, tool: str, kind: str) -> bool:
+        """Record a failure. Returns True if the circuit just opened."""
+        key = (tool, kind)
+        self._counts[key] += 1
+        if self._counts[key] >= self.threshold and key not in self._open:
+            self._open.add(key)
+            return True
+        return False
+
+    def record_success(self, tool: str) -> None:
+        """Reset all failure counts for this tool (any error_kind)."""
+        for k in [k for k in list(self._counts) if k[0] == tool]:
+            self._counts[k] = 0
+            self._open.discard(k)
+
+    def is_open(self, tool: str, kind: str) -> bool:
+        return (tool, kind) in self._open
+
+    def open_circuits(self) -> list[tuple[str, str]]:
+        return list(self._open)
+
+    def failure_count(self, tool: str, kind: str) -> int:
+        return self._counts.get((tool, kind), 0)
+
+    def serialize(self) -> dict:
+        """JSON-serializable snapshot (tuple keys → strings)."""
+        return {
+            "open_circuits": [f"{t}:{e}" for t, e in self._open],
+            "failure_counts": {f"{t}:{e}": v for (t, e), v in self._counts.items() if v > 0},
+        }
+
+
+# ---------------------------------------------------------------------------
 # AgentContext
 # ---------------------------------------------------------------------------
 
@@ -108,6 +157,7 @@ class AgentContext:
     reasoning_log: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
     job_history: list[dict] = field(default_factory=list)
+    circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
 
     def serialize(self) -> dict:
         """Produce the dict written to results.json and reasoning_log.json."""
@@ -117,4 +167,5 @@ class AgentContext:
             "events": self.events,
             "job_history": self.job_history,
             "memory": self.memory.dump(),
+            "circuit_breaker": self.circuit_breaker.serialize(),
         }

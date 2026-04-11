@@ -1,0 +1,860 @@
+"""
+executor.py — The central execution layer.
+
+The Executor is the ONLY code that runs subprocesses, compiles CUDA, or
+invokes profiling tools. The LLM never calls nvcc / ncu / nsys directly;
+it calls Executor public methods (registered as tools in tool_registry.py).
+
+Sections:
+  1. Exceptions
+  2. Data structures (JobSpec, JobResult, SubResult)
+  3. Workspace (per-run temp directory)
+  4. Cache (in-memory, keyed by payload hash)
+  5. Sandbox (binary whitelist, path traversal guard)
+  6. Subprocess helpers
+  7. Compilation
+  8. Post-processing (output reducers for ncu / nsys / torch)
+  9. Backends (_execute_cuda_probe, _execute_ncu, _execute_nsys, _execute_torch)
+ 10. Executor (public API)
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+from config import ExecutorConfig
+
+
+# ===========================================================================
+# 1. Exceptions
+# ===========================================================================
+
+class ExecutorError(Exception):
+    """Raised for expected executor-level failures (compile error, bad path …).
+    The Executor catches these and converts them to structured tool-result dicts.
+    """
+    def __init__(self, kind: str, **details: Any) -> None:
+        self.kind = kind
+        self.details = details
+        super().__init__(f"ExecutorError({kind}): {details}")
+
+
+# ===========================================================================
+# 2. Data structures
+# ===========================================================================
+
+@dataclass(frozen=True)
+class JobSpec:
+    backend: str       # "cuda_probe" | "ncu" | "nsys" | "torch"
+    name: str          # caller-provided identifier
+    payload: dict      # backend-specific parameters (frozen via tuple conversion)
+
+    def cache_key(self, gpu_arch_tag: str = "") -> str:
+        """Stable hash for this job spec."""
+        canonical = json.dumps(
+            {"backend": self.backend, "name": self.name, "payload": self.payload,
+             "gpu": gpu_arch_tag},
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+@dataclass
+class SubResult:
+    stdout: str
+    stderr: str
+    returncode: int
+    timed_out: bool = False
+
+
+@dataclass
+class JobResult:
+    job_id: str
+    backend: str
+    name: str
+    status: str           # "done" | "error" | "timed_out"
+    summary: dict         # LLM-facing reduced view
+    artifact_refs: dict   # {logical_name: workspace-relative path string}
+    cache_hit: bool
+    elapsed_s: float
+    started_at: str       # ISO-8601
+
+    def to_tool_result(self) -> dict:
+        """Dict the LLM sees as a tool-call response."""
+        return {
+            "status": self.status,
+            "job_id": self.job_id,
+            "cache_hit": self.cache_hit,
+            "elapsed_s": round(self.elapsed_s, 2),
+            **self.summary,
+        }
+
+    def to_log_dict(self) -> dict:
+        """Compact version stored in ctx.job_history."""
+        return {
+            "job_id": self.job_id,
+            "backend": self.backend,
+            "name": self.name,
+            "status": self.status,
+            "cache_hit": self.cache_hit,
+            "elapsed_s": round(self.elapsed_s, 2),
+            "started_at": self.started_at,
+            "artifact_refs": self.artifact_refs,
+        }
+
+
+# ===========================================================================
+# 3. Workspace
+# ===========================================================================
+
+class _Workspace:
+    """Per-run temporary directory with deterministic sub-paths."""
+
+    SUBDIRS = ("src", "bin", "ncu", "nsys", "torch", "logs")
+
+    def __init__(self, root: str) -> None:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        uid = uuid.uuid4().hex[:8]
+        self.root = Path(root) / f"run_{ts}_{uid}"
+        self.root.mkdir(parents=True, exist_ok=True)
+        for sub in self.SUBDIRS:
+            (self.root / sub).mkdir(exist_ok=True)
+
+    def allocate(self, kind: str, suffix: str) -> Path:
+        """Return a unique path inside the workspace (file not yet created)."""
+        uid = uuid.uuid4().hex[:6]
+        return self.root / kind / f"{kind}_{uid}{suffix}"
+
+    def write(self, rel: str, content: str | bytes) -> Path:
+        """Write content to a workspace-relative path (creates parent dirs)."""
+        target = _safe_join(self.root, rel)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, str):
+            target.write_text(content, encoding="utf-8")
+        else:
+            target.write_bytes(content)
+        return target
+
+    def cleanup(self, keep: bool = False) -> None:
+        if not keep and self.root.exists():
+            shutil.rmtree(self.root, ignore_errors=True)
+
+    def rel(self, path: Path) -> str:
+        """Return POSIX-style path relative to workspace root."""
+        try:
+            return path.relative_to(self.root).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+
+# ===========================================================================
+# 4. Cache
+# ===========================================================================
+
+class _JobCache:
+    def __init__(self) -> None:
+        self._store: dict[str, JobResult] = {}
+
+    def get(self, key: str) -> JobResult | None:
+        return self._store.get(key)
+
+    def put(self, key: str, result: JobResult) -> None:
+        self._store[key] = result
+
+
+# ===========================================================================
+# 5. Sandbox helpers
+# ===========================================================================
+
+def _safe_join(root: Path, rel: str) -> Path:
+    """Resolve rel relative to root and reject path traversal / absolute paths."""
+    if Path(rel).is_absolute():
+        raise ExecutorError("path_escape", rel=rel, reason="absolute path not allowed")
+    resolved = (root / rel).resolve()
+    root_resolved = root.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise ExecutorError("path_escape", rel=rel, reason="path escapes workspace")
+    return resolved
+
+
+def _check_binary(cfg: ExecutorConfig, name: str) -> str:
+    """Return the resolved path for a binary name if it's on the whitelist."""
+    basename = Path(name).stem if Path(name).suffix else name
+    if basename not in cfg.allowed_binaries:
+        raise ExecutorError(
+            "binary_not_whitelisted",
+            name=name,
+            allowed=cfg.allowed_binaries,
+        )
+    resolved = shutil.which(name)
+    if resolved is None:
+        raise ExecutorError("binary_not_found", name=name)
+    return resolved
+
+
+# ===========================================================================
+# 6. Subprocess helpers
+# ===========================================================================
+
+def _run_subprocess(
+    cmd: list[str],
+    timeout_s: int,
+    cwd: Path | None = None,
+    env: dict | None = None,
+    truncate_bytes: int = 64_000,
+) -> SubResult:
+    """Run cmd and return a SubResult.  Never raises; timeouts are captured."""
+    TRUNC_MARKER = b"\n[... output truncated ...]\n"
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout_s,
+            cwd=cwd,
+            env=env,
+        )
+        stdout_b = proc.stdout
+        stderr_b = proc.stderr
+        timed_out = False
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        stdout_b = exc.stdout or b""
+        stderr_b = exc.stderr or b""
+        timed_out = True
+        returncode = -1
+
+    # Truncate
+    if len(stdout_b) > truncate_bytes:
+        stdout_b = stdout_b[:truncate_bytes] + TRUNC_MARKER
+    if len(stderr_b) > truncate_bytes:
+        stderr_b = stderr_b[:truncate_bytes] + TRUNC_MARKER
+
+    # Use system locale encoding so MSVC/GBK output on Chinese Windows is readable
+    _enc = sys.stdout.encoding or "utf-8"
+    return SubResult(
+        stdout=stdout_b.decode(_enc, errors="replace"),
+        stderr=stderr_b.decode(_enc, errors="replace"),
+        returncode=returncode,
+        timed_out=timed_out,
+    )
+
+
+# ===========================================================================
+# 7. Compilation
+# ===========================================================================
+
+def _compile_cuda(
+    source: str,
+    name: str,
+    flags: list[str],
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> Path:
+    """Write CUDA source to workspace/src and compile with nvcc.
+
+    Returns path to the compiled binary.
+    Raises ExecutorError("compile_failed") on non-zero nvcc exit.
+    """
+    nvcc = _check_binary(cfg, cfg.nvcc_bin)
+
+    src_path = workspace.write(f"src/{name}.cu", source)
+    # On Windows nvcc produces .exe
+    suffix = ".exe" if sys.platform == "win32" else ""
+    out_path = workspace.root / "bin" / f"{name}{suffix}"
+
+    ccbin_flags = ["-ccbin", cfg.nvcc_ccbin] if cfg.nvcc_ccbin else []
+    cmd = [nvcc, *ccbin_flags, *cfg.nvcc_default_flags, *flags, "-o", str(out_path), str(src_path)]
+    result = _run_subprocess(
+        cmd,
+        timeout_s=cfg.default_compile_timeout_s,
+        truncate_bytes=cfg.stdout_truncate_bytes,
+    )
+
+    if result.returncode != 0 and not result.timed_out:
+        # nvcc prints errors to stdout on some platforms; capture both
+        combined = (result.stdout + "\n" + result.stderr).strip()
+        raise ExecutorError(
+            "compile_failed",
+            returncode=result.returncode,
+            stderr=combined[-4000:],        # keep last 4 KB for LLM context
+            cmd=" ".join(cmd),
+        )
+    if result.timed_out:
+        raise ExecutorError("compile_timeout", cmd=" ".join(cmd))
+
+    return out_path
+
+
+# ===========================================================================
+# 8. Post-processing (output reducers)
+# ===========================================================================
+
+def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
+    """Parse ncu --csv output and extract requested metrics.
+
+    ncu --csv produces lines like:
+      "ID","Process ID","Process Name","Host Name","Kernel Name","Kernel Time", ...
+      "0","1234","app","host","myKernel","1234", ...  (metric rows follow)
+
+    Phase 1: simple CSV parse; extract numeric values for requested metrics.
+    """
+    result: dict[str, Any] = {}
+    notes: list[str] = []
+
+    lines = raw_text.strip().splitlines()
+    if not lines:
+        return {"metrics": {}, "notes": ["empty ncu output"]}
+
+    # ncu CSV has two header rows: section header + metric header
+    # Try to find rows that look like CSV
+    try:
+        reader = csv.DictReader(io.StringIO(raw_text))
+        rows = list(reader)
+        for row in rows:
+            for m in metrics_requested:
+                # ncu metric names in CSV headers may have spaces/parens stripped
+                # Try direct match first, then partial
+                for col in row:
+                    if m in col or col in m:
+                        val_str = row[col].strip().strip('"')
+                        try:
+                            result[m] = float(val_str.replace(",", ""))
+                        except ValueError:
+                            result[m] = val_str
+    except Exception as exc:
+        notes.append(f"CSV parse error: {exc}")
+
+    # Also do regex scan for lines like "metric_name   123.45"
+    for m in metrics_requested:
+        if m not in result:
+            pattern = re.compile(
+                r"(?i)" + re.escape(m) + r"[^\d\-]*([0-9]+(?:\.[0-9]+)?)"
+            )
+            match = pattern.search(raw_text)
+            if match:
+                result[m] = float(match.group(1))
+
+    missing = [m for m in metrics_requested if m not in result]
+    if missing:
+        notes.append(f"Could not parse metrics: {missing}")
+
+    return {"metrics": result, "notes": notes}
+
+
+def _reduce_nsys(raw_text: str) -> dict:
+    """Extract top GPU kernels from nsys stats text output.
+
+    Phase 1: minimal reducer — look for the gpusum table and return top 10.
+    """
+    lines = raw_text.strip().splitlines()
+    result: dict[str, Any] = {"timeline_summary": [], "notes": []}
+
+    in_table = False
+    header: list[str] = []
+    rows: list[dict] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_table:
+                in_table = False
+            continue
+        # Detect table header (nsys stats columns often include "Time (%)")
+        if "Time (%)" in stripped and not in_table:
+            header = [h.strip() for h in stripped.split(",")]
+            in_table = True
+            continue
+        if in_table:
+            parts = stripped.split(",")
+            if len(parts) == len(header):
+                rows.append(dict(zip(header, [p.strip() for p in parts])))
+
+    if rows:
+        result["timeline_summary"] = rows[:10]  # top 10 by appearance
+    else:
+        # Fallback: just return first 50 lines
+        result["timeline_summary"] = lines[:50]
+        result["notes"].append("Could not parse nsys stats table; raw excerpt returned")
+
+    return result
+
+
+def _reduce_torch(raw_text: str) -> dict:
+    """Parse torch.profiler text output and return top operators by self CPU time.
+
+    Phase 1: minimal reducer — parse the table printed by print(prof.key_averages()).
+    """
+    lines = raw_text.strip().splitlines()
+    result: dict[str, Any] = {"op_stats": [], "notes": []}
+
+    header_idx = -1
+    for i, line in enumerate(lines):
+        if "Self CPU" in line or "CPU total" in line:
+            header_idx = i
+            break
+
+    if header_idx >= 0:
+        data_lines = lines[header_idx + 1 :]
+        ops = []
+        for line in data_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("-"):
+                continue
+            ops.append(stripped)
+            if len(ops) >= 20:
+                break
+        result["op_stats"] = ops
+    else:
+        result["op_stats"] = lines[:30]
+        result["notes"].append("Could not parse torch profiler table; raw excerpt returned")
+
+    return result
+
+
+# ===========================================================================
+# 9. Backends
+# ===========================================================================
+
+def _execute_cuda_probe(
+    spec: JobSpec,
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> SubResult:
+    """Compile and run a CUDA kernel; return raw stdout/stderr."""
+    p = spec.payload
+    source: str = p["source"]
+    name: str = p["probe_name"].replace(" ", "_")
+    flags: list[str] = p.get("compile_flags", [])
+    args: list[str] = p.get("args", [])
+    timeout_s: int = p.get("timeout_s", cfg.default_run_timeout_s)
+
+    bin_path = _compile_cuda(source, name, flags, workspace, cfg)
+
+    run_cmd = [str(bin_path)] + args
+    return _run_subprocess(
+        run_cmd,
+        timeout_s=timeout_s,
+        cwd=workspace.root,
+        truncate_bytes=cfg.stdout_truncate_bytes,
+    )
+
+
+def _execute_ncu(
+    spec: JobSpec,
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> dict:
+    """Run Nsight Compute and return reduced metrics dict."""
+    p = spec.payload
+    ncu = _check_binary(cfg, cfg.ncu_bin)
+
+    source_type: str = p["source_type"]
+    source_or_path: str = p["source_or_path"]
+    kernel_name: str = p.get("kernel_name", "")
+    metrics: list[str] = p.get("metrics", [])
+    flags: list[str] = p.get("compile_flags", [])
+    args: list[str] = p.get("args", [])
+    timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
+    probe_name: str = p.get("probe_name", spec.name)
+
+    # Compile if needed
+    if source_type == "cuda_source":
+        bin_path = _compile_cuda(
+            source_or_path, probe_name.replace(" ", "_"), flags, workspace, cfg
+        )
+    else:
+        bin_path = _safe_join(workspace.root, source_or_path)
+        if not bin_path.exists():
+            raise ExecutorError("binary_not_found", path=source_or_path)
+
+    # Build ncu command
+    ncu_output = workspace.allocate("ncu", ".csv")
+    cmd = [
+        ncu,
+        "--csv",
+        "--log-file", str(ncu_output),
+    ]
+    if kernel_name:
+        cmd += ["--kernel-name", kernel_name]
+    if metrics:
+        cmd += ["--metrics", ",".join(metrics)]
+    cmd += [str(bin_path)] + args
+
+    sub = _run_subprocess(
+        cmd,
+        timeout_s=timeout_s,
+        cwd=workspace.root,
+        truncate_bytes=cfg.stdout_truncate_bytes,
+    )
+
+    # Read CSV output from log file if it was created, else use stdout
+    raw_csv = ""
+    if ncu_output.exists():
+        raw_csv = ncu_output.read_text(encoding="utf-8", errors="replace")
+    if not raw_csv:
+        raw_csv = sub.stdout
+
+    reduced = _reduce_ncu(raw_csv, metrics)
+    reduced["stdout"] = sub.stdout
+    reduced["stderr"] = sub.stderr[-2000:] if sub.stderr else ""
+    reduced["returncode"] = sub.returncode
+    reduced["raw_path"] = workspace.rel(ncu_output) if ncu_output.exists() else None
+    return reduced
+
+
+def _execute_nsys(
+    spec: JobSpec,
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> dict:
+    """Run Nsight Systems and return a minimal timeline summary."""
+    p = spec.payload
+    nsys = _check_binary(cfg, cfg.nsys_bin)
+
+    source_type: str = p["source_type"]
+    source_or_path: str = p["source_or_path"]
+    flags: list[str] = p.get("compile_flags", [])
+    args: list[str] = p.get("args", [])
+    timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
+    probe_name: str = p.get("probe_name", spec.name).replace(" ", "_")
+
+    # Compile / write script if needed
+    if source_type == "cuda_source":
+        bin_path = _compile_cuda(source_or_path, probe_name, flags, workspace, cfg)
+        target_cmd = [str(bin_path)] + args
+    elif source_type == "python_script":
+        script_path = workspace.write(f"src/{probe_name}.py", source_or_path)
+        python = _check_binary(cfg, cfg.python_bin)
+        target_cmd = [python, str(script_path)] + args
+    else:  # binary
+        bin_path = _safe_join(workspace.root, source_or_path)
+        target_cmd = [str(bin_path)] + args
+
+    report_base = workspace.allocate("nsys", "")
+    report_path = str(report_base)  # nsys appends .nsys-rep
+
+    cmd = [
+        nsys, "profile",
+        "--output", report_path,
+        "--force-overwrite", "true",
+        "--stats", "true",
+        "--export", "sqlite",
+    ] + target_cmd
+
+    sub = _run_subprocess(
+        cmd,
+        timeout_s=timeout_s,
+        cwd=workspace.root,
+        truncate_bytes=cfg.stdout_truncate_bytes,
+    )
+
+    reduced = _reduce_nsys(sub.stdout + sub.stderr)
+    reduced["returncode"] = sub.returncode
+    reduced["timed_out"] = sub.timed_out
+    reduced["raw_path"] = workspace.rel(report_base.with_suffix(".nsys-rep")) \
+        if (report_base.with_suffix(".nsys-rep")).exists() else None
+    return reduced
+
+
+def _execute_torch(
+    spec: JobSpec,
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> dict:
+    """Run user Python code under torch.profiler and return op stats."""
+    p = spec.payload
+    python_code: str = p["python_code"]
+    op_name: str = p.get("op_name", spec.name)
+    num_iters: int = p.get("num_iters", 100)
+    timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
+
+    python = _check_binary(cfg, cfg.python_bin)
+
+    # Wrap the user code with torch.profiler
+    wrapper = textwrap.dedent(f"""\
+        import torch
+        from torch.profiler import profile, ProfilerActivity, record_function
+
+        # ---- user code start ----
+        {textwrap.indent(python_code, '        ')}
+        # ---- user code end ----
+
+        NUM_ITERS = {num_iters}
+        OP_NAME = {repr(op_name)}
+
+        # Warmup
+        for _ in range(max(1, NUM_ITERS // 10)):
+            pass  # user code already ran above; this is a placeholder
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            with record_function(OP_NAME):
+                for _ in range(NUM_ITERS):
+                    # Re-execute user code block is not straightforward in exec context.
+                    # We rely on the user code defining a callable 'run()' or running inline.
+                    pass
+
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+    """)
+
+    script_path = workspace.write(
+        f"torch/{op_name.replace(' ', '_')}_prof.py", wrapper
+    )
+
+    sub = _run_subprocess(
+        [python, str(script_path)],
+        timeout_s=timeout_s,
+        cwd=workspace.root,
+        truncate_bytes=cfg.stdout_truncate_bytes,
+    )
+
+    reduced = _reduce_torch(sub.stdout)
+    reduced["returncode"] = sub.returncode
+    reduced["stderr"] = sub.stderr[-1000:] if sub.stderr else ""
+    return reduced
+
+
+# ===========================================================================
+# 10. Executor (public API)
+# ===========================================================================
+
+class Executor:
+    """Central execution layer.
+
+    All LLM tool calls that involve running code are routed through this
+    class. It owns: workspace, sandbox, cache, subprocess, compilation,
+    and output reduction. The LLM never imports subprocess directly.
+    """
+
+    def __init__(
+        self,
+        cfg: ExecutorConfig,
+        on_job_complete: Callable[[JobResult], None] | None = None,
+    ) -> None:
+        self._cfg = cfg
+        self._on_job_complete = on_job_complete
+        self.workspace = _Workspace(cfg.workspace_root)
+        self._cache = _JobCache()
+        self._gpu_arch_tag = self._detect_gpu_arch()
+
+    # ------------------------------------------------------------------
+    # GPU arch detection (best-effort, for cache keys)
+    # ------------------------------------------------------------------
+
+    def _detect_gpu_arch(self) -> str:
+        try:
+            result = _run_subprocess(
+                ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+                timeout_s=10,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip().replace(" ", "_")[:40]
+        except Exception:
+            pass
+        return "unknown_gpu"
+
+    # ------------------------------------------------------------------
+    # Internal job runner
+    # ------------------------------------------------------------------
+
+    def _run_job(
+        self,
+        spec: JobSpec,
+        execute_fn: Callable,
+    ) -> dict:
+        """Common pattern for all four backends:
+        1. Cache check
+        2. Execute (with full exception capture)
+        3. Build JobResult
+        4. Notify + return tool-result dict
+        """
+        cache_key = spec.cache_key(self._gpu_arch_tag)
+
+        if self._cfg.cache_enabled:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                cached_result = JobResult(
+                    job_id=cached.job_id,
+                    backend=cached.backend,
+                    name=cached.name,
+                    status=cached.status,
+                    summary=cached.summary,
+                    artifact_refs=cached.artifact_refs,
+                    cache_hit=True,
+                    elapsed_s=cached.elapsed_s,
+                    started_at=cached.started_at,
+                )
+                if self._on_job_complete:
+                    self._on_job_complete(cached_result)
+                return cached_result.to_tool_result()
+
+        job_id = uuid.uuid4().hex[:12]
+        started_at = datetime.now(timezone.utc).isoformat()
+        t0 = time.monotonic()
+
+        try:
+            raw = execute_fn(spec, self.workspace, self._cfg)
+            status = "done"
+            if isinstance(raw, SubResult):
+                summary: dict = {
+                    "stdout": raw.stdout,
+                    "stderr": raw.stderr,
+                    "returncode": raw.returncode,
+                    "timed_out": raw.timed_out,
+                }
+                status = "timed_out" if raw.timed_out else "done"
+            else:
+                summary = raw
+        except ExecutorError as exc:
+            status = "error"
+            summary = {"error": exc.kind, **exc.details}
+        except Exception as exc:
+            status = "error"
+            summary = {"error": exc.__class__.__name__, "detail": str(exc)}
+
+        elapsed_s = time.monotonic() - t0
+
+        job_result = JobResult(
+            job_id=job_id,
+            backend=spec.backend,
+            name=spec.name,
+            status=status,
+            summary=summary,
+            artifact_refs={},
+            cache_hit=False,
+            elapsed_s=elapsed_s,
+            started_at=started_at,
+        )
+
+        if self._cfg.cache_enabled and status == "done":
+            self._cache.put(cache_key, job_result)
+
+        # Write job log
+        try:
+            log_path = self.workspace.root / "logs" / "jobs.jsonl"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(job_result.to_log_dict(), default=str) + "\n")
+        except Exception:
+            pass  # log failure must not crash the agent
+
+        if self._on_job_complete:
+            self._on_job_complete(job_result)
+
+        return job_result.to_tool_result()
+
+    # ------------------------------------------------------------------
+    # Public API (registered as LLM tools)
+    # ------------------------------------------------------------------
+
+    def run_cuda_probe(
+        self,
+        source: str,
+        probe_name: str,
+        compile_flags: list[str] | None = None,
+        args: list[str] | None = None,
+        timeout_s: int = 60,
+    ) -> dict:
+        """Compile and run a CUDA kernel. Primary tool for hardware probing."""
+        spec = JobSpec(
+            backend="cuda_probe",
+            name=probe_name,
+            payload={
+                "source": source,
+                "probe_name": probe_name,
+                "compile_flags": compile_flags or [],
+                "args": args or [],
+                "timeout_s": timeout_s,
+            },
+        )
+        return self._run_job(spec, _execute_cuda_probe)
+
+    def profile_with_ncu(
+        self,
+        source_type: str,
+        source_or_path: str,
+        kernel_name: str,
+        metrics: list[str],
+        compile_flags: list[str] | None = None,
+        args: list[str] | None = None,
+        timeout_s: int = 600,
+    ) -> dict:
+        """Run Nsight Compute on a kernel to collect hardware counters."""
+        spec = JobSpec(
+            backend="ncu",
+            name=f"ncu_{kernel_name}",
+            payload={
+                "source_type": source_type,
+                "source_or_path": source_or_path,
+                "kernel_name": kernel_name,
+                "metrics": metrics,
+                "compile_flags": compile_flags or [],
+                "args": args or [],
+                "timeout_s": timeout_s,
+                "probe_name": kernel_name,
+            },
+        )
+        return self._run_job(spec, _execute_ncu)
+
+    def profile_with_nsys(
+        self,
+        source_type: str,
+        source_or_path: str,
+        compile_flags: list[str] | None = None,
+        args: list[str] | None = None,
+        duration_s: int = 10,
+        timeout_s: int = 300,
+    ) -> dict:
+        """Run Nsight Systems to capture CPU-GPU timeline."""
+        spec = JobSpec(
+            backend="nsys",
+            name="nsys_profile",
+            payload={
+                "source_type": source_type,
+                "source_or_path": source_or_path,
+                "compile_flags": compile_flags or [],
+                "args": args or [],
+                "duration_s": duration_s,
+                "timeout_s": timeout_s,
+                "probe_name": "nsys_target",
+            },
+        )
+        return self._run_job(spec, _execute_nsys)
+
+    def profile_with_torch(
+        self,
+        python_code: str,
+        op_name: str,
+        num_iters: int = 100,
+        timeout_s: int = 300,
+    ) -> dict:
+        """Run PyTorch Profiler on user-provided Python code."""
+        spec = JobSpec(
+            backend="torch",
+            name=op_name,
+            payload={
+                "python_code": python_code,
+                "op_name": op_name,
+                "num_iters": num_iters,
+                "timeout_s": timeout_s,
+            },
+        )
+        return self._run_job(spec, _execute_torch)

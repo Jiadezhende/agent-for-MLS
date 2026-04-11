@@ -258,6 +258,11 @@ int main() {
         assert result.get("error") == "compile_failed"
         # LLM must see the actual error message
         assert len(result.get("stderr", "")) > 0
+        # error_class must be present so LLM knows whether to fix code or env
+        assert "error_class" in result
+        assert result["error_class"] in ("user_code", "infrastructure", "timeout")
+        # cmd must NOT be present — it caused LLM to misread arch flags as the error
+        assert "cmd" not in result
 
     def test_cache_hit_on_second_call(self, executor):
         result1 = executor.run_cuda_probe(source=self.HELLO_SRC, probe_name="cache_test")
@@ -340,3 +345,62 @@ class TestRunSubprocess:
             truncate_bytes=50,
         )
         assert len(result.stdout.encode()) <= 100  # truncate marker adds bytes
+
+
+class TestCompileErrorParsing:
+    """Tests for _extract_nvcc_errors and _classify_compile_error helpers."""
+
+    def test_extract_removes_nvcc_invocation_line(self):
+        from executor import _extract_nvcc_errors
+        combined = (
+            "nvcc.EXE -ccbin C:/MSVC/bin -arch=sm_120 -o foo.exe src/foo.cu\n"
+            "src/foo.cu(5): error: 'clockRate' is not a member of 'cudaDeviceProp'\n"
+            "1 error detected in compilation of 'src/foo.cu'\n"
+        )
+        result = _extract_nvcc_errors(combined)
+        assert "nvcc.EXE" not in result
+        assert "clockRate" in result
+
+    def test_extract_fallback_when_no_diagnostics(self):
+        from executor import _extract_nvcc_errors
+        combined = "something weird with no diagnostic keywords"
+        result = _extract_nvcc_errors(combined)
+        assert len(result) > 0   # fallback returns something
+
+    def test_extract_respects_max_chars(self):
+        from executor import _extract_nvcc_errors
+        combined = "error: " + "x" * 5000
+        result = _extract_nvcc_errors(combined, max_chars=100)
+        assert len(result) <= 100
+
+    def test_classify_user_code_for_syntax_error(self):
+        from executor import _classify_compile_error
+        combined = "src/foo.cu(10): error: expected a ';'\n1 error detected"
+        assert _classify_compile_error(combined) == "user_code"
+
+    def test_classify_infrastructure_for_ccbin_missing(self):
+        from executor import _classify_compile_error
+        combined = "nvcc -ccbin C:/missing/path: cannot find compiler\n1 error"
+        assert _classify_compile_error(combined) == "infrastructure"
+
+    def test_classify_infrastructure_for_command_not_found(self):
+        from executor import _classify_compile_error
+        combined = "nvcc: command not found"
+        assert _classify_compile_error(combined) == "infrastructure"
+
+    def test_executor_error_has_error_class_field(self):
+        from executor import ExecutorError
+        err = ExecutorError("compile_failed", error_class="user_code", returncode=1, stderr="oops")
+        assert err.error_class == "user_code"
+        assert err.kind == "compile_failed"
+
+    def test_executor_error_default_error_class_is_infrastructure(self):
+        from executor import ExecutorError
+        err = ExecutorError("binary_not_found", name="ncu")
+        assert err.error_class == "infrastructure"
+
+    def test_executor_error_hint_field(self):
+        from executor import ExecutorError
+        err = ExecutorError("binary_not_found", error_class="infrastructure",
+                            hint="Set AGENT_NCU_BIN", name="ncu")
+        assert err.hint == "Set AGENT_NCU_BIN"

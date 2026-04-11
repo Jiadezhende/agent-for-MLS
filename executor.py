@@ -15,7 +15,8 @@ Sections:
   7. Compilation
   8. Post-processing (output reducers for ncu / nsys / torch)
   9. Backends (_execute_cuda_probe, _execute_ncu, _execute_nsys, _execute_torch)
- 10. Executor (public API)
+ 10. Environment auto-detection
+ 11. Executor (public API)
 """
 from __future__ import annotations
 
@@ -47,9 +48,22 @@ from config import ExecutorConfig
 class ExecutorError(Exception):
     """Raised for expected executor-level failures (compile error, bad path …).
     The Executor catches these and converts them to structured tool-result dicts.
+
+    error_class values:
+      "user_code"      — the CUDA source or tool arguments are wrong; LLM should fix code.
+      "infrastructure" — a binary is missing or env is misconfigured; LLM should NOT retry.
+      "timeout"        — execution exceeded the time limit; LLM may reduce workload.
     """
-    def __init__(self, kind: str, **details: Any) -> None:
+    def __init__(
+        self,
+        kind: str,
+        error_class: str = "infrastructure",
+        hint: str | None = None,
+        **details: Any,
+    ) -> None:
         self.kind = kind
+        self.error_class = error_class
+        self.hint = hint
         self.details = details
         super().__init__(f"ExecutorError({kind}): {details}")
 
@@ -184,13 +198,15 @@ class _JobCache:
 def _safe_join(root: Path, rel: str) -> Path:
     """Resolve rel relative to root and reject path traversal / absolute paths."""
     if Path(rel).is_absolute():
-        raise ExecutorError("path_escape", rel=rel, reason="absolute path not allowed")
+        raise ExecutorError("path_escape", error_class="user_code",
+                            rel=rel, reason="absolute path not allowed")
     resolved = (root / rel).resolve()
     root_resolved = root.resolve()
     try:
         resolved.relative_to(root_resolved)
     except ValueError:
-        raise ExecutorError("path_escape", rel=rel, reason="path escapes workspace")
+        raise ExecutorError("path_escape", error_class="user_code",
+                            rel=rel, reason="path escapes workspace")
     return resolved
 
 
@@ -200,12 +216,18 @@ def _check_binary(cfg: ExecutorConfig, name: str) -> str:
     if basename not in cfg.allowed_binaries:
         raise ExecutorError(
             "binary_not_whitelisted",
+            error_class="infrastructure",
             name=name,
             allowed=cfg.allowed_binaries,
         )
     resolved = shutil.which(name)
     if resolved is None:
-        raise ExecutorError("binary_not_found", name=name)
+        raise ExecutorError(
+            "binary_not_found",
+            error_class="infrastructure",
+            hint=_BINARY_HINTS.get(basename, f"Install {basename} or set the AGENT_{basename.upper()}_BIN env var."),
+            name=name,
+        )
     return resolved
 
 
@@ -257,6 +279,54 @@ def _run_subprocess(
 
 
 # ===========================================================================
+# 7. Compilation helpers
+# ===========================================================================
+
+_BINARY_HINTS: dict[str, str] = {
+    "ncu":  "Set AGENT_NCU_BIN env var, or install Nsight Compute.",
+    "nsys": "Set AGENT_NSYS_BIN env var, or install Nsight Systems.",
+    "nvcc": "Set AGENT_NVCC_BIN env var, or install the CUDA Toolkit.",
+}
+
+_DIAG_RE = re.compile(
+    r"(error:|warning:|note:|undefined reference|undefined symbol|"
+    r"\d+ error(s)? detected|cannot open source file|fatal error)",
+    re.IGNORECASE,
+)
+
+
+def _extract_nvcc_errors(combined: str, max_chars: int = 3000) -> str:
+    """Extract only diagnostic lines from nvcc stderr/stdout mix.
+
+    nvcc output looks like:
+        nvcc.EXE -ccbin … (invocation — skip)
+        /path/file.cu(42): error: 'clockRate' is not a member of …
+        1 error detected in compilation of …
+
+    We keep lines that contain diagnostic keywords and strip the workspace
+    path prefix so line references are stable across runs.
+    Fallback: if nothing matches, return the last 2000 chars of combined.
+    """
+    lines = combined.splitlines()
+    kept = [l.strip() for l in lines if l.strip() and _DIAG_RE.search(l)]
+    result = "\n".join(kept) if kept else combined[-2000:]
+    return result[:max_chars]
+
+
+def _classify_compile_error(combined: str) -> str:
+    """Return 'user_code' or 'infrastructure' based on nvcc error content."""
+    low = combined.lower()
+    if "command not found" in low:
+        return "infrastructure"
+    if "nvcc fatal" in low and "no input files" not in low:
+        return "infrastructure"
+    # ccbin-related: the host compiler path is wrong (env misconfiguration)
+    if "-ccbin" in combined and ("cannot find" in low or "no such file" in low):
+        return "infrastructure"
+    return "user_code"
+
+
+# ===========================================================================
 # 7. Compilation
 # ===========================================================================
 
@@ -290,14 +360,19 @@ def _compile_cuda(
     if result.returncode != 0 and not result.timed_out:
         # nvcc prints errors to stdout on some platforms; capture both
         combined = (result.stdout + "\n" + result.stderr).strip()
+        ec = _classify_compile_error(combined)
         raise ExecutorError(
             "compile_failed",
+            error_class=ec,
             returncode=result.returncode,
-            stderr=combined[-4000:],        # keep last 4 KB for LLM context
-            cmd=" ".join(cmd),
+            # Clean stderr: only diagnostic lines, not the nvcc invocation.
+            # Omitting cmd prevents LLM from misreading flags as the error cause.
+            stderr=_extract_nvcc_errors(combined),
+            arch_flags=[f for f in cmd if f.startswith("-arch") or f.startswith("--generate-code")],
         )
     if result.timed_out:
-        raise ExecutorError("compile_timeout", cmd=" ".join(cmd))
+        raise ExecutorError("compile_timeout", error_class="timeout",
+                            source_name=name)
 
     return out_path
 
@@ -634,7 +709,146 @@ def _execute_torch(
 
 
 # ===========================================================================
-# 10. Executor (public API)
+# 10. Environment auto-detection
+# ===========================================================================
+
+_NCU_SEARCH_PATHS_WIN: list[str] = [
+    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.1\ncu.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2024.3\ncu.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2024.1\ncu.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2023.3\ncu.exe",
+]
+
+_NSYS_SEARCH_PATHS_WIN: list[str] = [
+    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.1.1\target-windows-x64\nsys.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.6.1\target-windows-x64\nsys.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.3.1\target-windows-x64\nsys.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2023.4.1\target-windows-x64\nsys.exe",
+]
+
+
+def _detect_arch_flags() -> str | None:
+    """Query nvidia-smi for GPU compute capability and return '-arch=sm_NNN'.
+
+    Returns None if nvidia-smi is unavailable or returns unexpected output.
+    """
+    r = _run_subprocess(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+        timeout_s=10,
+    )
+    if r.returncode == 0:
+        cc = r.stdout.strip().replace(".", "")   # "12.0" → "120"
+        if cc.isdigit():
+            return f"-arch=sm_{cc}"
+    return None
+
+
+def _detect_msvc_ccbin() -> str | None:
+    """Find MSVC host compiler directory via vswhere (Windows only).
+
+    Returns the directory containing cl.exe (used as nvcc -ccbin), or None.
+    """
+    if sys.platform != "win32":
+        return None
+    vswhere = shutil.which("vswhere") or \
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    if not Path(vswhere).exists():
+        return None
+    r = _run_subprocess(
+        [vswhere, "-latest", "-products", "*",
+         "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+         "-property", "installationPath"],
+        timeout_s=15,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    vs_path = Path(r.stdout.strip())
+    vc_tools = vs_path / "VC" / "Tools" / "MSVC"
+    if not vc_tools.exists():
+        return None
+    versions = sorted(vc_tools.iterdir(), reverse=True)
+    for v in versions:
+        cl_dir = v / "bin" / "Hostx64" / "x64"
+        if (cl_dir / "cl.exe").exists():
+            return str(cl_dir)
+    return None
+
+
+def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
+    """Return the first existing path in search_list if the tool is not on PATH.
+
+    Returns None if the tool is already on PATH (no override needed) or if
+    no candidate path exists.
+    """
+    if shutil.which(on_path_name) is not None:
+        return None   # already on PATH — don't override
+    for candidate in search_list:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]:
+    """Fill in missing ExecutorConfig values through best-effort auto-detection.
+
+    Env-var overrides always take priority. Auto-detection only fills fields
+    that still hold their default/empty values.
+
+    Returns:
+        (updated_cfg, notes) — notes is a list of human-readable strings
+        describing what was detected or what is missing.
+    """
+    import dataclasses
+
+    changes: dict[str, Any] = {}
+    notes: list[str] = []
+
+    # --- GPU arch → nvcc_default_flags ---
+    if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
+        arch = _detect_arch_flags()
+        if arch:
+            changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
+            notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
+        else:
+            notes.append(
+                "[auto-detect] GPU arch: nvidia-smi unavailable; "
+                "set AGENT_NVCC_FLAGS=-arch=sm_NNN if compilation fails"
+            )
+
+    # --- MSVC ccbin (Windows only) ---
+    if not cfg.nvcc_ccbin:
+        ccbin = _detect_msvc_ccbin()
+        if ccbin:
+            changes["nvcc_ccbin"] = ccbin
+            notes.append(f"[auto-detect] MSVC ccbin: {ccbin}")
+        elif sys.platform == "win32":
+            notes.append(
+                "[auto-detect] MSVC ccbin: not found via vswhere; "
+                "set AGENT_NVCC_CCBIN if compilation fails on Windows"
+            )
+
+    # --- ncu binary ---
+    if cfg.ncu_bin == "ncu":
+        detected = _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        if detected:
+            changes["ncu_bin"] = detected
+            notes.append(f"[auto-detect] ncu: {detected}")
+
+    # --- nsys binary ---
+    if cfg.nsys_bin == "nsys":
+        detected = _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        if detected:
+            changes["nsys_bin"] = detected
+            notes.append(f"[auto-detect] nsys: {detected}")
+
+    if changes:
+        cfg = dataclasses.replace(cfg, **changes)
+
+    return cfg, notes
+
+
+# ===========================================================================
+# 11. Executor (public API)
 # ===========================================================================
 
 class Executor:
@@ -650,7 +864,9 @@ class Executor:
         cfg: ExecutorConfig,
         on_job_complete: Callable[[JobResult], None] | None = None,
     ) -> None:
+        cfg, detect_notes = _autodetect_env(cfg)
         self._cfg = cfg
+        self.detect_notes: list[str] = detect_notes   # printed by main.py at startup
         self._on_job_complete = on_job_complete
         self.workspace = _Workspace(cfg.workspace_root)
         self._cache = _JobCache()
@@ -726,10 +942,13 @@ class Executor:
                 summary = raw
         except ExecutorError as exc:
             status = "error"
-            summary = {"error": exc.kind, **exc.details}
+            summary = {"error": exc.kind, "error_class": exc.error_class, **exc.details}
+            if exc.hint:
+                summary["hint"] = exc.hint
         except Exception as exc:
             status = "error"
-            summary = {"error": exc.__class__.__name__, "detail": str(exc)}
+            summary = {"error": exc.__class__.__name__, "error_class": "infrastructure",
+                       "detail": str(exc)}
 
         elapsed_s = time.monotonic() - t0
 

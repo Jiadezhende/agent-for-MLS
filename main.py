@@ -103,7 +103,7 @@ def main() -> None:
 
     llm      = LLMClient(llm_cfg)
     registry = build_default_registry(executor)
-    loop     = AgentLoop(llm, registry, ctx, max_iterations=agent_cfg.max_iterations)
+    loop     = AgentLoop(llm, registry, ctx, max_iterations=agent_cfg.max_iterations, verbose=args.verbose)
 
     if args.verbose:
         print(

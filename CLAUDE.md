@@ -34,12 +34,28 @@ Executor (executor.py)                  ← only code that runs subprocesses
 | File | Purpose |
 |------|---------|
 | `executor.py` | Compilation, sandboxing, auto-detection, error classification |
+| `agent/loop.py` | Main LLM loop; `--verbose` real-time output via `_emit()` |
 | `agent/types.py` | `AgentContext`, `CircuitBreaker`, `Result`, `MemoryStore` |
 | `agent/tool_registry.py` | Tool dispatch + circuit breaker enforcement |
 | `agent/prompts.py` | System prompt (edit here to change LLM behavior) |
 | `config.py` | Three dataclasses: `LLMConfig`, `AgentConfig`, `ExecutorConfig` |
 | `skills/*.md` | Measurement strategy docs the LLM reads via `list_skills`/`read_skill` |
 | `tools/recording.py` | `record_measurement`, `flag_event`, `submit_results` |
+
+## Real-time verbose output
+
+`AgentLoop` accepts `verbose: bool = False`. When enabled (via `--verbose`), each iteration prints to stderr:
+
+```text
+── iter 3/40 ────────────────────────────────────────────
+  <LLM reasoning text>
+  call: run_cuda_probe  {"source":"<3842 chars>","probe_name":"clock_measurement"}
+  result: run_cuda_probe  status=done  elapsed=4.21s
+```
+
+- Large-text arguments (`source`, `source_or_path`, `python_code`) are replaced with `<N chars>` to keep output readable.
+- All prints use `flush=True` so output appears immediately even when piped (`2>&1 | tee run.log`).
+- Helper functions `_summarize_args()` and `_summarize_result()` in `agent/loop.py` handle formatting.
 
 ## Executor error handling
 

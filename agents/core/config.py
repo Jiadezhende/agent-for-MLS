@@ -1,5 +1,5 @@
 """
-config.py — Three configuration dataclasses loaded from environment variables.
+agents/core/config.py — Three configuration dataclasses loaded from environment variables.
 Call load_dotenv() before from_env() in main.py.
 """
 from __future__ import annotations

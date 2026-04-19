@@ -3,9 +3,6 @@ main.py — CLI entry point for the GPU profiling agent.
 
 Usage:
     python main.py --spec target_spec.json --output results.json
-
-The agent reads the target spec, runs the LLM loop (which calls the Executor
-via registered tools), and writes results.json + reasoning_log.json.
 """
 from __future__ import annotations
 
@@ -34,21 +31,19 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-
 def main() -> None:
-    # Load .env before any config reads
     load_dotenv()
 
     args = parse_args()
 
     # Import after load_dotenv so env vars are available
-    import agent.tasks  # noqa: F401  triggers registration of all task plugins
-    from agent.orchestrator import Orchestrator
-    from agent.tasks._registry import all_definitions
-    from agent.types import Task
-    from config import AgentConfig, ExecutorConfig, LLMConfig
-    from executor import Executor
-    from llm.client import LLMClient
+    import agents  # noqa: F401  triggers registration of all agent plugins
+    from agents._registry import all_definitions
+    from agents.core.config import AgentConfig, ExecutorConfig, LLMConfig
+    from agents.core.llm import LLMClient
+    from agents.core.types import Task
+    from agents.tools.cuda_executor import Executor
+    from orchestrator import Orchestrator
 
     # --- Config -----------------------------------------------------------
     try:
@@ -89,7 +84,6 @@ def main() -> None:
     )
 
     executor = Executor(exec_cfg)
-    # Always print auto-detection notes so users know what was found/missing
     for note in executor.detect_notes:
         print(note, file=sys.stderr)
 
@@ -108,18 +102,16 @@ def main() -> None:
         executor=executor,
         task=task,
         agent_cfg=agent_cfg,
-        task_registry=all_definitions(),
+        agent_registry=all_definitions(),
         verbose=args.verbose,
     )
 
     # --- Run --------------------------------------------------------------
     exit_code = 0
-    all_results = []
-    critique = None
-    worker_results = []
+    state = None
 
     try:
-        all_results, critique, worker_results = orchestrator.run()
+        state = orchestrator.run()
         if args.verbose:
             print("[info] Orchestrator completed successfully.", file=sys.stderr)
     except RuntimeError as exc:
@@ -129,8 +121,31 @@ def main() -> None:
         print(f"[error] Unexpected error: {exc}", file=sys.stderr)
         exit_code = 1
 
-    if worker_results:
-        exit_code = max(wr.exit_code for wr in worker_results)
+    # --- Collect results --------------------------------------------------
+    all_results: list[dict] = []
+    worker_logs: list[dict] = []
+
+    if state is not None:
+        for step in state.steps:
+            out = state.outputs.get(step.id)
+            if out is None:
+                continue
+            all_results.extend(out.results)
+            worker_logs.append({
+                "step_id":      step.id,
+                "task":         step.task,
+                "worker":       step.worker,
+                "success":      out.success,
+                "n_results":    len(out.results),
+                "summary":      out.summary,
+                "reasoning_log": out.reasoning_log,
+                "events":       out.events,
+            })
+
+        failed_steps = [s.id for s in state.steps if not state.outputs.get(s.id, None) or
+                        not state.outputs[s.id].success]
+        if failed_steps:
+            exit_code = max(exit_code, 3)
 
     # --- Write outputs ----------------------------------------------------
     output_path = Path(args.output)
@@ -138,37 +153,13 @@ def main() -> None:
 
     try:
         output_path.write_text(
-            json.dumps([r.to_dict() for r in all_results], indent=2, default=str),
+            json.dumps(all_results, indent=2, default=str),
             encoding="utf-8",
         )
-
-        log_data: dict = {
-            "workers": [
-                {
-                    "worker_id":     wr.worker_id,
-                    "targets":       wr.worker_spec.targets,
-                    "exit_code":     wr.exit_code,
-                    "error":         wr.error,
-                    "reasoning_log": wr.ctx.reasoning_log,
-                    "events":        wr.ctx.events,
-                    "job_history":   wr.ctx.job_history,
-                    "circuit_breaker": wr.ctx.circuit_breaker.serialize(),
-                    "summary":       wr.ctx.memory.get("run", "summary"),
-                }
-                for wr in worker_results
-            ],
-            "critique": {
-                "confidence_adjustments": critique.confidence_adjustments if critique else {},
-                "anomaly_flags":          critique.anomaly_flags          if critique else [],
-                "flagged_results":        critique.flagged_results         if critique else [],
-                "overall_assessment":     critique.overall_assessment      if critique else "",
-            },
-        }
         log_path.write_text(
-            json.dumps(log_data, indent=2, default=str),
+            json.dumps({"workers": worker_logs}, indent=2, default=str),
             encoding="utf-8",
         )
-
         if args.verbose or exit_code != 0:
             print(f"[info] Wrote {output_path} and {log_path}", file=sys.stderr)
 
@@ -180,10 +171,7 @@ def main() -> None:
     if exit_code == 0 and not agent_cfg.keep_workspace:
         executor.workspace.cleanup()
     else:
-        print(
-            f"[info] Workspace retained at: {executor.workspace.root}",
-            file=sys.stderr,
-        )
+        print(f"[info] Workspace retained at: {executor.workspace.root}", file=sys.stderr)
 
     sys.exit(exit_code)
 

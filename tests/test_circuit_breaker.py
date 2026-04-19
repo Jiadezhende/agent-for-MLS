@@ -7,8 +7,8 @@ import uuid
 
 import pytest
 
-from agent.types import AgentContext, CircuitBreaker, MemoryStore, Task
-from agent.tool_registry import ToolRegistry, _EXECUTOR_TOOL_NAMES
+from agents.core.types import AgentContext, CircuitBreaker, MemoryStore, Task
+from agents.tools.registry import ToolRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -194,18 +194,17 @@ class TestDispatchCircuitBreaker:
         result = failing_reg.dispatch("run_cuda_probe", {}, ctx)
         assert result["status"] == "error"   # real error, not circuit_open
 
-    def test_non_executor_tool_never_circuit_breaks(self):
-        """flag_event and other non-executor tools must not be circuit-broken."""
-        assert "flag_event" not in _EXECUTOR_TOOL_NAMES
+    def test_all_tools_subject_to_circuit_breaking(self):
+        """Circuit breaker now applies universally to every registered tool."""
         ctx = _make_ctx(threshold=1)
         reg = _make_registry_with_tool(
             "flag_event",
             {"error": "some_error", "status": "error"}
         )
-        reg.dispatch("flag_event", {}, ctx)
+        reg.dispatch("flag_event", {}, ctx)   # failure recorded → circuit opens
         result = reg.dispatch("flag_event", {}, ctx)
-        # Should NOT be circuit_open
-        assert result.get("status") != "circuit_open"
+        assert result["status"] == "circuit_open"
+        assert result["tool"] == "flag_event"
 
     def test_timed_out_does_not_count_toward_circuit(self):
         """timed_out results should not open the circuit (kernel just slow)."""

@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import pytest
 
-from agent.tool_registry import _Terminated
-from tools.recording import flag_event, record_measurement, submit_results
-from tools.skills import list_skills, read_skill
+from agents.tools.registry import _Terminated
+from agents.tools.builtin.recording import flag_event, record_measurement, submit_results
+from agents.tools.builtin.skills import list_skills, read_skill
 
 
 # ===========================================================================

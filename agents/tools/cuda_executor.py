@@ -1,22 +1,21 @@
 """
-executor.py — The central execution layer.
+agents/tools/cuda_executor.py — The central execution layer for CUDA tools.
 
 The Executor is the ONLY code that runs subprocesses, compiles CUDA, or
 invokes profiling tools. The LLM never calls nvcc / ncu / nsys directly;
-it calls Executor public methods (registered as tools in tool_registry.py).
+it calls Executor public methods (registered as tools in registry.py).
 
 Sections:
-  1. Exceptions
-  2. Data structures (JobSpec, JobResult, SubResult)
-  3. Workspace (per-run temp directory)
-  4. Cache (in-memory, keyed by payload hash)
-  5. Sandbox (binary whitelist, path traversal guard)
-  6. Subprocess helpers
-  7. Compilation
-  8. Post-processing (output reducers for ncu / nsys / torch)
-  9. Backends (_execute_cuda_probe, _execute_ncu, _execute_nsys, _execute_torch)
- 10. Environment auto-detection
- 11. Executor (public API)
+  1. Data structures (JobSpec, JobResult, SubResult)
+  2. Workspace (per-run temp directory)
+  3. Cache (in-memory, keyed by payload hash)
+  4. Sandbox (binary whitelist, path traversal guard)
+  5. Subprocess helpers
+  6. Compilation
+  7. Post-processing (output reducers for ncu / nsys / torch)
+  8. Backends (_execute_cuda_probe, _execute_ncu, _execute_nsys, _execute_torch)
+  9. Environment auto-detection
+ 10. Executor (public API)
 """
 from __future__ import annotations
 
@@ -39,38 +38,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from config import ExecutorConfig
+from agents.core.config import ExecutorConfig
+from agents.core.exceptions import ExecutorError
 
 
 # ===========================================================================
-# 1. Exceptions
-# ===========================================================================
-
-class ExecutorError(Exception):
-    """Raised for expected executor-level failures (compile error, bad path …).
-    The Executor catches these and converts them to structured tool-result dicts.
-
-    error_class values:
-      "user_code"      — the CUDA source or tool arguments are wrong; LLM should fix code.
-      "infrastructure" — a binary is missing or env is misconfigured; LLM should NOT retry.
-      "timeout"        — execution exceeded the time limit; LLM may reduce workload.
-    """
-    def __init__(
-        self,
-        kind: str,
-        error_class: str = "infrastructure",
-        hint: str | None = None,
-        **details: Any,
-    ) -> None:
-        self.kind = kind
-        self.error_class = error_class
-        self.hint = hint
-        self.details = details
-        super().__init__(f"ExecutorError({kind}): {details}")
-
-
-# ===========================================================================
-# 2. Data structures
+# 1. Data structures
 # ===========================================================================
 
 @dataclass(frozen=True)
@@ -134,7 +107,7 @@ class JobResult:
 
 
 # ===========================================================================
-# 3. Workspace
+# 2. Workspace
 # ===========================================================================
 
 class _Workspace:
@@ -178,7 +151,7 @@ class _Workspace:
 
 
 # ===========================================================================
-# 4. Cache
+# 3. Cache
 # ===========================================================================
 
 class _JobCache:
@@ -196,7 +169,7 @@ class _JobCache:
 
 
 # ===========================================================================
-# 5. Sandbox helpers
+# 4. Sandbox helpers
 # ===========================================================================
 
 def _safe_join(root: Path, rel: str) -> Path:
@@ -236,7 +209,7 @@ def _check_binary(cfg: ExecutorConfig, name: str) -> str:
 
 
 # ===========================================================================
-# 6. Subprocess helpers
+# 5. Subprocess helpers
 # ===========================================================================
 
 def _run_subprocess(
@@ -283,7 +256,7 @@ def _run_subprocess(
 
 
 # ===========================================================================
-# 7. Compilation helpers
+# 6. Compilation helpers
 # ===========================================================================
 
 _BINARY_HINTS: dict[str, str] = {
@@ -329,10 +302,6 @@ def _classify_compile_error(combined: str) -> str:
         return "infrastructure"
     return "user_code"
 
-
-# ===========================================================================
-# 7. Compilation
-# ===========================================================================
 
 def _compile_cuda(
     source: str,
@@ -382,18 +351,11 @@ def _compile_cuda(
 
 
 # ===========================================================================
-# 8. Post-processing (output reducers)
+# 7. Post-processing (output reducers)
 # ===========================================================================
 
 def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
-    """Parse ncu --csv output and extract requested metrics.
-
-    ncu --csv produces lines like:
-      "ID","Process ID","Process Name","Host Name","Kernel Name","Kernel Time", ...
-      "0","1234","app","host","myKernel","1234", ...  (metric rows follow)
-
-    Phase 1: simple CSV parse; extract numeric values for requested metrics.
-    """
+    """Parse ncu --csv output and extract requested metrics."""
     result: dict[str, Any] = {}
     notes: list[str] = []
 
@@ -401,15 +363,11 @@ def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
     if not lines:
         return {"metrics": {}, "notes": ["empty ncu output"]}
 
-    # ncu CSV has two header rows: section header + metric header
-    # Try to find rows that look like CSV
     try:
         reader = csv.DictReader(io.StringIO(raw_text))
         rows = list(reader)
         for row in rows:
             for m in metrics_requested:
-                # ncu metric names in CSV headers may have spaces/parens stripped
-                # Try direct match first, then partial
                 for col in row:
                     if m in col or col in m:
                         val_str = row[col].strip().strip('"')
@@ -420,7 +378,6 @@ def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
     except Exception as exc:
         notes.append(f"CSV parse error: {exc}")
 
-    # Also do regex scan for lines like "metric_name   123.45"
     for m in metrics_requested:
         if m not in result:
             pattern = re.compile(
@@ -438,10 +395,7 @@ def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
 
 
 def _reduce_nsys(raw_text: str) -> dict:
-    """Extract top GPU kernels from nsys stats text output.
-
-    Phase 1: minimal reducer — look for the gpusum table and return top 10.
-    """
+    """Extract top GPU kernels from nsys stats text output."""
     lines = raw_text.strip().splitlines()
     result: dict[str, Any] = {"timeline_summary": [], "notes": []}
 
@@ -455,7 +409,6 @@ def _reduce_nsys(raw_text: str) -> dict:
             if in_table:
                 in_table = False
             continue
-        # Detect table header (nsys stats columns often include "Time (%)")
         if "Time (%)" in stripped and not in_table:
             header = [h.strip() for h in stripped.split(",")]
             in_table = True
@@ -466,9 +419,8 @@ def _reduce_nsys(raw_text: str) -> dict:
                 rows.append(dict(zip(header, [p.strip() for p in parts])))
 
     if rows:
-        result["timeline_summary"] = rows[:10]  # top 10 by appearance
+        result["timeline_summary"] = rows[:10]
     else:
-        # Fallback: just return first 50 lines
         result["timeline_summary"] = lines[:50]
         result["notes"].append("Could not parse nsys stats table; raw excerpt returned")
 
@@ -476,10 +428,7 @@ def _reduce_nsys(raw_text: str) -> dict:
 
 
 def _reduce_torch(raw_text: str) -> dict:
-    """Parse torch.profiler text output and return top operators by self CPU time.
-
-    Phase 1: minimal reducer — parse the table printed by print(prof.key_averages()).
-    """
+    """Parse torch.profiler text output and return top operators by self CPU time."""
     lines = raw_text.strip().splitlines()
     result: dict[str, Any] = {"op_stats": [], "notes": []}
 
@@ -490,7 +439,7 @@ def _reduce_torch(raw_text: str) -> dict:
             break
 
     if header_idx >= 0:
-        data_lines = lines[header_idx + 1 :]
+        data_lines = lines[header_idx + 1:]
         ops = []
         for line in data_lines:
             stripped = line.strip()
@@ -508,7 +457,7 @@ def _reduce_torch(raw_text: str) -> dict:
 
 
 # ===========================================================================
-# 9. Backends
+# 8. Backends
 # ===========================================================================
 
 def _execute_cuda_probe(
@@ -553,7 +502,6 @@ def _execute_ncu(
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
     probe_name: str = p.get("probe_name", spec.name)
 
-    # Compile if needed
     if source_type == "cuda_source":
         bin_path = _compile_cuda(
             source_or_path, probe_name.replace(" ", "_"), flags, workspace, cfg
@@ -563,7 +511,6 @@ def _execute_ncu(
         if not bin_path.exists():
             raise ExecutorError("binary_not_found", path=source_or_path)
 
-    # Build ncu command
     ncu_output = workspace.allocate("ncu", ".csv")
     cmd = [
         ncu,
@@ -583,7 +530,6 @@ def _execute_ncu(
         truncate_bytes=cfg.stdout_truncate_bytes,
     )
 
-    # Read CSV output from log file if it was created, else use stdout
     raw_csv = ""
     if ncu_output.exists():
         raw_csv = ncu_output.read_text(encoding="utf-8", errors="replace")
@@ -614,7 +560,6 @@ def _execute_nsys(
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
     probe_name: str = p.get("probe_name", spec.name).replace(" ", "_")
 
-    # Compile / write script if needed
     if source_type == "cuda_source":
         bin_path = _compile_cuda(source_or_path, probe_name, flags, workspace, cfg)
         target_cmd = [str(bin_path)] + args
@@ -627,7 +572,7 @@ def _execute_nsys(
         target_cmd = [str(bin_path)] + args
 
     report_base = workspace.allocate("nsys", "")
-    report_path = str(report_base)  # nsys appends .nsys-rep
+    report_path = str(report_base)
 
     cmd = [
         nsys, "profile",
@@ -666,7 +611,6 @@ def _execute_torch(
 
     python = _check_binary(cfg, cfg.python_bin)
 
-    # Wrap the user code with torch.profiler
     wrapper = textwrap.dedent(f"""\
         import torch
         from torch.profiler import profile, ProfilerActivity, record_function
@@ -680,7 +624,7 @@ def _execute_torch(
 
         # Warmup
         for _ in range(max(1, NUM_ITERS // 10)):
-            pass  # user code already ran above; this is a placeholder
+            pass
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -688,8 +632,6 @@ def _execute_torch(
         ) as prof:
             with record_function(OP_NAME):
                 for _ in range(NUM_ITERS):
-                    # Re-execute user code block is not straightforward in exec context.
-                    # We rely on the user code defining a callable 'run()' or running inline.
                     pass
 
         print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
@@ -713,7 +655,7 @@ def _execute_torch(
 
 
 # ===========================================================================
-# 10. Environment auto-detection
+# 9. Environment auto-detection
 # ===========================================================================
 
 _NCU_SEARCH_PATHS_WIN: list[str] = [
@@ -732,10 +674,7 @@ _NSYS_SEARCH_PATHS_WIN: list[str] = [
 
 
 def _detect_arch_flags() -> str | None:
-    """Query nvidia-smi for GPU compute capability and return '-arch=sm_NNN'.
-
-    Returns None if nvidia-smi is unavailable or returns unexpected output.
-    """
+    """Query nvidia-smi for GPU compute capability and return '-arch=sm_NNN'."""
     r = _run_subprocess(
         ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
         timeout_s=10,
@@ -748,10 +687,7 @@ def _detect_arch_flags() -> str | None:
 
 
 def _detect_msvc_ccbin() -> str | None:
-    """Find MSVC host compiler directory via vswhere (Windows only).
-
-    Returns the directory containing cl.exe (used as nvcc -ccbin), or None.
-    """
+    """Find MSVC host compiler directory via vswhere (Windows only)."""
     if sys.platform != "win32":
         return None
     vswhere = shutil.which("vswhere") or \
@@ -779,13 +715,9 @@ def _detect_msvc_ccbin() -> str | None:
 
 
 def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
-    """Return the first existing path in search_list if the tool is not on PATH.
-
-    Returns None if the tool is already on PATH (no override needed) or if
-    no candidate path exists.
-    """
+    """Return the first existing path in search_list if the tool is not on PATH."""
     if shutil.which(on_path_name) is not None:
-        return None   # already on PATH — don't override
+        return None
     for candidate in search_list:
         if Path(candidate).exists():
             return candidate
@@ -793,21 +725,12 @@ def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
 
 
 def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]:
-    """Fill in missing ExecutorConfig values through best-effort auto-detection.
-
-    Env-var overrides always take priority. Auto-detection only fills fields
-    that still hold their default/empty values.
-
-    Returns:
-        (updated_cfg, notes) — notes is a list of human-readable strings
-        describing what was detected or what is missing.
-    """
+    """Fill in missing ExecutorConfig values through best-effort auto-detection."""
     import dataclasses
 
     changes: dict[str, Any] = {}
     notes: list[str] = []
 
-    # --- GPU arch → nvcc_default_flags ---
     if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
         arch = _detect_arch_flags()
         if arch:
@@ -819,7 +742,6 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
                 "set AGENT_NVCC_FLAGS=-arch=sm_NNN if compilation fails"
             )
 
-    # --- MSVC ccbin (Windows only) ---
     if not cfg.nvcc_ccbin:
         ccbin = _detect_msvc_ccbin()
         if ccbin:
@@ -831,14 +753,12 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
                 "set AGENT_NVCC_CCBIN if compilation fails on Windows"
             )
 
-    # --- ncu binary ---
     if cfg.ncu_bin == "ncu":
         detected = _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
         if detected:
             changes["ncu_bin"] = detected
             notes.append(f"[auto-detect] ncu: {detected}")
 
-    # --- nsys binary ---
     if cfg.nsys_bin == "nsys":
         detected = _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
         if detected:
@@ -852,7 +772,7 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
 
 
 # ===========================================================================
-# 11. Executor (public API)
+# 10. Executor (public API)
 # ===========================================================================
 
 class Executor:
@@ -870,7 +790,7 @@ class Executor:
     ) -> None:
         cfg, detect_notes = _autodetect_env(cfg)
         self._cfg = cfg
-        self.detect_notes: list[str] = detect_notes   # printed by main.py at startup
+        self.detect_notes: list[str] = detect_notes
         self._job_listeners: list[Callable[[JobResult], None]] = []
         self._listeners_lock = threading.Lock()
         if on_job_complete is not None:
@@ -880,18 +800,12 @@ class Executor:
         self._gpu_arch_tag = self._detect_gpu_arch()
 
     def add_job_listener(self, fn: Callable[[JobResult], None]) -> None:
-        """Register a callback to be called after each completed job."""
         with self._listeners_lock:
             self._job_listeners.append(fn)
 
     def remove_job_listener(self, fn: Callable[[JobResult], None]) -> None:
-        """Unregister a previously added job callback."""
         with self._listeners_lock:
             self._job_listeners.remove(fn)
-
-    # ------------------------------------------------------------------
-    # GPU arch detection (best-effort, for cache keys)
-    # ------------------------------------------------------------------
 
     def _detect_gpu_arch(self) -> str:
         try:
@@ -905,21 +819,12 @@ class Executor:
             pass
         return "unknown_gpu"
 
-    # ------------------------------------------------------------------
-    # Internal job runner
-    # ------------------------------------------------------------------
-
     def _run_job(
         self,
         spec: JobSpec,
         execute_fn: Callable,
     ) -> dict:
-        """Common pattern for all four backends:
-        1. Cache check
-        2. Execute (with full exception capture)
-        3. Build JobResult
-        4. Notify + return tool-result dict
-        """
+        """Common pattern for all four backends."""
         cache_key = spec.cache_key(self._gpu_arch_tag)
 
         if self._cfg.cache_enabled:
@@ -986,13 +891,12 @@ class Executor:
         if self._cfg.cache_enabled and status == "done":
             self._cache.put(cache_key, job_result)
 
-        # Write job log
         try:
             log_path = self.workspace.root / "logs" / "jobs.jsonl"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(job_result.to_log_dict(), default=str) + "\n")
         except Exception:
-            pass  # log failure must not crash the agent
+            pass
 
         with self._listeners_lock:
             listeners = list(self._job_listeners)

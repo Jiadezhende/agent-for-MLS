@@ -12,7 +12,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 
-from executor import (
+from agents.tools.cuda_executor import (
     ExecutorError,
     JobSpec,
     JobResult,
@@ -23,7 +23,7 @@ from executor import (
     _check_binary,
     _run_subprocess,
 )
-from config import ExecutorConfig
+from agents.core.config import ExecutorConfig
 
 
 # ===========================================================================
@@ -272,8 +272,7 @@ int main() {
 
     def test_on_job_complete_callback(self, exec_cfg):
         import tempfile
-        from executor import Executor
-        from config import ExecutorConfig
+        from agents.tools.cuda_executor import Executor
 
         completed = []
         cfg = exec_cfg.__class__(
@@ -287,7 +286,7 @@ int main() {
     def test_stdout_truncate(self, exec_cfg):
         """stdout_truncate_bytes is respected."""
         import tempfile
-        from executor import Executor
+        from agents.tools.cuda_executor import Executor
 
         cfg = exec_cfg.__class__(
             **{**exec_cfg.__dict__,
@@ -351,7 +350,7 @@ class TestCompileErrorParsing:
     """Tests for _extract_nvcc_errors and _classify_compile_error helpers."""
 
     def test_extract_removes_nvcc_invocation_line(self):
-        from executor import _extract_nvcc_errors
+        from agents.tools.cuda_executor import _extract_nvcc_errors
         combined = (
             "nvcc.EXE -ccbin C:/MSVC/bin -arch=sm_120 -o foo.exe src/foo.cu\n"
             "src/foo.cu(5): error: 'clockRate' is not a member of 'cudaDeviceProp'\n"
@@ -362,45 +361,45 @@ class TestCompileErrorParsing:
         assert "clockRate" in result
 
     def test_extract_fallback_when_no_diagnostics(self):
-        from executor import _extract_nvcc_errors
+        from agents.tools.cuda_executor import _extract_nvcc_errors
         combined = "something weird with no diagnostic keywords"
         result = _extract_nvcc_errors(combined)
         assert len(result) > 0   # fallback returns something
 
     def test_extract_respects_max_chars(self):
-        from executor import _extract_nvcc_errors
+        from agents.tools.cuda_executor import _extract_nvcc_errors
         combined = "error: " + "x" * 5000
         result = _extract_nvcc_errors(combined, max_chars=100)
         assert len(result) <= 100
 
     def test_classify_user_code_for_syntax_error(self):
-        from executor import _classify_compile_error
+        from agents.tools.cuda_executor import _classify_compile_error
         combined = "src/foo.cu(10): error: expected a ';'\n1 error detected"
         assert _classify_compile_error(combined) == "user_code"
 
     def test_classify_infrastructure_for_ccbin_missing(self):
-        from executor import _classify_compile_error
+        from agents.tools.cuda_executor import _classify_compile_error
         combined = "nvcc -ccbin C:/missing/path: cannot find compiler\n1 error"
         assert _classify_compile_error(combined) == "infrastructure"
 
     def test_classify_infrastructure_for_command_not_found(self):
-        from executor import _classify_compile_error
+        from agents.tools.cuda_executor import _classify_compile_error
         combined = "nvcc: command not found"
         assert _classify_compile_error(combined) == "infrastructure"
 
     def test_executor_error_has_error_class_field(self):
-        from executor import ExecutorError
+        from agents.tools.cuda_executor import ExecutorError
         err = ExecutorError("compile_failed", error_class="user_code", returncode=1, stderr="oops")
         assert err.error_class == "user_code"
         assert err.kind == "compile_failed"
 
     def test_executor_error_default_error_class_is_infrastructure(self):
-        from executor import ExecutorError
+        from agents.tools.cuda_executor import ExecutorError
         err = ExecutorError("binary_not_found", name="ncu")
         assert err.error_class == "infrastructure"
 
     def test_executor_error_hint_field(self):
-        from executor import ExecutorError
+        from agents.tools.cuda_executor import ExecutorError
         err = ExecutorError("binary_not_found", error_class="infrastructure",
                             hint="Set AGENT_NCU_BIN", name="ncu")
         assert err.hint == "Set AGENT_NCU_BIN"

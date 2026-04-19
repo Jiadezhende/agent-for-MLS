@@ -1,19 +1,13 @@
 """
-agent/prompts.py — Generic user message builder.
+agents/core/prompts.py — Generic user message builder for worker agents.
 
-Task-specific system prompts live in agent/tasks/<task_type>/prompt.py.
-This module provides build_user_message(), which is generic across all
-task types (renders a list of targets + optional strategy hints).
+Task-specific system prompts live in each agent plugin's prompt.py.
 """
 from __future__ import annotations
 
 
 def build_user_message(target_spec: dict) -> str:
-    """Render the target spec into the first user message.
-
-    Keeping the spec here (not in the system prompt) lets the system prompt
-    be cached across multiple runs with different specs.
-    """
+    """Render the target spec into the first user message for a worker agent."""
     targets = target_spec.get("targets", [])
     if not targets:
         return "No targets specified. Call submit_results with an empty summary."

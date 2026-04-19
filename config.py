@@ -56,7 +56,9 @@ class LLMConfig:
 class AgentConfig:
     max_iterations: int = 40
     keep_workspace: bool = False
-    circuit_breaker_threshold: int = 3  # open circuit after N consecutive failures
+    circuit_breaker_threshold: int = 3    # open circuit after N consecutive failures
+    worker_timeout_s: float = 600.0       # max wall time per worker (seconds)
+    half_open_timeout_s: float = 60.0     # seconds before open CB allows a probe
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -64,6 +66,8 @@ class AgentConfig:
             max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS") or "40"),
             keep_workspace=(os.getenv("AGENT_KEEP_WORKSPACE") or "false").lower() == "true",
             circuit_breaker_threshold=int(os.getenv("AGENT_CB_THRESHOLD") or "3"),
+            worker_timeout_s=float(os.getenv("AGENT_WORKER_TIMEOUT_S") or "600"),
+            half_open_timeout_s=float(os.getenv("AGENT_HALF_OPEN_TIMEOUT_S") or "60"),
         )
 
 

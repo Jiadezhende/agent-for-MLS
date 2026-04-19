@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 
-from agent.prompts import SYSTEM_PROMPT, build_user_message
+from agent.prompts import build_user_message
 from agent.tool_registry import ToolRegistry, _Terminated
 from agent.types import AgentContext
 from llm.client import LLMClient
@@ -67,21 +67,33 @@ class AgentLoop:
         ctx: AgentContext,
         max_iterations: int = 40,
         verbose: bool = False,
+        worker_id: int | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
         self.ctx = ctx
         self.max_iterations = max_iterations
         self.verbose = verbose
+        self._prefix = f"[W{worker_id}] " if worker_id is not None else ""
+        self._system_prompt = system_prompt
 
     def _emit(self, *args: object) -> None:
         """Print to stderr when verbose mode is active. Always flushes."""
         if self.verbose:
-            print(*args, file=sys.stderr, flush=True)
+            if args and isinstance(args[0], str):
+                print(self._prefix + args[0], *args[1:], file=sys.stderr, flush=True)
+            else:
+                print(self._prefix, *args, file=sys.stderr, flush=True)
 
     def run(self) -> AgentContext:
+        if self._system_prompt is None:
+            from agent.tasks._registry import get as _get_task
+            task_def = _get_task(self.ctx.task.type)
+            self._system_prompt = task_def.system_prompt if task_def else ""
+
         messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt},
             {"role": "user",   "content": build_user_message(self.ctx.task.payload)},
         ]
         nudged = False  # track whether we already sent the nudge message

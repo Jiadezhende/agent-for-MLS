@@ -42,9 +42,10 @@ def main() -> None:
     args = parse_args()
 
     # Import after load_dotenv so env vars are available
-    from agent.loop import AgentLoop
-    from agent.tool_registry import build_default_registry
-    from agent.types import AgentContext, CircuitBreaker, MemoryStore, Task
+    import agent.tasks  # noqa: F401  triggers registration of all task plugins
+    from agent.orchestrator import Orchestrator
+    from agent.tasks._registry import all_definitions
+    from agent.types import Task
     from config import AgentConfig, ExecutorConfig, LLMConfig
     from executor import Executor
     from llm.client import LLMClient
@@ -87,63 +88,81 @@ def main() -> None:
         constraints={},
     )
 
-    ctx = AgentContext(
-        task=task,
-        memory=MemoryStore(),
-        circuit_breaker=CircuitBreaker(threshold=agent_cfg.circuit_breaker_threshold),
-    )
-
-    executor = Executor(
-        exec_cfg,
-        on_job_complete=lambda r: ctx.job_history.append(r.to_log_dict()),
-    )
+    executor = Executor(exec_cfg)
     # Always print auto-detection notes so users know what was found/missing
     for note in executor.detect_notes:
         print(note, file=sys.stderr)
 
-    llm      = LLMClient(llm_cfg)
-    registry = build_default_registry(executor)
-    loop     = AgentLoop(llm, registry, ctx, max_iterations=agent_cfg.max_iterations, verbose=args.verbose)
+    llm = LLMClient(llm_cfg)
 
     if args.verbose:
         print(
-            f"[info] Starting agent: model={llm_cfg.model} "
+            f"[info] Starting orchestrator: model={llm_cfg.model} "
             f"max_iterations={agent_cfg.max_iterations} "
             f"workspace={executor.workspace.root}",
             file=sys.stderr,
         )
 
-    # --- Run loop ---------------------------------------------------------
+    orchestrator = Orchestrator(
+        llm=llm,
+        executor=executor,
+        task=task,
+        agent_cfg=agent_cfg,
+        task_registry=all_definitions(),
+        verbose=args.verbose,
+    )
+
+    # --- Run --------------------------------------------------------------
     exit_code = 0
+    all_results = []
+    critique = None
+    worker_results = []
+
     try:
-        loop.run()
+        all_results, critique, worker_results = orchestrator.run()
         if args.verbose:
-            print("[info] Agent completed successfully.", file=sys.stderr)
+            print("[info] Orchestrator completed successfully.", file=sys.stderr)
     except RuntimeError as exc:
-        # Budget exhausted or protocol error — still write partial results.
         print(f"[warn] {exc}", file=sys.stderr)
         exit_code = 3
     except Exception as exc:
         print(f"[error] Unexpected error: {exc}", file=sys.stderr)
         exit_code = 1
 
+    if worker_results:
+        exit_code = max(wr.exit_code for wr in worker_results)
+
     # --- Write outputs ----------------------------------------------------
     output_path = Path(args.output)
     log_path    = output_path.with_name("reasoning_log.json")
 
     try:
-        serialized = ctx.serialize()
-
         output_path.write_text(
-            json.dumps(serialized["results"], indent=2, default=str),
+            json.dumps([r.to_dict() for r in all_results], indent=2, default=str),
             encoding="utf-8",
         )
 
-        log_data = {
-            "reasoning_log": serialized["reasoning_log"],
-            "events":        serialized["events"],
-            "job_history":   serialized["job_history"],
-            "summary":       ctx.memory.get("run", "summary"),
+        log_data: dict = {
+            "workers": [
+                {
+                    "worker_id":     wr.worker_id,
+                    "targets":       wr.worker_spec.targets,
+                    "exit_code":     wr.exit_code,
+                    "error":         wr.error,
+                    "reasoning_log": wr.ctx.reasoning_log,
+                    "events":        wr.ctx.events,
+                    "job_history":   wr.ctx.job_history,
+                    "circuit_breaker": wr.ctx.circuit_breaker.serialize(),
+                    "summary":       wr.ctx.memory.get("run", "summary"),
+                }
+                for wr in worker_results
+            ],
+            "critique": {
+                "confidence_adjustments": critique.confidence_adjustments if critique else {},
+                "anomaly_flags":          critique.anomaly_flags          if critique else [],
+                "flagged_results":        critique.flagged_results         if critique else [],
+                "overall_assessment":     critique.overall_assessment      if critique else "",
+            },
         }
         log_path.write_text(
             json.dumps(log_data, indent=2, default=str),

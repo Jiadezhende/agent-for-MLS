@@ -159,39 +159,3 @@ class ToolRegistry:
         return result
 
 
-# ---------------------------------------------------------------------------
-# Default registry factory
-# ---------------------------------------------------------------------------
-
-def build_default_registry(executor: Any) -> ToolRegistry:
-    """Wire all tools and return a ready-to-use ToolRegistry.
-
-    executor — an Executor instance (its public methods become tools).
-    Recording tools are imported here to keep tool_registry free of
-    circular imports.
-    """
-    from agent.tool_schemas import TOOL_SCHEMAS
-    from tools.recording import flag_event, record_measurement, submit_results
-    from tools.skills import list_skills, read_skill
-
-    # Build a name → schema mapping for convenience
-    schema_by_name = {s["function"]["name"]: s for s in TOOL_SCHEMAS}
-
-    reg = ToolRegistry()
-
-    # Knowledge tools
-    reg.register("list_skills",  list_skills,  schema_by_name["list_skills"])
-    reg.register("read_skill",   read_skill,   schema_by_name["read_skill"])
-
-    # Executor tools (methods bound to the Executor instance)
-    reg.register("run_cuda_probe",    executor.run_cuda_probe,    schema_by_name["run_cuda_probe"])
-    reg.register("profile_with_ncu",  executor.profile_with_ncu,  schema_by_name["profile_with_ncu"])
-    reg.register("profile_with_nsys", executor.profile_with_nsys, schema_by_name["profile_with_nsys"])
-    reg.register("profile_with_torch",executor.profile_with_torch,schema_by_name["profile_with_torch"])
-
-    # Recording tools (need ctx injection)
-    reg.register("record_measurement", record_measurement, schema_by_name["record_measurement"], needs_ctx=True)
-    reg.register("flag_event",         flag_event,         schema_by_name["flag_event"],         needs_ctx=True)
-    reg.register("submit_results",     submit_results,     schema_by_name["submit_results"],     needs_ctx=True)
-
-    return reg

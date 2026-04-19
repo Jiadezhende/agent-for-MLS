@@ -45,6 +45,7 @@ def record_measurement(
         confidence=float(confidence),
         method=method,
         evidence=list(evidence),
+        task_type=ctx.task.type,
     )
     ctx.results.append(result)
     return {"ok": True, "count": len(ctx.results), "metric": metric}

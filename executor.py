@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -183,12 +184,15 @@ class _Workspace:
 class _JobCache:
     def __init__(self) -> None:
         self._store: dict[str, JobResult] = {}
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> JobResult | None:
-        return self._store.get(key)
+        with self._lock:
+            return self._store.get(key)
 
     def put(self, key: str, result: JobResult) -> None:
-        self._store[key] = result
+        with self._lock:
+            self._store[key] = result
 
 
 # ===========================================================================
@@ -867,10 +871,23 @@ class Executor:
         cfg, detect_notes = _autodetect_env(cfg)
         self._cfg = cfg
         self.detect_notes: list[str] = detect_notes   # printed by main.py at startup
-        self._on_job_complete = on_job_complete
+        self._job_listeners: list[Callable[[JobResult], None]] = []
+        self._listeners_lock = threading.Lock()
+        if on_job_complete is not None:
+            self._job_listeners.append(on_job_complete)
         self.workspace = _Workspace(cfg.workspace_root)
         self._cache = _JobCache()
         self._gpu_arch_tag = self._detect_gpu_arch()
+
+    def add_job_listener(self, fn: Callable[[JobResult], None]) -> None:
+        """Register a callback to be called after each completed job."""
+        with self._listeners_lock:
+            self._job_listeners.append(fn)
+
+    def remove_job_listener(self, fn: Callable[[JobResult], None]) -> None:
+        """Unregister a previously added job callback."""
+        with self._listeners_lock:
+            self._job_listeners.remove(fn)
 
     # ------------------------------------------------------------------
     # GPU arch detection (best-effort, for cache keys)
@@ -919,8 +936,10 @@ class Executor:
                     elapsed_s=cached.elapsed_s,
                     started_at=cached.started_at,
                 )
-                if self._on_job_complete:
-                    self._on_job_complete(cached_result)
+                with self._listeners_lock:
+                    listeners = list(self._job_listeners)
+                for fn in listeners:
+                    fn(cached_result)
                 return cached_result.to_tool_result()
 
         job_id = uuid.uuid4().hex[:12]
@@ -975,8 +994,10 @@ class Executor:
         except Exception:
             pass  # log failure must not crash the agent
 
-        if self._on_job_complete:
-            self._on_job_complete(job_result)
+        with self._listeners_lock:
+            listeners = list(self._job_listeners)
+        for fn in listeners:
+            fn(job_result)
 
         return job_result.to_tool_result()
 

@@ -9,7 +9,7 @@ Multiple targets are measured **in parallel** by a multi-agent pipeline: Planner
 ## How to run
 
 ```bash
-cp .env.example .env   # fill in OPENAI_API_KEY and AGENT_LLM_MODEL
+cp .env.example .env   # fill in API_KEY and BASE_MODEL
 python main.py --spec target_spec.json --output results.json --verbose
 ```
 

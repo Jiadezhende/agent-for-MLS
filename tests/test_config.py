@@ -15,22 +15,22 @@ from unittest.mock import patch
 class TestLLMConfig:
     def test_missing_api_key_raises(self):
         from config import LLMConfig
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "", "AGENT_LLM_MODEL": "gpt-4o"}, clear=False):
-            with pytest.raises(EnvironmentError, match="OPENAI_API_KEY"):
+        with patch.dict(os.environ, {"API_KEY": "", "BASE_MODEL": "gpt-4o"}, clear=False):
+            with pytest.raises(EnvironmentError, match="API_KEY"):
                 LLMConfig.from_env()
 
     def test_missing_model_raises(self):
         from config import LLMConfig
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test", "AGENT_LLM_MODEL": ""}, clear=False):
-            with pytest.raises(EnvironmentError, match="AGENT_LLM_MODEL"):
+        with patch.dict(os.environ, {"API_KEY": "sk-test", "BASE_MODEL": ""}, clear=False):
+            with pytest.raises(EnvironmentError, match="BASE_MODEL"):
                 LLMConfig.from_env()
 
     def test_base_url_none_when_blank(self):
         from config import LLMConfig
         env = {
-            "OPENAI_API_KEY": "sk-test",
-            "AGENT_LLM_MODEL": "gpt-4o",
-            "OPENAI_BASE_URL": "",
+            "API_KEY": "sk-test",
+            "BASE_MODEL": "gpt-4o",
+            "BASE_URL": "",
         }
         with patch.dict(os.environ, env, clear=False):
             cfg = LLMConfig.from_env()
@@ -39,9 +39,9 @@ class TestLLMConfig:
     def test_base_url_set_when_provided(self):
         from config import LLMConfig
         env = {
-            "OPENAI_API_KEY": "sk-test",
-            "AGENT_LLM_MODEL": "gpt-4o",
-            "OPENAI_BASE_URL": "https://api.example.com/v1",
+            "API_KEY": "sk-test",
+            "BASE_MODEL": "gpt-4o",
+            "BASE_URL": "https://api.example.com/v1",
         }
         with patch.dict(os.environ, env, clear=False):
             cfg = LLMConfig.from_env()
@@ -49,8 +49,8 @@ class TestLLMConfig:
 
     def test_defaults_applied(self, monkeypatch):
         from config import LLMConfig
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
-        monkeypatch.setenv("AGENT_LLM_MODEL", "m")
+        monkeypatch.setenv("API_KEY", "sk-x")
+        monkeypatch.setenv("BASE_MODEL", "m")
         for k in ["AGENT_LLM_MAX_TOKENS", "AGENT_LLM_TEMPERATURE",
                    "AGENT_LLM_TIMEOUT_S", "AGENT_LLM_MAX_RETRIES"]:
             monkeypatch.delenv(k, raising=False)
@@ -63,8 +63,8 @@ class TestLLMConfig:
     def test_int_fields_parsed(self):
         from config import LLMConfig
         env = {
-            "OPENAI_API_KEY": "sk-x",
-            "AGENT_LLM_MODEL": "m",
+            "API_KEY": "sk-x",
+            "BASE_MODEL": "m",
             "AGENT_LLM_MAX_TOKENS": "8192",
             "AGENT_LLM_MAX_RETRIES": "5",
         }

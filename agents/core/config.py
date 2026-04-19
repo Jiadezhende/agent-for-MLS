@@ -24,19 +24,13 @@ class LLMConfig:
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        model = os.getenv("AGENT_LLM_MODEL", "")
+        api_key = os.getenv("API_KEY", "")
+        model = os.getenv("BASE_MODEL", "")
         if not api_key:
-            raise EnvironmentError(
-                "OPENAI_API_KEY is not set. "
-                "Copy .env.example to .env and fill in your API key."
-            )
+            raise EnvironmentError("API_KEY is not set.")
         if not model:
-            raise EnvironmentError(
-                "AGENT_LLM_MODEL is not set. "
-                "Example: AGENT_LLM_MODEL=gpt-4o-mini"
-            )
-        raw_base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+            raise EnvironmentError("BASE_MODEL is not set.")
+        raw_base_url = os.getenv("BASE_URL", "").strip()
         return cls(
             api_key=api_key,
             model=model,

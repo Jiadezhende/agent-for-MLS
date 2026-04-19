@@ -75,7 +75,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and fill in OPENAI_API_KEY and AGENT_LLM_MODEL
+# Edit .env and fill in API_KEY and BASE_MODEL
 ```
 
 ### 3. Prepare input
@@ -107,9 +107,9 @@ All settings are controlled via environment variables (`.env` file).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | — | **Required.** API key |
-| `AGENT_LLM_MODEL` | — | **Required.** Model name |
-| `OPENAI_BASE_URL` | OpenAI | Leave blank for OpenAI; set for other providers |
+| `API_KEY` | — | **Required.** API key |
+| `BASE_MODEL` | — | **Required.** Model name |
+| `BASE_URL` | OpenAI | Leave blank for OpenAI; set for other providers |
 | `AGENT_LLM_MAX_TOKENS` | `4096` | Max tokens per response |
 | `AGENT_LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 | `AGENT_LLM_TIMEOUT_S` | `120` | Per-request timeout (seconds) |
@@ -142,18 +142,18 @@ Only `.env` changes are needed — no code changes:
 
 ```bash
 # OpenAI (default)
-OPENAI_API_KEY=sk-proj-...
-AGENT_LLM_MODEL=gpt-4o
+API_KEY=sk-proj-...
+BASE_MODEL=gpt-4o
 
 # DeepSeek
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.deepseek.com
-AGENT_LLM_MODEL=deepseek-chat
+API_KEY=sk-...
+BASE_URL=https://api.deepseek.com
+BASE_MODEL=deepseek-chat
 
 # Local vLLM / Ollama
-OPENAI_API_KEY=none
-OPENAI_BASE_URL=http://localhost:8000/v1
-AGENT_LLM_MODEL=llama-3.1-8b
+API_KEY=none
+BASE_URL=http://localhost:8000/v1
+BASE_MODEL=llama-3.1-8b
 ```
 
 ---

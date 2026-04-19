@@ -20,9 +20,10 @@ from agents.core.types import Step
 _PLANNER_BASE_PROMPT = """\
 You are a multi-agent task planner. Given a list of targets, assign each to
 the most appropriate agent type and group related targets into workers.
-Workers run in parallel, so targets that share measurement infrastructure
-may be grouped to reduce overhead. Independent targets should go to separate
-workers.
+Workers run in parallel. Use the agent type descriptions below to decide:
+which agent type handles each target, and whether targets should share a worker
+or run in separate workers. Prefer fewer workers when targets belong to the same
+agent type and can be measured sequentially without interference.
 
 Available agent types:
 {agent_types_block}

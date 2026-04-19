@@ -103,13 +103,13 @@ Never call a tool again after seeing circuit_open for that tool.
 
 _PLANNER_HINTS = """\
 Agent type: hardware_probe
-Description: Measure GPU hardware parameters (latency, bandwidth, clock) via CUDA microbenchmarks.
-Grouping rules:
-  - dram_latency and dram_bandwidth can share one worker (same pointer-chase kernel)
-  - clock measurements must be isolated (they briefly alter GPU state)
-  - L1/L2 cache measurements can share one worker
-  - Default: 1 target per worker when no grouping rationale exists
-  - Maximum 8 workers total regardless of target count\
+Capability: Measures any GPU hardware parameter (latency, bandwidth, clock, cache, shared memory)
+            by writing and running CUDA C microbenchmarks. Can measure multiple targets sequentially
+            in a single worker — no need to split unless targets are truly independent domains.
+When to assign here: any low-level hardware metric that requires a CUDA kernel (e.g. DRAM latency,
+            boost clock, cache capacity, bandwidth, shared memory throughput, bank conflicts).
+When to split into multiple workers: only if you also have targets for a different agent type
+            (e.g. op_profiler, bottleneck_analyst). Targets of the same type can share one worker.\
 """
 
 _CRITIC_SYSTEM_PROMPT = """\

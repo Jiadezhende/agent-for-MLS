@@ -1,1 +1,11 @@
-{"targets": ["dram_latency_cycles", "actual_boost_clock_mhz"]}
+{
+  "targets": [
+    "dram_latency_cycles",
+    "actual_boost_clock_mhz",
+    "max_shmem_per_block_kb",
+    "l2_cache_capacity_bytes",
+    "peak_dram_bandwidth_GBps",
+    "peak_shmem_bandwidth_TBps",
+    "bank_conflict_penalty_cycles"
+  ]
+}

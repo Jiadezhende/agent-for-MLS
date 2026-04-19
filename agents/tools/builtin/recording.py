@@ -1,19 +1,13 @@
 """
-tools/recording.py — Recording tools that write to AgentContext.
+agents/tools/builtin/recording.py — Recording tools that write to AgentContext.
 
 These tools need ctx injection (needs_ctx=True in the registry).
-The _Terminated exception is defined here and re-raised by submit_results
-so the agent loop can break out cleanly.
 """
 from __future__ import annotations
 
-from agent.tool_registry import _Terminated  # shared signal class
-from agent.types import AgentContext, Result
+from agents.tools.registry import _Terminated
+from agents.core.types import AgentContext, Result
 
-
-# ---------------------------------------------------------------------------
-# Recording functions
-# ---------------------------------------------------------------------------
 
 def record_measurement(
     ctx: AgentContext,
@@ -24,11 +18,7 @@ def record_measurement(
     method: str,
     evidence: list[str],
 ) -> dict:
-    """Append a confirmed measurement to ctx.results.
-
-    Returns an error dict (not an exception) if evidence is empty — so the
-    LLM receives it as structured feedback.
-    """
+    """Append a confirmed measurement to ctx.results."""
     if not evidence:
         return {
             "error": "empty_evidence",
@@ -45,6 +35,7 @@ def record_measurement(
         confidence=float(confidence),
         method=method,
         evidence=list(evidence),
+        task_type=ctx.task.type,
     )
     ctx.results.append(result)
     return {"ok": True, "count": len(ctx.results), "metric": metric}
@@ -68,11 +59,6 @@ def flag_event(
 
 
 def submit_results(ctx: AgentContext, summary: str) -> None:
-    """Finalize and terminate the agent loop.
-
-    Raises _Terminated, which the loop catches to exit cleanly.
-    This function never returns normally.
-    """
-    # Store summary in memory so main.py can serialize it
+    """Finalize and terminate the agent loop. Never returns normally."""
     ctx.memory.set("run", "summary", summary)
     raise _Terminated(summary)

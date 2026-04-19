@@ -30,14 +30,14 @@ def pytest_configure(config):
 @pytest.fixture()
 def tmp_workspace(tmp_path):
     """A fresh _Workspace rooted in pytest's tmp_path."""
-    from executor import _Workspace
+    from agents.tools.cuda_executor import _Workspace
     return _Workspace(str(tmp_path))
 
 
 @pytest.fixture()
 def exec_cfg():
     """ExecutorConfig loaded from the real .env (so CCBIN / arch flags are set)."""
-    from config import ExecutorConfig
+    from agents.core.config import ExecutorConfig
     return ExecutorConfig.from_env()
 
 
@@ -45,7 +45,7 @@ def exec_cfg():
 def executor(exec_cfg):
     """A live Executor instance (workspace in a temp dir)."""
     import tempfile
-    from executor import Executor
+    from agents.tools.cuda_executor import Executor
     cfg = exec_cfg.__class__(
         **{**exec_cfg.__dict__, "workspace_root": tempfile.mkdtemp()}
     )
@@ -55,7 +55,7 @@ def executor(exec_cfg):
 @pytest.fixture()
 def agent_ctx():
     """A minimal AgentContext for recording-tool tests."""
-    from agent.types import AgentContext, MemoryStore, Task
+    from agents.core.types import AgentContext, MemoryStore, Task
     task = Task(
         id=str(uuid.uuid4()),
         type="hardware_probe",

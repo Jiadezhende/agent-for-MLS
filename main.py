@@ -3,15 +3,11 @@ main.py — CLI entry point for the GPU profiling agent.
 
 Usage:
     python main.py --spec target_spec.json --output results.json
-
-The agent reads the target spec, runs the LLM loop (which calls the Executor
-via registered tools), and writes results.json + reasoning_log.json.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -35,36 +31,19 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _warn_if_missing_binaries(exec_cfg) -> None:
-    """Print actionable warnings for missing profiler tools (do not exit)."""
-    for attr, label in [
-        ("nvcc_bin", "nvcc (CUDA compiler)"),
-        ("ncu_bin",  "ncu  (Nsight Compute)"),
-        ("nsys_bin", "nsys (Nsight Systems)"),
-    ]:
-        name = getattr(exec_cfg, attr)
-        if shutil.which(name) is None:
-            print(
-                f"[warn] {label} not found on PATH ('{name}'). "
-                f"Tools using this backend will return errors. "
-                f"Set AGENT_{attr.upper()} if it is installed elsewhere.",
-                file=sys.stderr,
-            )
-
-
 def main() -> None:
-    # Load .env before any config reads
     load_dotenv()
 
     args = parse_args()
 
     # Import after load_dotenv so env vars are available
-    from agent.loop import AgentLoop
-    from agent.tool_registry import build_default_registry
-    from agent.types import AgentContext, MemoryStore, Task
-    from config import AgentConfig, ExecutorConfig, LLMConfig
-    from executor import Executor
-    from llm.client import LLMClient
+    import agents  # noqa: F401  triggers registration of all agent plugins
+    from agents._registry import all_definitions
+    from agents.core.config import AgentConfig, ExecutorConfig, LLMConfig
+    from agents.core.llm import LLMClient
+    from agents.core.types import Task
+    from agents.tools.cuda_executor import Executor
+    from orchestrator import Orchestrator
 
     # --- Config -----------------------------------------------------------
     try:
@@ -79,8 +58,6 @@ def main() -> None:
         agent_cfg.max_iterations = args.max_iterations
     if args.keep_workspace:
         agent_cfg.keep_workspace = True
-
-    _warn_if_missing_binaries(exec_cfg)
 
     # --- Load spec --------------------------------------------------------
     spec_path = Path(args.spec)
@@ -106,62 +83,83 @@ def main() -> None:
         constraints={},
     )
 
-    ctx = AgentContext(task=task, memory=MemoryStore())
+    executor = Executor(exec_cfg)
+    for note in executor.detect_notes:
+        print(note, file=sys.stderr)
 
-    executor = Executor(
-        exec_cfg,
-        on_job_complete=lambda r: ctx.job_history.append(r.to_log_dict()),
-    )
-
-    llm      = LLMClient(llm_cfg)
-    registry = build_default_registry(executor)
-    loop     = AgentLoop(llm, registry, ctx, max_iterations=agent_cfg.max_iterations)
+    llm = LLMClient(llm_cfg)
 
     if args.verbose:
         print(
-            f"[info] Starting agent: model={llm_cfg.model} "
+            f"[info] Starting orchestrator: model={llm_cfg.model} "
             f"max_iterations={agent_cfg.max_iterations} "
             f"workspace={executor.workspace.root}",
             file=sys.stderr,
         )
 
-    # --- Run loop ---------------------------------------------------------
+    orchestrator = Orchestrator(
+        llm=llm,
+        executor=executor,
+        task=task,
+        agent_cfg=agent_cfg,
+        agent_registry=all_definitions(),
+        verbose=args.verbose,
+    )
+
+    # --- Run --------------------------------------------------------------
     exit_code = 0
+    state = None
+
     try:
-        loop.run()
+        state = orchestrator.run()
         if args.verbose:
-            print("[info] Agent completed successfully.", file=sys.stderr)
+            print("[info] Orchestrator completed successfully.", file=sys.stderr)
     except RuntimeError as exc:
-        # Budget exhausted or protocol error — still write partial results.
         print(f"[warn] {exc}", file=sys.stderr)
         exit_code = 3
     except Exception as exc:
         print(f"[error] Unexpected error: {exc}", file=sys.stderr)
         exit_code = 1
 
+    # --- Collect results --------------------------------------------------
+    all_results: list[dict] = []
+    worker_logs: list[dict] = []
+
+    if state is not None:
+        for step in state.steps:
+            out = state.outputs.get(step.id)
+            if out is None:
+                continue
+            all_results.extend(out.results)
+            worker_logs.append({
+                "step_id":      step.id,
+                "task":         step.task,
+                "worker":       step.worker,
+                "success":      out.success,
+                "n_results":    len(out.results),
+                "summary":      out.summary,
+                "reasoning_log": out.reasoning_log,
+                "events":       out.events,
+            })
+
+        failed_steps = [s.id for s in state.steps if not state.outputs.get(s.id, None) or
+                        not state.outputs[s.id].success]
+        if failed_steps:
+            exit_code = max(exit_code, 3)
+
     # --- Write outputs ----------------------------------------------------
     output_path = Path(args.output)
     log_path    = output_path.with_name("reasoning_log.json")
 
     try:
-        serialized = ctx.serialize()
-
         output_path.write_text(
-            json.dumps(serialized["results"], indent=2, default=str),
+            json.dumps(all_results, indent=2, default=str),
             encoding="utf-8",
         )
-
-        log_data = {
-            "reasoning_log": serialized["reasoning_log"],
-            "events":        serialized["events"],
-            "job_history":   serialized["job_history"],
-            "summary":       ctx.memory.get("run", "summary"),
-        }
         log_path.write_text(
-            json.dumps(log_data, indent=2, default=str),
+            json.dumps({"workers": worker_logs}, indent=2, default=str),
             encoding="utf-8",
         )
-
         if args.verbose or exit_code != 0:
             print(f"[info] Wrote {output_path} and {log_path}", file=sys.stderr)
 
@@ -173,10 +171,7 @@ def main() -> None:
     if exit_code == 0 and not agent_cfg.keep_workspace:
         executor.workspace.cleanup()
     else:
-        print(
-            f"[info] Workspace retained at: {executor.workspace.root}",
-            file=sys.stderr,
-        )
+        print(f"[info] Workspace retained at: {executor.workspace.root}", file=sys.stderr)
 
     sys.exit(exit_code)
 

@@ -1,5 +1,5 @@
 """
-llm/client.py — The ONLY file that imports openai.
+agents/core/llm.py — The ONLY file that imports openai.
 
 Wraps the OpenAI SDK into a simple chat() interface.  Non-streaming,
 basic exponential-backoff retry.  Streaming + tenacity come in Phase 2.
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import openai
 
-from config import LLMConfig
+from agents.core.config import LLMConfig
 
 
 # ---------------------------------------------------------------------------

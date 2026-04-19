@@ -1,8 +1,8 @@
 """
-agent/tool_schemas.py — OpenAI function-calling JSON schemas for all 9 tools.
+agents/tools/schemas.py — OpenAI function-calling JSON schemas for all 9 tools.
 
-Keeping schemas here (separate from implementations in tools/ and executor.py)
-means llm/client.py can feed them to the API, while tool_registry.py holds
+Keeping schemas here (separate from implementations in tools/ and cuda_executor.py)
+means llm/client.py can feed them to the API, while registry.py holds
 the callables. They are linked only by the tool name string.
 """
 

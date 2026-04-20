@@ -10,10 +10,31 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import openai
 
 from agents.core.config import LLMConfig
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """o-series and GPT-5+ models don't accept temperature and use max_completion_tokens."""
+    m = model.lower()
+    return bool(re.match(r"o\d", m)) or m.startswith("gpt-5")
+
+
+def _build_create_kwargs(cfg: LLMConfig) -> dict[str, Any]:
+    """Return only the API params this model family accepts."""
+    kwargs: dict[str, Any] = {"timeout": cfg.request_timeout_s}
+    if _is_reasoning_model(cfg.model):
+        if cfg.max_tokens:
+            kwargs["max_completion_tokens"] = cfg.max_tokens
+        # temperature not supported on reasoning models
+    else:
+        if cfg.max_tokens:
+            kwargs["max_tokens"] = cfg.max_tokens
+        kwargs["temperature"] = cfg.temperature
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +196,7 @@ class LLMClient:
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
-                    max_tokens=self._cfg.max_tokens,
-                    temperature=self._cfg.temperature,
-                    timeout=self._cfg.request_timeout_s,
+                    **_build_create_kwargs(self._cfg),
                 )
                 return ChatResponse.from_openai(raw)
             except (

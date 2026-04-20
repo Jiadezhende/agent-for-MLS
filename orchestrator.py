@@ -31,6 +31,7 @@ from agents.tools.registry import ToolFactory
 class _ExecutionState:
     steps: list[Step] = field(default_factory=list)
     outputs: dict[str, WorkerOutput] = field(default_factory=dict)
+    history: dict[str, list[WorkerOutput]] = field(default_factory=dict)  # step_id → all attempts
     retry_set: set[str] = field(default_factory=set)
     carry_forward: dict[str, list[dict]] = field(default_factory=dict)  # step_id → accepted results
     done: bool = False
@@ -119,6 +120,7 @@ class Orchestrator:
                             summary=out.summary,
                         )
                     state.outputs[out.step_id] = out
+                    state.history.setdefault(out.step_id, []).append(out)
                     state.retry_set.discard(out.step_id)
                 self._trace("workers", "output", {
                     sid: {"success": out.success, "n_results": len(out.results)}

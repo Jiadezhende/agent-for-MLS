@@ -133,6 +133,7 @@ def main() -> None:
             if out is None:
                 continue
             raw_results.extend(out.results)
+            attempts = state.history.get(step.id, [out])
             worker_logs.append({
                 "step_id":      step.id,
                 "task":         step.task,
@@ -140,8 +141,16 @@ def main() -> None:
                 "success":      out.success,
                 "n_results":    len(out.results),
                 "summary":      out.summary,
-                "reasoning_log": out.reasoning_log,
-                "events":       out.events,
+                "attempts": [
+                    {
+                        "reasoning_log": a.reasoning_log,
+                        "events":        a.events,
+                        "n_results":     len(a.results),
+                        "success":       a.success,
+                        "summary":       a.summary,
+                    }
+                    for a in attempts
+                ],
             })
 
         # Deduplicate by metric: keep the entry with the highest confidence

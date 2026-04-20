@@ -132,18 +132,27 @@ class LLMClient:
                 openai.APIConnectionError,
             ) as exc:
                 last_exc = exc
-                wait = 2 ** attempt          # 1 s, 2 s, 4 s, …
+                is_rate_limit = isinstance(exc, openai.RateLimitError)
+                base = 15 if is_rate_limit else 1
+                wait = base * (2 ** attempt)   # rate-limit: 15s, 30s, 60s, …
                 print(
                     f"[llm] transient error (attempt {attempt + 1}/"
                     f"{self._cfg.max_retries}): {exc}. "
-                    f"Retrying in {wait}s …"
+                    f"Retrying in {wait}s …",
+                    flush=True,
                 )
                 time.sleep(wait)
             except openai.APIStatusError as exc:
                 # 4xx errors (except 429) are not transient — surface immediately.
                 if exc.status_code == 429:
                     last_exc = exc
-                    wait = 2 ** attempt
+                    wait = 15 * (2 ** attempt)  # 15s, 30s, 60s, …
+                    print(
+                        f"[llm] rate-limited (attempt {attempt + 1}/"
+                        f"{self._cfg.max_retries}): {exc}. "
+                        f"Retrying in {wait}s …",
+                        flush=True,
+                    )
                     time.sleep(wait)
                 else:
                     raise

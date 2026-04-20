@@ -172,8 +172,15 @@ _AUDIT_SCHEMA: dict = {
                                 "type": "string",
                                 "description": "1–2 sentences explaining the decision.",
                             },
+                            "failing_targets": {
+                                "type": "array",
+                                "description": "Names of targets that need re-measurement "
+                                               "(subset of the step's targets). "
+                                               "Leave empty only if ALL targets need retry.",
+                                "items": {"type": "string"},
+                            },
                         },
-                        "required": ["step_id", "decision", "confidence", "reason"],
+                        "required": ["step_id", "decision", "confidence", "reason", "failing_targets"],
                     },
                 },
             },
@@ -219,13 +226,15 @@ class HardwareProbeAgent(Agent):
         self.worker_id = worker_id
 
     def run(self, step: Step, tools: ToolRegistry) -> WorkerOutput:
+        payload: dict = {"targets": step.targets}
+        if step.retry_context:
+            payload["retry_context"] = step.retry_context
+
         task = Task(
             id=step.id,
             type="hardware_probe",
             description=step.task,
-            payload={
-                "targets": step.targets,
-            },
+            payload=payload,
             constraints={},
         )
         ctx = AgentContext(

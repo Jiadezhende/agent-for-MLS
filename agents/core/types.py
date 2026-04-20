@@ -117,6 +117,7 @@ class Step:
     worker: str                              # agent_type key in the registry
     targets: list[str] = field(default_factory=list)  # target names assigned to this worker
     task: str = ""                           # auto-generated log label, not sent to Worker LLM
+    retry_context: dict | None = None        # set on retry steps; contains reason + previous bad values
 
 
 @dataclass
@@ -137,3 +138,4 @@ class CriticDecision:
     decision: str       # "accept" | "retry"
     confidence: float
     reason: str
+    failing_targets: list[str] = field(default_factory=list)  # which targets to re-measure

@@ -128,11 +128,14 @@ class CriticAgent(Agent):
             dec = d.get("decision", "accept")
             if dec not in ("accept", "retry"):
                 dec = "accept"
+            raw_failing = d.get("failing_targets", [])
+            failing = [m for m in raw_failing if isinstance(m, str)] if isinstance(raw_failing, list) else []
             decisions.append(CriticDecision(
                 step_id=sid,
                 decision=dec,
                 confidence=conf,
                 reason=str(d.get("reason", "")),
+                failing_targets=failing,
             ))
 
         for sid in outputs:

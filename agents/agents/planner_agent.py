@@ -18,54 +18,49 @@ from agents.core.types import Step
 # ---------------------------------------------------------------------------
 
 _PLANNER_BASE_PROMPT = """\
-You are a multi-agent task planner. Given a list of targets, assign each to
-the most appropriate agent type and group related targets into workers.
-Workers run in parallel. Use the agent type descriptions below to decide:
-which agent type handles each target, and whether targets should share a worker
-or run in separate workers. Prefer fewer workers when targets belong to the same
-agent type and can be measured sequentially without interference.
+You are a multi-agent task planner. Given a list of targets, group them by
+agent type domain and assign each group to one worker. Targets of the same
+agent type should share ONE worker — do not create duplicate or redundant steps.
 
 Available agent types:
 {agent_types_block}
 
 You MUST respond with a JSON object in this exact format:
 {{
-  "steps": [
+  "workers": [
     {{
       "id": "step_0",
-      "task": "<target name or description>",
       "worker": "<agent_type>",
-      "hints": ["<optional strategy hint>"]
+      "targets": ["<target_name>", "<target_name>"]
     }}
   ]
 }}
 
 Rules:
-- Each step has a unique id starting from "step_0"
+- Each worker has a unique id starting from "step_0"
 - "worker" must be one of the available agent types listed above
-- "hints" is optional; omit or leave empty if no specific hints apply
+- "targets" is a JSON array of target name strings — one entry per target, no comma-joining
+- All targets of the same agent type go into ONE worker entry
 - Do not include any text outside the JSON object\
 """
 
 _FALLBACK_PROMPT = """\
 You are a GPU benchmark task planner. Given a list of target metrics,
-assign each to a worker.
+assign them all to one hardware_probe worker.
 
 You MUST respond with a JSON object in this exact format:
 {
-  "steps": [
+  "workers": [
     {
       "id": "step_0",
-      "task": "<target name>",
       "worker": "hardware_probe",
-      "hints": []
+      "targets": ["<target_name>"]
     }
   ]
 }
 
 Rules:
-- Each step has a unique id starting from "step_0"
-- Default to "hardware_probe" as the worker type
+- Put all targets in a single worker
 - Do not include any text outside the JSON object\
 """
 
@@ -117,7 +112,7 @@ class PlannerAgent(Agent):
 
         system_prompt = _build_system_prompt(self.agent_registry)
         user_msg = (
-            "Plan parallel workers for these targets:\n"
+            "Assign these targets to workers:\n"
             + "\n".join(f"  - {t}" for t in target_names)
             + "\n\nRespond with the JSON object only."
         )
@@ -154,45 +149,55 @@ class PlannerAgent(Agent):
                 lines = text.splitlines()
                 text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
             data = json.loads(text)
-            raw_steps = data.get("steps", [])
-            if not raw_steps:
+            raw_workers = data.get("workers", data.get("steps", []))
+            if not raw_workers:
                 return _fallback_plan(target_names, default_agent_type)
 
-            steps: list[Step] = []
             valid_types = set(self.agent_registry.keys()) or {"hardware_probe"}
-            for item in raw_steps:
+            steps: list[Step] = []
+            covered: set[str] = set()
+            for i, item in enumerate(raw_workers):
                 worker = item.get("worker", default_agent_type)
                 if worker not in valid_types:
                     worker = default_agent_type
+                targets = item.get("targets", [])
+                if isinstance(targets, str):
+                    targets = [t.strip() for t in targets.split(",")]
+                targets = [t for t in targets if t and t not in covered]
+                covered.update(targets)
+                if not targets:
+                    continue
                 steps.append(Step(
-                    id=item.get("id", f"step_{len(steps)}"),
-                    task=item.get("task", ""),
+                    id=item.get("id", f"step_{i}"),
                     worker=worker,
-                    hints=item.get("hints", []),
+                    targets=targets,
+                    task=", ".join(targets),
                 ))
 
-            planned_tasks = {s.task for s in steps}
             for t in target_names:
-                if t not in planned_tasks:
+                if t not in covered:
                     steps.append(Step(
                         id=f"step_{len(steps)}",
-                        task=t,
                         worker=default_agent_type,
+                        targets=[t],
+                        task=t,
                     ))
 
             return steps
 
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             if self.verbose:
-                print(f"[planner] JSON parse error ({exc}); falling back to 1:1.", file=sys.stderr)
+                print(f"[planner] JSON parse error ({exc}); falling back.", file=sys.stderr)
             return _fallback_plan(target_names, default_agent_type)
 
 
 def _fallback_plan(target_names: list[str], default_agent_type: str) -> list[Step]:
-    return [
-        Step(id=f"step_{i}", task=t, worker=default_agent_type)
-        for i, t in enumerate(target_names)
-    ]
+    return [Step(
+        id="step_0",
+        worker=default_agent_type,
+        targets=target_names,
+        task=", ".join(target_names),
+    )]
 
 
 def _normalize_target_names(targets: list) -> list[str]:

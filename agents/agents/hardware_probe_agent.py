@@ -104,12 +104,18 @@ Never call a tool again after seeing circuit_open for that tool.
 _PLANNER_HINTS = """\
 Agent type: hardware_probe
 Capability: Measures any GPU hardware parameter (latency, bandwidth, clock, cache, shared memory)
-            by writing and running CUDA C microbenchmarks. Can measure multiple targets sequentially
-            in a single worker — no need to split unless targets are truly independent domains.
-When to assign here: any low-level hardware metric that requires a CUDA kernel (e.g. DRAM latency,
-            boost clock, cache capacity, bandwidth, shared memory throughput, bank conflicts).
-When to split into multiple workers: only if you also have targets for a different agent type
-            (e.g. op_profiler, bottleneck_analyst). Targets of the same type can share one worker.\
+            by writing and running CUDA C microbenchmarks. Measures multiple targets sequentially
+            in a single worker.
+Known target names (assign ALL of these to hardware_probe):
+  dram_latency_cycles, l1_latency_cycles, l2_latency_cycles, dram_latency_ns,
+  actual_boost_clock_mhz, actual_clock_mhz, gpu_clock_mhz,
+  peak_dram_bandwidth_GBps, peak_shmem_bandwidth_TBps,
+  l2_cache_capacity_bytes, l2_cache_size_mb,
+  max_shmem_per_block_kb, max_shared_memory_per_block_kb,
+  bank_conflict_penalty_cycles, bank_conflict_penalty_x,
+  bottleneck_type, compute_utilization_pct, memory_utilization_pct
+Any unrecognised low-level hardware metric also belongs here.
+Grouping rule: put ALL hardware_probe targets in ONE worker entry.\
 """
 
 _CRITIC_SYSTEM_PROMPT = """\
@@ -218,8 +224,7 @@ class HardwareProbeAgent(Agent):
             type="hardware_probe",
             description=step.task,
             payload={
-                "targets": [step.task],
-                "strategy_hints": step.hints,
+                "targets": step.targets,
             },
             constraints={},
         )

@@ -114,9 +114,9 @@ class AgentContext:
 class Step:
     """One unit of work produced by the Planner for one worker agent."""
     id: str
-    task: str           # target / task description passed to the worker
-    worker: str         # agent_type key in the registry
-    hints: list[str] = field(default_factory=list)
+    worker: str                              # agent_type key in the registry
+    targets: list[str] = field(default_factory=list)  # target names assigned to this worker
+    task: str = ""                           # auto-generated log label, not sent to Worker LLM
 
 
 @dataclass

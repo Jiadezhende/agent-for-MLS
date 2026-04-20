@@ -686,6 +686,18 @@ def _detect_arch_flags() -> str | None:
     return None
 
 
+def _validate_arch_flag(arch: str, nvcc_bin: str) -> bool:
+    """Return True if nvcc accepts the given -arch flag (test compile a no-op kernel)."""
+    import tempfile
+    minimal_src = "__global__ void _k(){} int main(){return 0;}\n"
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "arch_test.cu"
+        out = Path(d) / ("arch_test.exe" if sys.platform == "win32" else "arch_test")
+        src.write_text(minimal_src)
+        r = _run_subprocess([nvcc_bin, arch, "-o", str(out), str(src)], timeout_s=20)
+        return r.returncode == 0
+
+
 def _detect_msvc_ccbin() -> str | None:
     """Find MSVC host compiler directory via vswhere (Windows only)."""
     if sys.platform != "win32":
@@ -734,8 +746,15 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
     if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
         arch = _detect_arch_flags()
         if arch:
-            changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
-            notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
+            if _validate_arch_flag(arch, cfg.nvcc_bin):
+                changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
+                notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
+            else:
+                notes.append(
+                    f"[auto-detect] GPU arch: {arch} detected but nvcc rejects it "
+                    f"(toolkit too old for this GPU); compiling without -arch flag. "
+                    f"Set AGENT_NVCC_FLAGS=-arch=sm_NNN to override."
+                )
         else:
             notes.append(
                 "[auto-detect] GPU arch: nvidia-smi unavailable; "

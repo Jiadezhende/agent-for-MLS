@@ -189,7 +189,7 @@ def _safe_join(root: Path, rel: str) -> Path:
 
 def _check_binary(cfg: ExecutorConfig, name: str) -> str:
     """Return the resolved path for a binary name if it's on the whitelist."""
-    basename = Path(name).stem if Path(name).suffix else name
+    basename = Path(name).stem
     if basename not in cfg.allowed_binaries:
         raise ExecutorError(
             "binary_not_whitelisted",

@@ -16,7 +16,7 @@ _SPLIT_THRESHOLD = 3       # targets per same-type group that triggers splitting
 _MAX_WORKERS_PER_TYPE = 2  # hard cap; never split into more than 2 per type
 
 # ---------------------------------------------------------------------------
-# Prompts (inlined from agents/planner/prompt.py)
+# Prompts
 # ---------------------------------------------------------------------------
 
 _PLANNER_BASE_PROMPT = """\
@@ -41,10 +41,7 @@ Rules:
 - Each worker has a unique id starting from "step_0"
 - "worker" must be one of the available agent types listed above
 - "targets" is a JSON array of target name strings — one entry per target, no comma-joining
-- For each agent type group with 1-2 targets: use ONE worker entry
-- For each agent type group with 3+ targets: create TWO worker entries of the same type,
-  splitting targets as evenly as possible (e.g. 5 targets → 3 + 2)
-- Never create more than 2 workers for the same agent type
+- Group targets by agent type domain; each group becomes one worker entry
 - Do not include any text outside the JSON object\
 """
 
@@ -89,8 +86,9 @@ def _build_system_prompt(agent_registry: dict) -> str:
 class PlannerAgent(Agent):
     """Single LLM call that maps targets → list[Step].
 
-    The LLM is asked to respond with a JSON object containing a 'steps' list.
-    Falls back to 1:1 mapping (one Step per target) on any failure.
+    Falls back to 1:1 mapping on any failure.
+    After LLM routing, large groups (>= _SPLIT_THRESHOLD) are split into
+    at most _MAX_WORKERS_PER_TYPE steps for parallelism.
     """
 
     def __init__(
@@ -198,11 +196,7 @@ class PlannerAgent(Agent):
 
 
 def _maybe_split_steps(steps: list[Step]) -> list[Step]:
-    """Split any Step with >= _SPLIT_THRESHOLD targets into two Steps.
-
-    Creates new Step objects with sequential ids — no in-place mutation.
-    Runs in Phase 1 (single-threaded) before any workers are spawned.
-    """
+    """Split any Step with >= _SPLIT_THRESHOLD targets into two Steps."""
     result: list[Step] = []
     for step in steps:
         if len(step.targets) >= _SPLIT_THRESHOLD:

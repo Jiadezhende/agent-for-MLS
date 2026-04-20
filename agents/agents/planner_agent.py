@@ -12,6 +12,8 @@ from agents.core.agent import Agent
 from agents.core.llm import LLMClient
 from agents.core.types import Step
 
+_SPLIT_THRESHOLD = 3       # targets per same-type group that triggers splitting
+_MAX_WORKERS_PER_TYPE = 2  # hard cap; never split into more than 2 per type
 
 # ---------------------------------------------------------------------------
 # Prompts (inlined from agents/planner/prompt.py)
@@ -19,8 +21,7 @@ from agents.core.types import Step
 
 _PLANNER_BASE_PROMPT = """\
 You are a multi-agent task planner. Given a list of targets, group them by
-agent type domain and assign each group to one worker. Targets of the same
-agent type should share ONE worker — do not create duplicate or redundant steps.
+agent type domain and assign each group to workers.
 
 Available agent types:
 {agent_types_block}
@@ -40,6 +41,10 @@ Rules:
 - Each worker has a unique id starting from "step_0"
 - "worker" must be one of the available agent types listed above
 - "targets" is a JSON array of target name strings — one entry per target, no comma-joining
+- For each agent type group with 1-2 targets: use ONE worker entry
+- For each agent type group with 3+ targets: create TWO worker entries of the same type,
+  splitting targets as evenly as possible (e.g. 5 targets → 3 + 2)
+- Never create more than 2 workers for the same agent type
 - Do not include any text outside the JSON object\
 """
 
@@ -129,6 +134,8 @@ class PlannerAgent(Agent):
                 print(f"[planner] LLM call failed ({exc}); falling back to 1:1.", file=sys.stderr)
             plan = _fallback_plan(target_names, default_agent_type)
 
+        plan = _maybe_split_steps(plan)
+
         if self.verbose:
             print(
                 f"[planner] {len(plan)} step(s): "
@@ -188,6 +195,29 @@ class PlannerAgent(Agent):
             if self.verbose:
                 print(f"[planner] JSON parse error ({exc}); falling back.", file=sys.stderr)
             return _fallback_plan(target_names, default_agent_type)
+
+
+def _maybe_split_steps(steps: list[Step]) -> list[Step]:
+    """Split any Step with >= _SPLIT_THRESHOLD targets into two Steps.
+
+    Creates new Step objects with sequential ids — no in-place mutation.
+    Runs in Phase 1 (single-threaded) before any workers are spawned.
+    """
+    result: list[Step] = []
+    for step in steps:
+        if len(step.targets) >= _SPLIT_THRESHOLD:
+            mid = (len(step.targets) + 1) // 2
+            groups = [step.targets[:mid], step.targets[mid:]]
+        else:
+            groups = [step.targets]
+        for targets in groups:
+            result.append(Step(
+                id=f"step_{len(result)}",
+                worker=step.worker,
+                targets=list(targets),
+                task=", ".join(targets),
+            ))
+    return result
 
 
 def _fallback_plan(target_names: list[str], default_agent_type: str) -> list[Step]:

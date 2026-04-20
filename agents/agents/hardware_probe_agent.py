@@ -125,6 +125,20 @@ Your job:
    - "accept": all requested targets measured and results are plausible
    - "retry":  any target is missing, anomalous, or implausible
 
+## Accept-with-warnings rule (IMPORTANT — check before issuing any retry)
+If ALL targets are present in `targets_measured` AND every target's
+`confidence` is >= 0.70:
+- **Do NOT retry** solely because of warn-severity flag_event entries
+  (e.g. suspicious_l1_latency, l2_cliff_not_found, strategy_switch,
+  measurement_uncertainty, ncu verification failures).
+- Warn events are informational annotations; the measurements themselves
+  are valid unless the *values* are physically implausible.
+- Only issue "retry" when:
+  1. A target is absent from `targets_measured`, OR
+  2. A measured value is physically implausible (e.g. L1 latency > DRAM
+     latency, negative bandwidth), OR
+  3. **All** targets in the step have confidence < 0.70.
+
 ## Consistency-accept rule (IMPORTANT)
 If a step's payload contains `retry_count >= 1`, it has already been
 re-measured at least once. In that case:

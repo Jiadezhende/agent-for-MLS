@@ -536,6 +536,22 @@ def _execute_ncu(
     if not raw_csv:
         raw_csv = sub.stdout
 
+    if not raw_csv and sub.returncode != 0:
+        return {
+            "error": "ncu_failed",
+            "error_class": "infrastructure",
+            "stderr": sub.stderr[-2000:] if sub.stderr else "",
+            "hint": (
+                "NCU command failed. Common causes: (1) requires admin/root privileges "
+                "(run with elevated permissions), (2) metric names unsupported on this GPU arch, "
+                "(3) --log-file path issue on Windows. Do NOT retry with different metric names — "
+                "switch to run_cuda_probe self-instrumentation instead."
+            ),
+            "metrics": {},
+            "notes": ["NCU command exited with non-zero returncode; no output produced"],
+            "returncode": sub.returncode,
+        }
+
     reduced = _reduce_ncu(raw_csv, metrics)
     reduced["stdout"] = sub.stdout
     reduced["stderr"] = sub.stderr[-2000:] if sub.stderr else ""

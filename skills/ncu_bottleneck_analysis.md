@@ -1,5 +1,42 @@
 # ncu_bottleneck_analysis — Roofline & Bottleneck Diagnosis via Nsight Compute
 
+## Prescribed usage order (ALWAYS follow this sequence)
+
+When using `profile_with_ncu`, always follow this 4-step approach — do not
+skip steps or use ad-hoc metric lists:
+
+**Step 1 — Roofline baseline (always run first):**
+
+```
+metrics: ["sm__throughput.avg.pct_of_peak_sustained_elapsed",
+          "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"]
+```
+
+**Step 2 — Characterize based on result:**
+
+- Memory% > Compute% → add `dram__throughput`, `l2__throughput`, `l1tex__t_sector_hit_rate`
+- Compute% > Memory% → add `sm__pipe_tensor_op_hmma_cycle_active`, `sm__warps_active`
+
+**Step 3 — Look for anomalies:**
+
+- `sm__warps_active.avg.pct_of_peak_sustained_active` < 10% → SM masking suspected
+- `sm__cycles_elapsed.avg.per_second` differs from measured clock > 10% → throttled
+
+**Step 4 — Hardware intrinsic cross-verification (use these exact metrics):**
+
+| Target metric | NCU metric for verification |
+|---|---|
+| `actual_boost_clock_mhz` | `sm__cycles_elapsed.avg.per_second` (divide by 1e6) |
+| `peak_dram_bandwidth_GBps` | `dram__throughput.avg.pct_of_peak_sustained_elapsed` |
+| `bank_conflict_penalty_x` | `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` |
+| `dram_latency_cycles` | `l1tex__t_sector_hit_rate.pct`, `l2__t_sector_hit_rate.pct` |
+
+**If `profile_with_ncu` returns `error_class: "infrastructure"`:**
+
+- Call `flag_event(type="ncu_failed", severity="error")` immediately
+- Do NOT retry NCU with different metric names — the binary itself failed
+- Fall back to `run_cuda_probe` self-instrumentation (see Environment fallback below)
+
 ## When to use
 
 Use this skill when:

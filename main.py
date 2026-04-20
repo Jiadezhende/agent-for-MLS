@@ -161,9 +161,21 @@ def main() -> None:
     output_path = Path(args.output)
     log_path    = output_path.with_name("reasoning_log.json")
 
+    flat_results: dict[str, int | float] = {}
+    for r in all_results:
+        raw = r.get("value")
+        if raw is None:
+            continue
+        try:
+            fval = float(raw)
+            val: int | float = int(fval) if fval == int(fval) else fval
+        except (TypeError, ValueError):
+            continue
+        flat_results[r["metric"]] = val
+
     try:
         output_path.write_text(
-            json.dumps(all_results, indent=2, default=str),
+            json.dumps(flat_results, indent=2),
             encoding="utf-8",
         )
         log_path.write_text(

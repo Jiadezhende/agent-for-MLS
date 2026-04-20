@@ -7,5 +7,5 @@ pip3 install openai python-dotenv jsonschema \
 
 python3 /workspace/main.py \
   --spec /target/target_spec.json \
-  --output /workspace/results.json \
+  --output /workspace/output.json \
   --verbose

@@ -244,6 +244,11 @@ def _run_subprocess(
         stderr_b = exc.stderr or b""
         timed_out = True
         returncode = -1
+    except FileNotFoundError:
+        stdout_b = b""
+        stderr_b = f"command not found: {cmd[0]}".encode()
+        timed_out = False
+        returncode = 127
 
     # Truncate
     if len(stdout_b) > truncate_bytes:
@@ -684,6 +689,27 @@ def _execute_torch(
 # 9. Environment auto-detection
 # ===========================================================================
 
+_NVCC_SEARCH_PATHS_LINUX: list[str] = [
+    "/usr/local/cuda/bin/nvcc",
+    "/usr/local/cuda-13/bin/nvcc",
+    "/usr/local/cuda-12/bin/nvcc",
+    "/usr/local/cuda-11/bin/nvcc",
+    "/opt/cuda/bin/nvcc",
+]
+
+_NCU_SEARCH_PATHS_LINUX: list[str] = [
+    "/usr/local/cuda/bin/ncu",
+    "/usr/local/cuda-13/bin/ncu",
+    "/usr/local/cuda-12/bin/ncu",
+    "/opt/cuda/bin/ncu",
+]
+
+_NSYS_SEARCH_PATHS_LINUX: list[str] = [
+    "/usr/local/cuda/bin/nsys",
+    "/opt/nvidia/nsight-systems/2024.6/target-linux-x64/nsys",
+    "/opt/nvidia/nsight-systems/2024.3/target-linux-x64/nsys",
+]
+
 _NCU_SEARCH_PATHS_WIN: list[str] = [
     r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.1\ncu.exe",
     r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2024.3\ncu.exe",
@@ -792,6 +818,16 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
     changes: dict[str, Any] = {}
     notes: list[str] = []
 
+    # Auto-detect nvcc if not in PATH (common on Linux where it lives in /usr/local/cuda/bin)
+    if cfg.nvcc_bin == "nvcc" and shutil.which("nvcc") is None:
+        search = [] if sys.platform == "win32" else _NVCC_SEARCH_PATHS_LINUX
+        detected = _detect_tool_path("nvcc", search)
+        if detected:
+            changes["nvcc_bin"] = detected
+            notes.append(f"[auto-detect] nvcc: {detected}")
+        else:
+            notes.append("[auto-detect] nvcc: not found; set AGENT_NVCC_BIN or add to PATH")
+
     # Detect ccbin FIRST — needed for arch validation on Windows (nvcc needs cl.exe)
     if not cfg.nvcc_ccbin:
         ccbin = _detect_msvc_ccbin()
@@ -807,8 +843,9 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
     if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
         arch = _detect_arch_flags()
         if arch:
+            effective_nvcc = changes.get("nvcc_bin") or cfg.nvcc_bin
             effective_ccbin = changes.get("nvcc_ccbin") or cfg.nvcc_ccbin
-            if _validate_arch_flag(arch, cfg.nvcc_bin, ccbin=effective_ccbin):
+            if _validate_arch_flag(arch, effective_nvcc, ccbin=effective_ccbin):
                 changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
                 notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
             else:
@@ -824,13 +861,15 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
             )
 
     if cfg.ncu_bin == "ncu":
-        detected = _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        search = _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else _NCU_SEARCH_PATHS_LINUX
+        detected = _detect_tool_path("ncu", search)
         if detected:
             changes["ncu_bin"] = detected
             notes.append(f"[auto-detect] ncu: {detected}")
 
     if cfg.nsys_bin == "nsys":
-        detected = _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        search = _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else _NSYS_SEARCH_PATHS_LINUX
+        detected = _detect_tool_path("nsys", search)
         if detected:
             changes["nsys_bin"] = detected
             notes.append(f"[auto-detect] nsys: {detected}")

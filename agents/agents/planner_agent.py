@@ -40,7 +40,6 @@ Rules:
 - Each worker has a unique id starting from "step_0"
 - "worker" must be one of the available agent types listed above
 - "targets" is a JSON array of target name strings — one entry per target, no comma-joining
-- All targets of the same agent type go into ONE worker entry
 - Do not include any text outside the JSON object\
 """
 

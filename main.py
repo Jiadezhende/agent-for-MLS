@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -126,11 +127,12 @@ def main() -> None:
     worker_logs: list[dict] = []
 
     if state is not None:
+        raw_results: list[dict] = []
         for step in state.steps:
             out = state.outputs.get(step.id)
             if out is None:
                 continue
-            all_results.extend(out.results)
+            raw_results.extend(out.results)
             worker_logs.append({
                 "step_id":      step.id,
                 "task":         step.task,
@@ -141,6 +143,14 @@ def main() -> None:
                 "reasoning_log": out.reasoning_log,
                 "events":       out.events,
             })
+
+        # Deduplicate by metric: keep the entry with the highest confidence
+        seen: dict[str, dict] = {}
+        for r in raw_results:
+            metric = r.get("metric", "")
+            if metric not in seen or r.get("confidence", 0) > seen[metric].get("confidence", 0):
+                seen[metric] = r
+        all_results = list(seen.values())
 
         failed_steps = [s.id for s in state.steps if not state.outputs.get(s.id, None) or
                         not state.outputs[s.id].success]
@@ -173,7 +183,7 @@ def main() -> None:
     else:
         print(f"[info] Workspace retained at: {executor.workspace.root}", file=sys.stderr)
 
-    sys.exit(exit_code)
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":

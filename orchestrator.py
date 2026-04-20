@@ -127,7 +127,7 @@ class Orchestrator:
 
                 # Critic reviews current outputs
                 self._trace("critic", "start", {})
-                decisions: list[CriticDecision] = self.critic.run(state.outputs)
+                decisions: list[CriticDecision] = self.critic.run(state.outputs, retry_counts)
                 self._trace("critic", "output", {
                     "decisions": [
                         {"step_id": d.step_id, "decision": d.decision,

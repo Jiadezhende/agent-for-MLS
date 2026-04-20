@@ -71,7 +71,11 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Complete CUDA C++ source code (.cu content).",
+                        "description": (
+                            "Complete CUDA C++ source code (.cu content). "
+                            "MUST be actual code starting with #include or __global__. "
+                            "NEVER pass a skill name, filename, or description here."
+                        ),
                     },
                     "probe_name": {
                         "type": "string",

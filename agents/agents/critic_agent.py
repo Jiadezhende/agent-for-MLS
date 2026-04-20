@@ -34,15 +34,21 @@ class CriticAgent(Agent):
         self.agent_registry = agent_registry
         self.verbose = verbose
 
-    def run(self, outputs: dict[str, WorkerOutput]) -> list[CriticDecision]:
+    def run(
+        self,
+        outputs: dict[str, WorkerOutput],
+        retry_counts: dict[str, int] | None = None,
+    ) -> list[CriticDecision]:
         """Cross-validate all worker outputs.
 
-        outputs: step_id → WorkerOutput
+        outputs:      step_id → WorkerOutput
+        retry_counts: step_id → number of retries already performed (0 = first attempt)
         Returns list[CriticDecision] with one decision per step.
         """
         if not outputs:
             return _accept_decisions({})
 
+        counts = retry_counts or {}
         all_decisions: list[CriticDecision] = []
         by_type = self._group_by_type(outputs)
 
@@ -57,6 +63,7 @@ class CriticAgent(Agent):
             decisions = self._critique_one_type(
                 agent_type=agent_type,
                 outputs=typed_outputs,
+                retry_counts=counts,
                 critic_system_prompt=defn.critic_system_prompt,
                 critic_tool_schema=defn.critic_tool_schema,
             )
@@ -77,12 +84,22 @@ class CriticAgent(Agent):
         self,
         agent_type: str,
         outputs: dict[str, WorkerOutput],
+        retry_counts: dict[str, int],
         critic_system_prompt: str,
         critic_tool_schema: dict,
     ) -> list[CriticDecision]:
         results_json = json.dumps(
-            {sid: {"results": out.results, "success": out.success, "summary": out.summary}
-             for sid, out in outputs.items()},
+            {
+                sid: {
+                    "retry_count": retry_counts.get(sid, 0),
+                    "results": out.results,
+                    "success": out.success,
+                    "targets_requested": out.targets_requested,
+                    "targets_measured": [r["metric"] for r in out.results],
+                    "summary": out.summary,
+                }
+                for sid, out in outputs.items()
+            },
             indent=2,
             default=str,
         )
@@ -92,6 +109,9 @@ class CriticAgent(Agent):
             f"Review these {agent_type} worker outputs:\n\n"
             f"```json\n{results_json}\n```\n\n"
             f"Step IDs to evaluate: {step_ids}\n\n"
+            f"IMPORTANT: For each step, compare 'targets_requested' against "
+            f"'targets_measured'. Any target present in 'targets_requested' but "
+            f"absent from 'targets_measured' is MISSING and requires retry.\n\n"
             f"Call {tool_name} with your decisions for each step_id."
         )
         messages = [

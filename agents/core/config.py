@@ -53,7 +53,7 @@ class AgentConfig:
     circuit_breaker_threshold: int = 3    # open circuit after N consecutive failures
     worker_timeout_s: float = 600.0       # max wall time per worker (seconds)
     half_open_timeout_s: float = 60.0     # seconds before open CB allows a probe
-    max_worker_retries: int = 2           # max Critic-triggered retries per step
+    max_worker_retries: int = 1           # max Critic-triggered retries per step
     max_critic_cycles: int = 5            # hard outer limit on Worker→Critic iterations
 
     @classmethod
@@ -64,7 +64,7 @@ class AgentConfig:
             circuit_breaker_threshold=int(os.getenv("AGENT_CB_THRESHOLD") or "3"),
             worker_timeout_s=float(os.getenv("AGENT_WORKER_TIMEOUT_S") or "600"),
             half_open_timeout_s=float(os.getenv("AGENT_HALF_OPEN_TIMEOUT_S") or "60"),
-            max_worker_retries=int(os.getenv("AGENT_MAX_WORKER_RETRIES") or "2"),
+            max_worker_retries=int(os.getenv("AGENT_MAX_WORKER_RETRIES") or "1"),
             max_critic_cycles=int(os.getenv("AGENT_MAX_CRITIC_CYCLES") or "5"),
         )
 

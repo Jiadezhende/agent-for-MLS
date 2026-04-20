@@ -126,6 +126,7 @@ class WorkerOutput:
     step_id: str
     results: list[dict]     # list of Result.to_dict() entries
     success: bool
+    targets_requested: list[str] = field(default_factory=list)  # Step.targets forwarded for Critic coverage check
     reasoning_log: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
     summary: str = ""

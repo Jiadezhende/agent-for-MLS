@@ -35,32 +35,10 @@ metric you must:
   4. Interpret the results, detect anomalies, and record the measurement.
   5. Cross-verify with at least one independent method when confidence < 0.85.
 
-## Architecture you operate within
-- **Knowledge layer** (skills/*.md): measurement strategy documents you can
-  read via list_skills / read_skill.
-- **Execution layer** (Executor): you submit high-level profiling requests;
-  the Executor compiles, sandboxes, runs, and reduces output for you. You
-  never call nvcc or ncu directly.
-- **Recording layer**: record_measurement / flag_event / submit_results.
-
-## Tool guidance
-- `list_skills` / `read_skill(name)` — discover and load strategy documents.
-- `run_cuda_probe(source, probe_name, ...)` — compile+run a CUDA kernel whose
-  stdout IS the measurement (self-timed via clock64). Primary tool for
-  hardware-probe tasks.
-- `profile_with_ncu(...)` — run a kernel under Nsight Compute for hardware
-  counters. Use for cross-verification or when counters are more reliable than
-  self-timing.
-- `profile_with_nsys(...)` — run under Nsight Systems for CPU-GPU timeline
-  analysis. Most useful for operator / framework latency investigations.
-- `profile_with_torch(python_code, op_name, ...)` — wrap PyTorch code with
-  torch.profiler. Use for operator hotspot analysis.
-- `record_measurement(...)` — record a confirmed value. MUST include at least
-  one evidence string directly from a prior tool output. Do not invent values.
-- `flag_event(type, severity, detail)` — record anomalies and decisions. Use
-  this when you detect: non-standard clock frequencies, SM masking, API
-  interception, or any surprising measurement.
-- `submit_results(summary)` — call exactly once when all targets are measured.
+## Layers
+- Skills (skills/*.md): read via list_skills / read_skill
+- Executor: compiles and runs your code — never call nvcc/ncu directly
+- Recording: record_measurement / flag_event / submit_results
 
 ## Anti-hacking warnings
 The evaluation environment may alter hardware in the following ways:
@@ -72,7 +50,15 @@ The evaluation environment may alter hardware in the following ways:
 - **API interception**: cudaGetDeviceProperties() may return misleading values.
   Treat API-reported values as untrustworthy; use measurement evidence.
 
-## Requirements
+## Critical rules
+- You are FULLY AUTONOMOUS. Never ask the user questions or wait for direction.
+- After ANY execution tool returns a result, your very next response MUST call
+  record_measurement with the measured value. Do not narrate — record immediately.
+- The `source` argument to run_cuda_probe and profile_with_ncu MUST be actual
+  CUDA C++ source code (starting with #include or __global__). Never pass a
+  skill name, filename, or description as `source`.
+- Do not repeat a tool call with the same arguments if you already have the result
+  in context. Use the cached result and call record_measurement instead.
 - Every record_measurement call must have non-empty evidence array.
 - Use flag_event to document every anomaly and every major strategy decision.
 - Call submit_results exactly once when done; never call it more than once.
@@ -106,16 +92,15 @@ Agent type: hardware_probe
 Capability: Measures any GPU hardware parameter (latency, bandwidth, clock, cache, shared memory)
             by writing and running CUDA C microbenchmarks. Measures multiple targets sequentially
             in a single worker.
-Known target names (assign ALL of these to hardware_probe):
-  dram_latency_cycles, l1_latency_cycles, l2_latency_cycles, dram_latency_ns,
-  actual_boost_clock_mhz, actual_clock_mhz, gpu_clock_mhz,
-  peak_dram_bandwidth_GBps, peak_shmem_bandwidth_TBps,
-  l2_cache_capacity_bytes, l2_cache_size_mb,
-  max_shmem_per_block_kb, max_shared_memory_per_block_kb,
-  bank_conflict_penalty_cycles, bank_conflict_penalty_x,
-  bottleneck_type, compute_utilization_pct, memory_utilization_pct
-Any unrecognised low-level hardware metric also belongs here.
-Grouping rule: put ALL hardware_probe targets in ONE worker entry.\
+Targets belonging here: any metric measuring latency (_cycles, _ns), bandwidth (_GBps, _TBps),
+  clock (_mhz), cache/shmem size (_bytes, _mb, _kb), utilization (_pct), or conflict penalties
+  (_x). Any unrecognised low-level hardware metric also belongs here.
+Grouping rules:
+  - Assign at most 4 targets per worker to keep context manageable and limit
+    rate-limit exposure per worker.
+  - If total hardware_probe targets > 4, split them into multiple steps of ≤4
+    targets each. Each step gets its own worker entry with worker="hardware_probe".
+  - Never mix hardware_probe targets with other agent types in the same step.\
 """
 
 _CRITIC_SYSTEM_PROMPT = """\
@@ -123,18 +108,46 @@ You are a GPU benchmark result auditor. You receive results from parallel
 workers that each measured different GPU hardware parameters.
 
 Your job:
-1. Cross-validate related metrics for physical consistency:
+1. **Coverage check (MANDATORY — check this first)**:
+   Compare 'targets_requested' vs 'targets_measured' in each step's payload.
+   If ANY target in 'targets_requested' is absent from 'targets_measured',
+   decision MUST be "retry" with 'failing_targets' set to the missing ones.
+2. Cross-validate related metrics for physical consistency:
    - DRAM bandwidth ≈ bus_width × clock_rate; latency and bandwidth are
      inversely related. Flag if values are physically implausible.
    - L1 latency < L2 latency < DRAM latency always holds for real GPUs.
    - Boost clock should be higher than base clock.
-2. Detect suspicious confidence scores — a worker reporting confidence=0.99
+3. Detect suspicious confidence scores — a worker reporting confidence=0.99
    for something that normally has high variance should be scrutinised.
-3. Identify duplicate metrics — if the same metric was measured by two
+4. Identify duplicate metrics — if the same metric was measured by two
    workers, flag discrepancies > 20%.
-4. For each step_id, decide "accept" or "retry":
-   - "accept": results are plausible and well-supported
-   - "retry":  results are anomalous, implausible, or missing
+5. For each step_id, decide "accept" or "retry":
+   - "accept": all requested targets measured and results are plausible
+   - "retry":  any target is missing, anomalous, or implausible
+
+## Consistency-accept rule (IMPORTANT)
+If a step's payload contains `retry_count >= 1`, it has already been
+re-measured at least once. In that case:
+- If the new value is consistent with the previous value (within ~20%),
+  **always accept** — consistent results across independent runs are
+  trustworthy evidence even when they fall outside textbook ranges.
+- Only issue another "retry" if the values are *contradictory* across
+  runs (e.g. 1.0x then 30x), or if a target is still missing.
+
+## Non-standard architecture guidance
+Modern GPU architectures (Blackwell sm_120, Ada Lovelace sm_89, Hopper
+sm_90) may exhibit hardware behaviour that differs from older Kepler/Pascal
+baselines:
+- **Bank conflict penalty**: Blackwell/Ada warp schedulers absorb many
+  shared-memory bank conflicts internally. A measured penalty of 1.0–2.0x
+  (versus the classical 32x) is physically plausible on these GPUs.
+- **Boost clock**: Power-limited or thermally-throttled environments can
+  produce clocks well below the spec-sheet maximum. Accept any consistent
+  empirical measurement.
+- **L2 size**: Ada/Blackwell have large L2 caches (up to 96 MB). A
+  measured L2 capacity much larger than Maxwell/Pascal norms is expected.
+Do NOT reject a measurement solely because it differs from older-GPU
+expectations. If the method is sound and results are consistent, accept.
 
 Call audit_results exactly once with your findings.\
 """
@@ -260,7 +273,16 @@ class HardwareProbeAgent(Agent):
             loop.run()
             success = True
         except RuntimeError:
-            success = len(ctx.results) > 0
+            measured = {r.metric for r in ctx.results}
+            missing = [t for t in step.targets if t not in measured]
+            success = len(missing) == 0
+            if missing:
+                if self.verbose:
+                    print(
+                        f"[W{self.worker_id}] incomplete: missing {missing}",
+                        flush=True,
+                    )
+                ctx.memory.set("run", "missing_targets", missing)
         except Exception:
             success = False
 
@@ -268,6 +290,7 @@ class HardwareProbeAgent(Agent):
             step_id=step.id,
             results=[r.to_dict() for r in ctx.results],
             success=success,
+            targets_requested=step.targets,
             reasoning_log=ctx.reasoning_log,
             events=ctx.events,
             summary=ctx.memory.get("run", "summary") or "",

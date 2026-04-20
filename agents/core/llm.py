@@ -7,12 +7,66 @@ basic exponential-backoff retry.  Streaming + tenacity come in Phase 2.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 
 import openai
 
 from agents.core.config import LLMConfig
+
+
+# ---------------------------------------------------------------------------
+# GLM streaming-artifact cleaner
+# ---------------------------------------------------------------------------
+
+_GLM_ARTIFACT_START = re.compile(r'\{"index":\s*\d+')
+
+
+def _strip_glm_artifacts(text: str | None) -> str | None:
+    """Remove GLM-API streaming delta JSON objects accidentally embedded in content.
+
+    GLM's non-streaming mode appends raw SSE delta objects like
+    {"index":0,"finish_reason":"tool_calls","delta":{...}} to the text content.
+    These pollute conversation history and confuse subsequent LLM calls.
+    Uses brace-counting to correctly handle nested JSON.
+    """
+    if not text:
+        return text
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m = _GLM_ARTIFACT_START.search(text, i)
+        if m is None:
+            parts.append(text[i:])
+            break
+        parts.append(text[i:m.start()])
+        # Walk forward counting braces to find the matching closing brace
+        j = m.start()
+        depth = 0
+        in_str = False
+        esc = False
+        while j < n:
+            c = text[j]
+            if esc:
+                esc = False
+            elif c == '\\' and in_str:
+                esc = True
+            elif c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+            j += 1
+        i = j
+    cleaned = ''.join(parts).strip()
+    return cleaned or None
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +111,7 @@ class ChatResponse:
             for tc in msg.tool_calls:
                 tcs.append(ToolCall.from_openai(tc))
         return cls(
-            content=msg.content,
+            content=_strip_glm_artifacts(msg.content),
             tool_calls=tcs,
             finish_reason=choice.finish_reason or "",
             _raw_tool_calls=msg.tool_calls or [],

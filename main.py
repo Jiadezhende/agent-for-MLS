@@ -151,13 +151,22 @@ def main() -> None:
     output_path = Path(args.output)
     log_path    = output_path.with_name("reasoning_log.json")
 
+    # Flat metric map: {"dram_latency_cycles": 876, ...}
+    metric_map: dict[str, object] = {}
+    for r in all_results:
+        # r may be a dict (already serialised) or a Result-like object
+        if isinstance(r, dict):
+            metric_map[r["metric"]] = r["value"]
+        else:
+            metric_map[r.metric] = r.value
+
     try:
         output_path.write_text(
-            json.dumps(all_results, indent=2, default=str),
+            json.dumps(metric_map, indent=2, default=str),
             encoding="utf-8",
         )
         log_path.write_text(
-            json.dumps({"workers": worker_logs}, indent=2, default=str),
+            json.dumps({"workers": worker_logs, "results": all_results}, indent=2, default=str),
             encoding="utf-8",
         )
         if args.verbose or exit_code != 0:

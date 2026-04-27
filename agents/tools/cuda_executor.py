@@ -452,6 +452,22 @@ _NSYS_SEARCH_PATHS_WIN: list[str] = [
     r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2023.4.1\target-windows-x64\nsys.exe",
 ]
 
+_NVCC_SEARCH_GLOBS_LIN: list[str] = [
+    "/usr/local/cuda/bin/nvcc",
+    "/usr/local/cuda-*/bin/nvcc",
+]
+_NCU_SEARCH_GLOBS_LIN: list[str] = [
+    "/usr/local/cuda/bin/ncu",
+    "/usr/local/cuda-*/bin/ncu",
+    "/opt/nvidia/nsight-compute-*/ncu",
+]
+_NSYS_SEARCH_GLOBS_LIN: list[str] = [
+    "/usr/local/cuda/bin/nsys",
+    "/usr/local/cuda-*/bin/nsys",
+    "/opt/nvidia/nsight-systems-*/target-linux-x64/nsys",
+    "/opt/nvidia/nsight-systems-*/bin/nsys",
+]
+
 
 def _detect_arch_flags() -> str | None:
     """Query nvidia-smi for GPU compute capability and return '-arch=sm_NNN'."""
@@ -513,6 +529,20 @@ def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
     return None
 
 
+def _detect_tool_path_linux(on_path_name: str, glob_patterns: list[str]) -> str | None:
+    """Search Linux CUDA install paths via glob; pick newest version by lexicographic sort."""
+    import glob as _glob
+    if shutil.which(on_path_name) is not None:
+        return None
+    candidates: list[str] = []
+    for pattern in glob_patterns:
+        candidates.extend(_glob.glob(pattern))
+    for candidate in sorted(candidates, reverse=True):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
 def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]:
     """Fill in missing ExecutorConfig values through best-effort auto-detection."""
     import dataclasses
@@ -542,14 +572,31 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
                 "set AGENT_NVCC_CCBIN if compilation fails on Windows"
             )
 
+    if cfg.nvcc_bin == "nvcc" and sys.platform != "win32":
+        detected = _detect_tool_path_linux("nvcc", _NVCC_SEARCH_GLOBS_LIN)
+        if detected:
+            changes["nvcc_bin"] = detected
+            notes.append(f"[auto-detect] nvcc: {detected}")
+        elif shutil.which("nvcc") is None:
+            notes.append(
+                "[auto-detect] nvcc: not found on PATH or known Linux paths. "
+                "Set AGENT_NVCC_BIN or call probe_environment tool at runtime."
+            )
+
     if cfg.ncu_bin == "ncu":
-        detected = _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        detected = (
+            _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN) if sys.platform == "win32"
+            else _detect_tool_path_linux("ncu", _NCU_SEARCH_GLOBS_LIN)
+        )
         if detected:
             changes["ncu_bin"] = detected
             notes.append(f"[auto-detect] ncu: {detected}")
 
     if cfg.nsys_bin == "nsys":
-        detected = _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        detected = (
+            _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN) if sys.platform == "win32"
+            else _detect_tool_path_linux("nsys", _NSYS_SEARCH_GLOBS_LIN)
+        )
         if detected:
             changes["nsys_bin"] = detected
             notes.append(f"[auto-detect] nsys: {detected}")
@@ -579,6 +626,7 @@ class Executor:
     ) -> None:
         cfg, detect_notes = _autodetect_env(cfg)
         self._cfg = cfg
+        self._cfg_lock = threading.Lock()
         self.detect_notes: list[str] = detect_notes
         self._job_listeners: list[Callable[[JobResult], None]] = []
         self._listeners_lock = threading.Lock()
@@ -595,6 +643,73 @@ class Executor:
     def remove_job_listener(self, fn: Callable[[JobResult], None]) -> None:
         with self._listeners_lock:
             self._job_listeners.remove(fn)
+
+    def probe_environment(self, force_rescan: bool = False) -> dict:
+        """Scan filesystem for nvcc/ncu/nsys and reconfigure Executor if found.
+
+        Does NOT execute any binary — only Path.is_file() checks.
+        Safe to call at any point during agent execution.
+        """
+        import dataclasses
+        import glob as _glob
+
+        with self._cfg_lock:
+            cfg = self._cfg
+
+        def _first_glob(patterns: list[str]) -> str | None:
+            candidates: list[str] = []
+            for p in patterns:
+                candidates.extend(_glob.glob(p))
+            for c in sorted(candidates, reverse=True):
+                if Path(c).is_file():
+                    return c
+            return None
+
+        scan = [
+            ("nvcc", cfg.nvcc_bin, _NVCC_SEARCH_GLOBS_LIN if sys.platform != "win32" else []),
+            ("ncu",  cfg.ncu_bin,  _NCU_SEARCH_GLOBS_LIN  if sys.platform != "win32" else _NCU_SEARCH_PATHS_WIN),
+            ("nsys", cfg.nsys_bin, _NSYS_SEARCH_GLOBS_LIN if sys.platform != "win32" else _NSYS_SEARCH_PATHS_WIN),
+        ]
+
+        found: dict[str, str] = {}
+        already: dict[str, str] = {}
+        not_found: list[str] = []
+        changes: dict[str, str] = {}
+
+        for name, current, patterns in scan:
+            if current != name and Path(current).is_file():
+                already[name] = current
+                continue
+            hit = shutil.which(name)
+            if hit and not force_rescan:
+                already[name] = hit
+                continue
+            if sys.platform == "win32":
+                hit = next((p for p in patterns if Path(p).is_file()), None)
+            else:
+                hit = _first_glob(patterns)
+            if hit:
+                found[name] = hit
+                changes[f"{name}_bin"] = hit
+            else:
+                not_found.append(name)
+
+        if changes:
+            with self._cfg_lock:
+                self._cfg = dataclasses.replace(self._cfg, **changes)
+
+        return {
+            "ok": True,
+            "already_configured": already,
+            "newly_found": found,
+            "not_found": not_found,
+            "reconfigured": bool(changes),
+            "hint": (
+                f"Not found: {not_found}. "
+                "Set AGENT_NVCC_BIN / AGENT_NCU_BIN / AGENT_NSYS_BIN env vars."
+                if not_found else "All CUDA tools resolved."
+            ),
+        }
 
     def _detect_gpu_arch(self) -> str:
         try:

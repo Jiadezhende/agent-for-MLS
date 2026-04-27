@@ -31,9 +31,17 @@ def build_user_message(target_spec: dict) -> str:
             lines.append(f"  • {t}")
 
     strategy_hints = target_spec.get("strategy_hints", [])
-    if strategy_hints:
+    env_hints  = [h[6:] for h in strategy_hints if h.startswith("[env] ")]
+    plan_hints = [h     for h in strategy_hints if not h.startswith("[env] ")]
+
+    if env_hints:
+        lines.append("\n## Environment status (check before calling executor tools):")
+        for h in env_hints:
+            lines.append(f"  - {h}")
+
+    if plan_hints:
         lines.append("\n## Planner hints (follow these):")
-        for h in strategy_hints:
+        for h in plan_hints:
             lines.append(f"  - {h}")
 
     lines.append(

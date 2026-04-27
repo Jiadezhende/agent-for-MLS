@@ -159,6 +159,7 @@ class ToolFactory:
             "profile_with_ncu":   (self._executor.profile_with_ncu,       False),
             "profile_with_nsys":  (self._executor.profile_with_nsys,      False),
             "profile_with_torch": (self._executor.profile_with_torch,     False),
+            "probe_environment":  (self._executor.probe_environment,       False),
             "record_measurement": (record_measurement,                    True),
             "flag_event":         (flag_event,                            True),
             "submit_results":     (submit_results,                        True),

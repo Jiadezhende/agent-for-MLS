@@ -324,4 +324,31 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "probe_environment",
+            "description": (
+                "Scan the filesystem for nvcc, ncu, and nsys binaries without executing them. "
+                "Call this when error_class='infrastructure' and error='binary_not_found'. "
+                "If binaries are found, the Executor is reconfigured automatically so "
+                "subsequent tool calls use the discovered paths. "
+                "Does NOT run any subprocess — only filesystem stat checks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "force_rescan": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, re-scans even if a binary appears to be on PATH. "
+                            "Use only if you suspect PATH-based resolution is wrong. "
+                            "Default: false."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]

@@ -84,9 +84,11 @@ Every executor tool error includes an `error_class` field. Use it to decide your
   carefully (it contains only the compiler diagnostic lines, not the command). Fix
   the code and retry.
 - `"infrastructure"`: A binary is missing or the environment is misconfigured.
-  The `hint` field (if present) tells you how to fix it. Do NOT keep retrying the
-  same approach — the code is fine, but the system cannot run it. Call flag_event
-  with severity="error" and try a different measurement strategy (e.g. profile_with_nsys
+  The `hint` field (if present) tells you how to fix it. If the error is
+  `binary_not_found`, call `probe_environment()` first — it scans common Linux/Windows
+  paths and reconfigures the Executor automatically if the binary is found. Only after
+  `probe_environment` returns the tool in `not_found` should you escalate: call
+  flag_event with severity="error" and try a different strategy (e.g. profile_with_nsys
   for timeline evidence, or reduce the problem and submit_results with lower confidence).
 - `"timeout"`: Execution exceeded the time limit. Reduce the workload size or
   pass a larger timeout_s argument.
@@ -203,6 +205,7 @@ class HardwareProbeAgent(Agent):
     REQUIRED_TOOLS: list[str] = [
         "list_skills",
         "read_skill",
+        "probe_environment",
         "run_cuda_probe",
         "profile_with_ncu",
         "profile_with_nsys",

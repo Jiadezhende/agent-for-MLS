@@ -212,6 +212,11 @@ class Orchestrator:
         """Instantiate and run the agent for one Step. Runs on a thread."""
         self._emit(f"[W{worker_id}] Starting step={step.id} task='{step.task}'")
 
+        env_notes = getattr(self.executor, "detect_notes", [])
+        if env_notes:
+            from dataclasses import replace as _dc_replace
+            step = _dc_replace(step, hints=list(step.hints) + [f"[env] {n}" for n in env_notes])
+
         agent_def = self.agent_registry.get(step.worker)
         if agent_def is None:
             msg = f"Unknown agent_type '{step.worker}'"

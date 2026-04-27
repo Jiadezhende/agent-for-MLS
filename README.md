@@ -108,10 +108,22 @@ All settings are controlled via environment variables (`.env` file).
 | `OPENAI_API_KEY`         | —        | **Required.** API key                           |
 | `AGENT_LLM_MODEL`        | —        | **Required.** Model name                        |
 | `OPENAI_BASE_URL`        | OpenAI   | Leave blank for OpenAI; set for other providers |
-| `AGENT_LLM_MAX_TOKENS`   | `4096`   | Max tokens per response                         |
-| `AGENT_LLM_TEMPERATURE`  | `0.2`    | Sampling temperature                            |
+| `AGENT_LLM_MAX_TOKENS`   | `4096`   | Max tokens per response (see note below)        |
+| `AGENT_LLM_TEMPERATURE`  | `0.2`    | Sampling temperature (ignored for o/GPT-5+)     |
 | `AGENT_LLM_TIMEOUT_S`    | `120`    | Per-request timeout (seconds)                   |
 | `AGENT_LLM_MAX_RETRIES`  | `3`      | Retries on transient errors                     |
+
+> **Model family compatibility** (`agents/core/llm.py`): the client auto-detects the model
+> family and adjusts API parameters accordingly.
+>
+> | Model family | Detection rule | `max_tokens` param sent as | `temperature` sent |
+> | --- | --- | --- | --- |
+> | o-series (o1, o3, o4…) | name matches `o\d.*` | `max_completion_tokens` | no |
+> | GPT-5 and later | name starts with `gpt-5` | `max_completion_tokens` | no |
+> | All others (GPT-4o, DeepSeek, vLLM…) | default | `max_tokens` | yes |
+>
+> This means `AGENT_LLM_MAX_TOKENS` and `AGENT_LLM_TEMPERATURE` work for all providers
+> without any code changes — the client picks the right parameter name automatically.
 
 ### Agent loop
 

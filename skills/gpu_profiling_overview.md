@@ -1,70 +1,38 @@
 # GPU Profiling Overview
 
-This document provides a high-level map of the measurement strategies
-available in this skill library.
+This file is the routing index for the hardware-probe skill library. Read it
+first, then read the one domain skill that matches the requested target.
 
-## Metric categories
+## Skill routing
 
-### Memory latency hierarchy
+| Target family | Examples | Read this skill |
+| --- | --- | --- |
+| Memory latency and cache size | `dram_latency_cycles`, `l2_latency_cycles`, `l2_cache_capacity_bytes` | `memory_hierarchy` |
+| Bandwidth and shared resources | `peak_dram_bandwidth_GBps`, `peak_shmem_bandwidth_TBps`, `max_shmem_per_block_kb`, `bank_conflict_penalty_cycles` | `throughput_resources` |
+| Clock and environment state | `actual_boost_clock_mhz`, `effective_sm_count`, clock lock or SM masking checks | `clock_environment` |
 
-Use pointer-chasing kernels to measure access latency for each cache tier.
-The key is to size the working set to force cache misses at the tier you
-want to measure, and use a random (non-sequential) access pattern so the
-prefetcher cannot hide latency.
+## General method
 
-- L1 cache latency: array fits entirely in L1 (~32 KB for most GPUs)
-- L2 cache latency: array fits in L2 but not L1 (~4–40 MB)
-- DRAM latency: array is much larger than L2 (>100 MB)
-
-Skill to use: `memory_latency` (Phase 2)
-
-### Memory bandwidth
-
-Use streaming read/write kernels to saturate memory bandwidth. The array
-must be large enough to exceed all cache levels, and the access pattern
-must be sequential (coalesced) for global memory bandwidth.
-
-Skill to use: `memory_bandwidth` (Phase 2)
-
-### L2 cache capacity
-
-Sweep the working set size across a range (e.g. 1 MB to 64 MB in steps)
-and plot the measured latency. The point where latency jumps sharply
-indicates the L2 boundary.
-
-Skill to use: `cache_capacity` (Phase 2)
-
-### Actual boost clock frequency
-
-Run a compute-intensive kernel and measure elapsed wall time against
-elapsed GPU clock cycles using `clock64()`. This gives the true operating
-frequency regardless of what nvidia-smi or cudaGetDeviceProperties report.
-
-Skill to use: `clock_measurement` (Phase 2)
-
-### Bank conflict penalty
-
-Compare shared memory access time with stride=1 (conflict-free) versus
-stride=32 (every thread hits the same bank). The ratio gives the conflict
-penalty in cycles.
-
-Skill to use: `bank_conflict` (Phase 2)
+1. Prefer `run_cuda_probe` with a self-timed CUDA C microbenchmark.
+2. Use `profile_with_ncu` only after a successful CUDA probe and pass the
+   returned `binary_path`.
+3. Record direct stdout evidence in every `record_measurement` call.
+4. Use `flag_event` for strategy choices, suspicious values, clock locking,
+   SM masking, API spoofing, ncu permission failures, and circuit breaker events.
+5. Report measured values from the active environment, not online specifications.
 
 ## Anti-hacking checklist
 
-Before finalizing any measurement:
-1. Compare measured clock against cudaGetDeviceProperties().clockRate.
-   If difference > 10%, flag_event "clock_locked" and report the measured value.
-2. Verify L2 latency is in the expected range for the GPU family.
-   If DRAM latency < 200 cycles, the working set may still be in L2.
-3. Check that measured peak bandwidth is lower than theoretical max.
-   If measured > theoretical, the measurement likely contains artifacts.
+- Treat `cudaGetDeviceProperties`, `nvidia-smi`, and spec sheets as secondary
+  evidence only.
+- If measured clock differs from reported clock by more than 10 percent, flag
+  `clock_locked` or `clock_throttled` and report the measured value.
+- If measured SM count is lower than API count, flag `sm_masked`.
+- If DRAM latency is below 200 cycles, increase the working set before recording.
+- If bandwidth exceeds plausible physical peak, fix byte accounting before
+  recording.
 
-## Recommended sequence for hardware_probe tasks
+## Completion rule
 
-1. list_skills → read_skill for each relevant strategy
-2. run_cuda_probe with a self-timed kernel → primary measurement
-3. profile_with_ncu with relevant counter metrics → cross-verification
-4. flag_event for any discrepancy > 10%
-5. record_measurement with confidence reflecting variance across runs
-6. submit_results with methodology summary
+Call `submit_results` exactly once after every requested target has either a
+measured result or an explicit low-confidence unavailable result with evidence.

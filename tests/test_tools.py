@@ -163,9 +163,12 @@ class TestListSkills:
     def test_includes_known_skills(self):
         result = list_skills()
         names = {s["name"] for s in result["skills"]}
-        assert "gpu_profiling_overview" in names
-        assert "memory_latency" in names
-        assert "clock_measurement" in names
+        assert names == {
+            "gpu_profiling_overview",
+            "memory_hierarchy",
+            "throughput_resources",
+            "clock_environment",
+        }
 
     def test_excludes_template(self):
         result = list_skills()
@@ -195,15 +198,20 @@ class TestReadSkill:
         assert "content" in result
         assert len(result["content"]) > 100
 
-    def test_reads_memory_latency(self):
-        result = read_skill("memory_latency")
+    def test_reads_memory_hierarchy(self):
+        result = read_skill("memory_hierarchy")
         assert "error" not in result
         assert "pointer" in result["content"].lower()
 
-    def test_reads_clock_measurement(self):
-        result = read_skill("clock_measurement")
+    def test_reads_clock_environment(self):
+        result = read_skill("clock_environment")
         assert "error" not in result
         assert "clock" in result["content"].lower()
+
+    def test_reads_throughput_resources(self):
+        result = read_skill("throughput_resources")
+        assert "error" not in result
+        assert "bandwidth" in result["content"].lower()
 
     def test_missing_skill_returns_error(self):
         result = read_skill("nonexistent_skill_xyz")

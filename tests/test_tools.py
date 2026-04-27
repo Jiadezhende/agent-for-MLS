@@ -8,6 +8,7 @@ import pytest
 from agents.tools.registry import _Terminated
 from agents.tools.builtin.recording import flag_event, record_measurement, submit_results
 from agents.tools.builtin.skills import list_skills, read_skill
+from agents.tools.schemas import TOOL_SCHEMAS
 
 
 # ===========================================================================
@@ -220,3 +221,15 @@ class TestReadSkill:
     def test_truncated_flag_false_for_small_file(self):
         result = read_skill("gpu_profiling_overview")
         assert result["truncated"] is False
+
+
+class TestToolSchemas:
+    def test_profile_with_ncu_requires_binary_path_only(self):
+        schema_map = {s["function"]["name"]: s for s in TOOL_SCHEMAS}
+        params = schema_map["profile_with_ncu"]["function"]["parameters"]
+        props = params["properties"]
+        assert "binary_path" in props
+        assert "source_type" not in props
+        assert "source_or_path" not in props
+        assert "compile_flags" not in props
+        assert params["required"] == ["binary_path", "kernel_name", "metrics"]

@@ -50,7 +50,9 @@ metric you must:
   hardware-probe tasks.
 - `profile_with_ncu(...)` — run a kernel under Nsight Compute for hardware
   counters. Use for cross-verification or when counters are more reliable than
-  self-timing.
+  self-timing. Always call run_cuda_probe first, then pass its returned
+  binary_path to profile_with_ncu. Never pass CUDA source directly to
+  profile_with_ncu.
 - `profile_with_nsys(...)` — run under Nsight Systems for CPU-GPU timeline
   analysis. Most useful for operator / framework latency investigations.
 - `profile_with_torch(python_code, op_name, ...)` — wrap PyTorch code with
@@ -90,6 +92,18 @@ Every executor tool error includes an `error_class` field. Use it to decide your
   instead of run_cuda_probe), or submit_results if no alternative exists.
 - `"timeout"`: Execution exceeded the time limit. Reduce the workload size or
   pass a larger timeout_s argument.
+- `"data_quality"`: The tool ran but the evidence is not usable, such as ncu
+  seeing no kernel for the requested kernel_name. Fix the kernel name, metric
+  name, or measurement setup instead of blindly retrying the same call.
+
+## Nsight Compute workflow
+For ncu counter cross-checks:
+1. Call run_cuda_probe with the CUDA source and confirm the probe runs.
+2. Read the returned binary_path from run_cuda_probe.
+3. Call profile_with_ncu(binary_path=<that path>, kernel_name=<kernel>, metrics=[...]).
+4. If profile_with_ncu returns missing_metrics, fix the metric names.
+5. If kernel_names_seen does not include your intended kernel, fix kernel_name
+   or the CUDA source so the kernel actually launches.
 
 ## Circuit breaker
 When you receive `"status": "circuit_open"` from a tool:

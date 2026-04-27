@@ -22,6 +22,9 @@ from agents.tools.cuda_executor import (
     _safe_join,
     _check_binary,
     _run_subprocess,
+    _reduce_probe_output,
+    _reduce_ncu,
+    _classify_subprocess_failure,
 )
 from agents.core.config import ExecutorConfig
 
@@ -284,7 +287,7 @@ int main() {
         assert completed[0].status == "done"
 
     def test_stdout_truncate(self, exec_cfg):
-        """stdout_truncate_bytes is respected."""
+        """Large probe stdout is reduced into head/tail evidence."""
         import tempfile
         from agents.tools.cuda_executor import Executor
 
@@ -305,7 +308,10 @@ int main() {
         result = exc.run_cuda_probe(source=big_src, probe_name="trunc_test")
         # Status may be done or error depending on whether nvcc treats this as CUDA
         if result["status"] == "done":
-            assert len(result.get("stdout", "")) <= 200  # truncated + marker overhead
+            assert "stdout_total_bytes" in result
+            if result["stdout_total_bytes"] > 9216:
+                assert "stdout_tail" in result
+                assert "stdout_head" in result
 
 
 # ===========================================================================
@@ -344,6 +350,52 @@ class TestRunSubprocess:
             truncate_bytes=50,
         )
         assert len(result.stdout.encode()) <= 100  # truncate marker adds bytes
+
+
+class TestProbeOutputReduction:
+    def test_small_output_keeps_stdout(self):
+        reduced = _reduce_probe_output(b"startup\nmeasurement=42\n", "utf-8")
+        assert reduced["stdout"] == "startup\nmeasurement=42\n"
+        assert reduced["stdout_total_bytes"] == len(b"startup\nmeasurement=42\n")
+
+    def test_large_output_keeps_head_and_tail(self):
+        payload = b"head\n" + (b"A" * 12000) + b"\nmeasurement=42\n"
+        reduced = _reduce_probe_output(payload, "utf-8")
+        assert "stdout" not in reduced
+        assert "stdout_head" in reduced
+        assert "stdout_tail" in reduced
+        assert "measurement=42" in reduced["stdout_tail"]
+        assert reduced["stdout_total_bytes"] == len(payload)
+
+
+class TestNcuReduction:
+    RAW = '''==PROF== Connected
+"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
+"1","k","sm__cycles_elapsed.avg.per_second","cycle/nsecond","99"
+"1","k","sm__cycles_elapsed.avg","cycle","1,000"
+"2","k","sm__cycles_elapsed.avg","cycle","3,000"
+"1","k","dram__bytes.sum","byte","10"
+"2","k","dram__bytes.sum","byte","20"
+'''
+
+    def test_exact_metric_name_no_substring_match(self):
+        reduced = _reduce_ncu(self.RAW, ["sm__cycles_elapsed.avg"])
+        assert reduced["metrics"]["sm__cycles_elapsed.avg"] == 2000.0
+        assert "sm__cycles_elapsed.avg.per_second" not in reduced["metrics"]
+
+    def test_sum_metric_aggregates_by_sum(self):
+        reduced = _reduce_ncu(self.RAW, ["dram__bytes.sum"])
+        assert reduced["metrics"]["dram__bytes.sum"] == 30.0
+
+    def test_missing_metric_reported(self):
+        reduced = _reduce_ncu(self.RAW, ["metric.not.found"])
+        assert reduced["metrics"] == {}
+        assert reduced["missing_metrics"] == ["metric.not.found"]
+
+    def test_kernel_names_seen_and_profile_count(self):
+        reduced = _reduce_ncu(self.RAW, ["sm__cycles_elapsed.avg"])
+        assert reduced["kernel_names_seen"] == ["k"]
+        assert reduced["kernels_profiled"] == 2
 
 
 class TestCompileErrorParsing:
@@ -386,6 +438,31 @@ class TestCompileErrorParsing:
         from agents.tools.cuda_executor import _classify_compile_error
         combined = "nvcc: command not found"
         assert _classify_compile_error(combined) == "infrastructure"
+
+    def test_classifier_timeout(self):
+        result = _classify_subprocess_failure("", phase="run", timed_out=True)
+        assert result["error_class"] == "timeout"
+        assert result["error"] == "run_timeout"
+
+    def test_classifier_ncu_permission(self):
+        result = _classify_subprocess_failure("ERR_NVGPUCTRPERM", phase="profile")
+        assert result["error"] == "ncu_permission_denied"
+        assert result["error_class"] == "infrastructure"
+
+    def test_classifier_cuda_oom(self):
+        result = _classify_subprocess_failure("cudaErrorMemoryAllocation", phase="run")
+        assert result["error"] == "cuda_oom"
+        assert result["error_class"] == "user_code"
+
+    def test_classifier_linker(self):
+        result = _classify_subprocess_failure("LNK2019 unresolved external symbol", phase="compile")
+        assert result["error"] == "link_failed"
+        assert result["error_class"] == "user_code"
+
+    def test_classifier_unsupported_arch(self):
+        result = _classify_subprocess_failure("unsupported gpu architecture 'sm_120'", phase="compile")
+        assert result["error"] == "unsupported_arch"
+        assert result["error_class"] == "user_code"
 
     def test_executor_error_has_error_class_field(self):
         from agents.tools.cuda_executor import ExecutorError

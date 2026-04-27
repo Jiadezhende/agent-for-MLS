@@ -206,16 +206,17 @@ class TestDispatchCircuitBreaker:
         assert result["status"] == "circuit_open"
         assert result["tool"] == "flag_event"
 
-    def test_timed_out_does_not_count_toward_circuit(self):
-        """timed_out results should not open the circuit (kernel just slow)."""
+    def test_timeout_error_counts_toward_circuit(self):
+        """Executor timeouts are structured errors and should open circuits."""
         ctx = _make_ctx(threshold=1)
         reg = _make_registry_with_tool(
             "run_cuda_probe",
-            {"status": "timed_out", "stdout": "", "timed_out": True}
+            {"status": "error", "error": "run_timeout", "error_class": "timeout"}
         )
         reg.dispatch("run_cuda_probe", {}, ctx)
         result = reg.dispatch("run_cuda_probe", {}, ctx)
-        assert result.get("status") != "circuit_open"
+        assert result.get("status") == "circuit_open"
+        assert "run_timeout" in result["open_error_kinds"]
 
     def test_different_tools_have_independent_circuits(self):
         ctx = _make_ctx(threshold=1)

@@ -64,6 +64,7 @@ TOOL_SCHEMAS: list[dict] = [
                 "kernel measures hardware properties via self-timing (clock64) "
                 "and you need the stdout output as your primary measurement. "
                 "The Executor handles compilation, sandboxing, and stdout capture. "
+                "On success it returns binary_path for profile_with_ncu cross-checks. "
                 "Do NOT use this for profiling — use profile_with_ncu instead."
             ),
             "parameters": {
@@ -110,26 +111,18 @@ TOOL_SCHEMAS: list[dict] = [
                 "Run a kernel under NVIDIA Nsight Compute to collect hardware "
                 "performance counters. Use this to cross-verify measurements, "
                 "detect clock throttling, check cache efficiency, or measure "
-                "memory bandwidth from the hardware counter side. "
-                "source_type='cuda_source' compiles internally; "
-                "source_type='binary' runs an existing workspace binary."
+                "memory bandwidth from the hardware counter side. Always pass "
+                "binary_path returned by a successful run_cuda_probe call; this "
+                "tool does not compile CUDA source internally."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "source_type": {
-                        "type": "string",
-                        "enum": ["cuda_source", "binary"],
-                        "description": (
-                            "'cuda_source' to provide CUDA source code (Executor compiles it); "
-                            "'binary' to run a binary already in the workspace."
-                        ),
-                    },
-                    "source_or_path": {
+                    "binary_path": {
                         "type": "string",
                         "description": (
-                            "If source_type='cuda_source': the full CUDA source code. "
-                            "If source_type='binary': workspace-relative path to the binary."
+                            "Workspace-relative binary path returned by run_cuda_probe, "
+                            "for example 'bin/probe.exe' on Windows or 'bin/probe' on Linux."
                         ),
                     },
                     "kernel_name": {
@@ -149,11 +142,6 @@ TOOL_SCHEMAS: list[dict] = [
                             "'l2__throughput.avg.pct_of_peak_sustained_elapsed']"
                         ),
                     },
-                    "compile_flags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "default": [],
-                    },
                     "args": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -165,7 +153,7 @@ TOOL_SCHEMAS: list[dict] = [
                         "description": "Total timeout for ncu run in seconds.",
                     },
                 },
-                "required": ["source_type", "source_or_path", "kernel_name", "metrics"],
+                "required": ["binary_path", "kernel_name", "metrics"],
             },
         },
     },

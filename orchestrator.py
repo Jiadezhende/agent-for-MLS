@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from dataclasses import dataclass, field
 from typing import Any
 
-from agents._registry import all_definitions, get as _get_agent_def
+from agents._registry import all_definitions
 from agents.agents.critic_agent import CriticAgent
 from agents.agents.planner_agent import PlannerAgent
 from agents.core.llm import LLMClient
@@ -188,7 +188,7 @@ class Orchestrator:
         """Instantiate and run the agent for one Step. Runs on a thread."""
         self._emit(f"[W{worker_id}] Starting step={step.id} task='{step.task}'")
 
-        agent_def = _get_agent_def(step.worker)
+        agent_def = self.agent_registry.get(step.worker)
         if agent_def is None:
             msg = f"Unknown agent_type '{step.worker}'"
             self._emit(f"[W{worker_id}] Error: {msg}")

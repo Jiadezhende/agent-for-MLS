@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from agents._registry import AgentDefinition
 from agents.core.config import AgentConfig
 from agents.core.llm import ChatResponse, ToolCall
-from agents.core.types import Result, Task, WorkerOutput
+from agents.core.types import Result, Step, Task, WorkerOutput
 from orchestrator import Orchestrator
 
 
@@ -151,3 +154,152 @@ def test_orchestrator_retries_step_when_critic_requests_retry():
     assert state.done is True
     assert _FakeWorkerAgent.calls == 2
     assert state.retry_set == set()
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for timeout tests
+# ---------------------------------------------------------------------------
+
+_AUDIT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "audit_results",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decisions": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["decisions"],
+        },
+    },
+}
+
+
+def _make_agent_def(agent_type: str, agent_class: type) -> AgentDefinition:
+    return AgentDefinition(
+        agent_type=agent_type,
+        description=f"{agent_type} worker",
+        agent_class=agent_class,
+        required_tools=[],
+        planner_hints="",
+        critic_system_prompt="",
+        critic_tool_schema=_AUDIT_SCHEMA,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: slow worker finishing after pool timeout still yields its real output
+# ---------------------------------------------------------------------------
+
+def test_slow_worker_result_preferred_over_timeout_placeholder():
+    """A worker that finishes after the soft deadline still yields its real output."""
+
+    class _SlowWorkerAgent:
+        def __init__(self, llm, agent_cfg, verbose=False, worker_id=0):
+            pass
+
+        def run(self, step, tools):
+            time.sleep(0.3)
+            return WorkerOutput(
+                step_id=step.id,
+                results=[{
+                    "metric": step.task, "value": 99, "unit": "cycles",
+                    "confidence": 0.9, "method": "slow", "evidence": [],
+                }],
+                success=True,
+                summary="slow_ok",
+            )
+
+    task = Task(
+        id="task_0",
+        type="hardware_probe",
+        description="slow timeout test",
+        payload={"targets": ["slow_metric"]},
+        constraints={},
+    )
+    cfg = AgentConfig(max_iterations=1, worker_timeout_s=0.05)
+
+    orch = Orchestrator(
+        llm=_FakeLLM(),
+        executor=_FakeExecutor(),
+        task=task,
+        agent_cfg=cfg,
+        agent_registry={"slow_probe": _make_agent_def("slow_probe", _SlowWorkerAgent)},
+    )
+
+    state = orch.run()
+
+    assert state.done is True
+    out = state.outputs["step_0"]
+    assert out.success is True, f"expected success but got summary={out.summary!r}"
+    assert out.summary == "slow_ok"
+    assert out.results[0]["value"] == 99
+
+
+# ---------------------------------------------------------------------------
+# Test: a future that can be cancelled returns worker_timeout
+# ---------------------------------------------------------------------------
+
+def test_cancellable_future_returns_timeout_summary(monkeypatch):
+    """A queued future that is cancelled before starting returns worker_timeout."""
+    from concurrent.futures import ThreadPoolExecutor as _RealTPE
+
+    block = threading.Event()
+
+    class _BlockingWorkerAgent:
+        def __init__(self, llm, agent_cfg, verbose=False, worker_id=0):
+            pass
+
+        def run(self, step, tools):
+            block.wait(timeout=5)
+            return WorkerOutput(
+                step_id=step.id,
+                results=[],
+                success=True,
+                summary="block_ok",
+            )
+
+    class _SingleThreadTPE(_RealTPE):
+        def __init__(self, max_workers):
+            super().__init__(max_workers=1)
+
+    monkeypatch.setattr("orchestrator.ThreadPoolExecutor", _SingleThreadTPE)
+
+    task = Task(
+        id="task_0",
+        type="hardware_probe",
+        description="cancel test",
+        payload={"targets": []},
+        constraints={},
+    )
+    cfg = AgentConfig(max_iterations=1, worker_timeout_s=0.05)
+    orch = Orchestrator(
+        llm=_FakeLLM(),
+        executor=_FakeExecutor(),
+        task=task,
+        agent_cfg=cfg,
+        agent_registry={"blocking_probe": _make_agent_def("blocking_probe", _BlockingWorkerAgent)},
+    )
+
+    steps = [
+        Step(id="step_0", task="t0", worker="blocking_probe"),
+        Step(id="step_1", task="t1", worker="blocking_probe"),
+    ]
+
+    timer = threading.Timer(0.15, block.set)
+    timer.start()
+    try:
+        results = orch._run_workers(steps, timeout_s=0.05)
+    finally:
+        block.set()
+        timer.cancel()
+
+    by_id = {r.step_id: r for r in results}
+
+    # step_0 was running when timeout fired; real output collected after pool drains
+    assert by_id["step_0"].success is True
+    assert by_id["step_0"].summary == "block_ok"
+
+    # step_1 was queued and not started; it was cancelled → worker_timeout
+    assert by_id["step_1"].success is False
+    assert by_id["step_1"].summary == "worker_timeout"

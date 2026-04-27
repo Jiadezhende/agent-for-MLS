@@ -1,8 +1,8 @@
 """
-agents/core/llm.py — The ONLY file that imports openai.
+agents/core/llm.py - The ONLY file that imports openai.
 
-Wraps the OpenAI SDK into a simple chat() interface.  Non-streaming,
-basic exponential-backoff retry.  Streaming + tenacity come in Phase 2.
+Wraps the OpenAI SDK into a simple chat() interface. Non-streaming,
+basic exponential-backoff retry. Streaming + tenacity come in Phase 2.
 """
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ class ToolCall:
 class ChatResponse:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning_content: str | None = None
     finish_reason: str = ""
     _raw_tool_calls: list = field(default_factory=list, repr=False)
 
@@ -56,21 +57,31 @@ class ChatResponse:
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 tcs.append(ToolCall.from_openai(tc))
+
+        reasoning_content = getattr(msg, "reasoning_content", None)
+        if reasoning_content is None:
+            model_extra = getattr(msg, "model_extra", None)
+            if isinstance(model_extra, dict):
+                reasoning_content = model_extra.get("reasoning_content")
+
         return cls(
             content=msg.content,
             tool_calls=tcs,
+            reasoning_content=reasoning_content,
             finish_reason=choice.finish_reason or "",
             _raw_tool_calls=msg.tool_calls or [],
         )
 
     def to_openai_message(self) -> dict:
-        """Reconstruct the assistant message dict the API expects on the next turn.
+        """Reconstruct the assistant message dict expected on the next turn.
 
         IMPORTANT: The tool_calls list must be included verbatim (as dicts)
         so the provider can match tool call IDs to the tool-result messages
         we append afterwards.
         """
         msg: dict = {"role": "assistant", "content": self.content}
+        if self.reasoning_content is not None:
+            msg["reasoning_content"] = self.reasoning_content
         if self._raw_tool_calls:
             msg["tool_calls"] = [
                 {
@@ -93,7 +104,7 @@ class ChatResponse:
 class LLMClient:
     """Thin wrapper around openai.OpenAI.
 
-    Exposes a single chat() method.  The rest of the codebase never sees
+    Exposes a single chat() method. The rest of the codebase never sees
     the openai module.
     """
 
@@ -101,13 +112,13 @@ class LLMClient:
         self._cfg = cfg
         self._client = openai.OpenAI(
             api_key=cfg.api_key,
-            base_url=cfg.base_url,          # None → uses OpenAI default
+            base_url=cfg.base_url,          # None uses OpenAI default
         )
 
     def chat(
         self,
         messages: list[dict],
-        tools: list[dict],
+        tools: list[dict] | None,
     ) -> ChatResponse:
         """Call the LLM with retry on transient errors.
 
@@ -132,15 +143,15 @@ class LLMClient:
                 openai.APIConnectionError,
             ) as exc:
                 last_exc = exc
-                wait = 2 ** attempt          # 1 s, 2 s, 4 s, …
+                wait = 2 ** attempt          # 1 s, 2 s, 4 s, ...
                 print(
                     f"[llm] transient error (attempt {attempt + 1}/"
                     f"{self._cfg.max_retries}): {exc}. "
-                    f"Retrying in {wait}s …"
+                    f"Retrying in {wait}s..."
                 )
                 time.sleep(wait)
             except openai.APIStatusError as exc:
-                # 4xx errors (except 429) are not transient — surface immediately.
+                # 4xx errors (except 429) are not transient; surface immediately.
                 if exc.status_code == 429:
                     last_exc = exc
                     wait = 2 ** attempt

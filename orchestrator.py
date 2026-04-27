@@ -148,6 +148,7 @@ class Orchestrator:
         max_threads = min(len(steps), 8)
         future_to_step: dict = {}
         results: list[WorkerOutput] = []
+        collected: set = set()
 
         with ThreadPoolExecutor(max_workers=max_threads) as pool:
             for i, step in enumerate(steps):
@@ -157,32 +158,55 @@ class Orchestrator:
             try:
                 for future in as_completed(future_to_step, timeout=timeout_s):
                     step = future_to_step[future]
-                    try:
-                        results.append(future.result())
-                    except Exception as exc:
-                        self._emit(f"[orchestrator] Step {step.id} raised: {exc}")
-                        results.append(WorkerOutput(
-                            step_id=step.id, results=[], success=False
-                        ))
+                    collected.add(future)
+                    results.append(self._future_output(future, step))
 
             except FuturesTimeout:
-                self._emit("[orchestrator] Worker pool timed out. Collecting partial results.")
+                self._emit(
+                    "[orchestrator] Worker pool timed out. "
+                    "Waiting for running workers to finish."
+                )
                 for future, step in future_to_step.items():
+                    if future in collected:
+                        continue
                     if future.done():
-                        try:
-                            results.append(future.result())
-                        except Exception:
-                            results.append(WorkerOutput(
-                                step_id=step.id, results=[], success=False
-                            ))
-                    else:
-                        future.cancel()
+                        collected.add(future)
+                        results.append(self._future_output(future, step))
+                    elif future.cancel():
+                        collected.add(future)
                         results.append(WorkerOutput(
                             step_id=step.id, results=[], success=False,
                             summary="worker_timeout",
                         ))
 
+        # ThreadPoolExecutor cannot forcibly stop already-running workers. The
+        # context manager waits for them, so collect their real outputs instead
+        # of returning stale timeout placeholders.
+        for future, step in future_to_step.items():
+            if future in collected:
+                continue
+            collected.add(future)
+            if future.cancelled():
+                results.append(WorkerOutput(
+                    step_id=step.id, results=[], success=False,
+                    summary="worker_timeout",
+                ))
+            elif future.done():
+                results.append(self._future_output(future, step))
+            else:
+                results.append(WorkerOutput(
+                    step_id=step.id, results=[], success=False,
+                    summary="worker_timeout",
+                ))
+
         return results
+
+    def _future_output(self, future: Any, step: Step) -> WorkerOutput:
+        try:
+            return future.result()
+        except Exception as exc:
+            self._emit(f"[orchestrator] Step {step.id} raised: {exc}")
+            return WorkerOutput(step_id=step.id, results=[], success=False)
 
     def _run_single_step(self, step: Step, worker_id: int) -> WorkerOutput:
         """Instantiate and run the agent for one Step. Runs on a thread."""

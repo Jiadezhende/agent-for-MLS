@@ -15,8 +15,8 @@ Use this skill for targets such as:
 
 ## Primary CUDA strategies
 
-For clock, launch a sustained compute kernel and measure both GPU cycles and
-wall time:
+For clock, the **primary method** is combining `clock64()` cycle counts with
+CUDA-event wall time:
 
 ```text
 actual_clock_mhz = (clock64_end - clock64_start) / wall_seconds / 1e6
@@ -25,6 +25,17 @@ actual_clock_mhz = (clock64_end - clock64_start) / wall_seconds / 1e6
 Use CUDA events for wall time and `clock64()` from inside the measured kernel.
 Run long enough to reduce launch overhead, usually 100 ms or more. Repeat two or
 three times if the value looks unstable.
+
+`cudaDeviceProp.clockRate` and driver/API queries are **secondary evidence only**.
+Use them to cross-check, not as the primary measurement. On some drivers they
+report the TDP boost ceiling, not the sustained operating clock.
+
+**Nsight Compute (`profile_with_ncu`) may perturb boost clocks.** The profiler
+replays kernels under instruction-level sampling, which can force the GPU into
+a lower power state. Always run the microbenchmark first with `run_cuda_probe`,
+record the clock from that run, and use `profile_with_ncu` only as a
+cross-check — never let the ncu result replace the probe result for
+`actual_boost_clock_mhz`.
 
 For effective SM count, use a persistent kernel with one block per possible SM
 and atomic counters that record concurrently resident blocks. Treat API-reported

@@ -11,6 +11,15 @@ first, then read the one domain skill that matches the requested target.
 | Bandwidth and shared resources | `peak_dram_bandwidth_GBps`, `peak_shmem_bandwidth_TBps`, `max_shmem_per_block_kb`, `bank_conflict_penalty_cycles` | `throughput_resources` |
 | Clock and environment state | `actual_boost_clock_mhz`, `effective_sm_count`, clock lock or SM masking checks | `clock_environment` |
 
+## Preflight rule
+
+Do **not** hardcode `-arch`, `--gpu-architecture`, or any `sm_NNN` flag in
+CUDA source or compiler arguments. The Executor auto-detects the GPU
+architecture via `nvidia-smi` and injects the correct flag through
+`AGENT_NVCC_FLAGS`. Hardcoding an arch flag can override detection and
+silently produce wrong code (e.g., `clock64()` is unavailable below sm_70
+and requires sm_120 on Blackwell).
+
 ## General method
 
 1. Prefer `run_cuda_probe` with a self-timed CUDA C microbenchmark.

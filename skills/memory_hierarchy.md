@@ -88,6 +88,14 @@ microbenchmark result but lower confidence and flag a `data_quality` event.
 - L1 latency greater than L2 latency indicates timing overhead or wrong working set.
 - A capacity cliff with a single noisy point is not enough; repeat around the cliff.
 - High variance across trials suggests clock instability; record confidence below 0.85.
+- Zero cycles, missing writes, or `ncu_no_kernel_found` from a first-attempt kernel
+  are most likely caused by a kernel that never launched or a mismatched GPU
+  architecture. Before changing the timing approach or adding a fallback timer,
+  add a `cudaGetLastError` / `cudaDeviceSynchronize` after every kernel launch
+  and confirm the kernel ran. If the error message mentions an unsupported PTX
+  instruction or an invalid device function, the architecture flag is wrong;
+  check that no `-arch` is hardcoded (see gpu_profiling_overview preflight rule)
+  and that the Executor-injected flag matches the physical GPU.
 
 ## Failure fallback
 

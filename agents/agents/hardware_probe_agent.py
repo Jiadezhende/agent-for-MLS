@@ -238,6 +238,7 @@ class HardwareProbeAgent(Agent):
         "record_measurement",
         "flag_event",
         "submit_results",
+        "find_binary",
     ]
 
     def __init__(

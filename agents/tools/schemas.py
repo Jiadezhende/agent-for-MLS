@@ -383,4 +383,29 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # ------------------------------------------------------------------
+    # Environment tools
+    # ------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "find_binary",
+            "description": (
+                "Search the filesystem for a required binary (nvcc, ncu, nsys) that "
+                "was not found in PATH. Updates the executor config for this session "
+                "if found. Call this when you receive a binary_not_found infrastructure error."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "binary_name": {
+                        "type": "string",
+                        "enum": ["nvcc", "ncu", "nsys"],
+                        "description": "Name of the binary to locate.",
+                    },
+                },
+                "required": ["binary_name"],
+            },
+        },
+    },
 ]

@@ -119,6 +119,17 @@ def _classify_subprocess_failure(
             "phase": phase,
             "hint": "Install the required binary or configure the corresponding AGENT_*_BIN variable.",
         }
+    if phase == "run" and ("no such file or directory" in low or "errno 2" in low):
+        return {
+            "error": "binary_missing_after_compile",
+            "error_class": "infrastructure",
+            "phase": phase,
+            "hint": (
+                "The compiled binary could not be executed — it may not have been "
+                "written to disk. Check nvcc output, workspace permissions, or "
+                "try a simpler kernel first."
+            ),
+        }
     if "nvcc fatal" in low and "no input files" not in low and phase == "compile":
         return {
             "error": "nvcc_infrastructure_failure",

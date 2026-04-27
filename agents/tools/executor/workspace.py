@@ -39,7 +39,7 @@ class _Workspace:
     def __init__(self, root: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         uid = uuid.uuid4().hex[:8]
-        self.root = Path(root) / f"run_{ts}_{uid}"
+        self.root = Path(root).resolve() / f"run_{ts}_{uid}"
         self.root.mkdir(parents=True, exist_ok=True)
         for sub in self.SUBDIRS:
             (self.root / sub).mkdir(exist_ok=True)

@@ -118,7 +118,7 @@ class _Workspace:
     def __init__(self, root: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         uid = uuid.uuid4().hex[:8]
-        self.root = Path(root) / f"run_{ts}_{uid}"
+        self.root = Path(root).resolve() / f"run_{ts}_{uid}"
         self.root.mkdir(parents=True, exist_ok=True)
         for sub in self.SUBDIRS:
             (self.root / sub).mkdir(exist_ok=True)
@@ -189,7 +189,7 @@ def _safe_join(root: Path, rel: str) -> Path:
 
 def _check_binary(cfg: ExecutorConfig, name: str) -> str:
     """Return the resolved path for a binary name if it's on the whitelist."""
-    basename = Path(name).stem if Path(name).suffix else name
+    basename = Path(name).stem
     if basename not in cfg.allowed_binaries:
         raise ExecutorError(
             "binary_not_whitelisted",
@@ -197,6 +197,9 @@ def _check_binary(cfg: ExecutorConfig, name: str) -> str:
             name=name,
             allowed=cfg.allowed_binaries,
         )
+    # Accept absolute paths that exist directly (e.g. from auto-detect or find_binary)
+    if Path(name).is_absolute() and Path(name).exists():
+        return name
     resolved = shutil.which(name)
     if resolved is None:
         raise ExecutorError(
@@ -220,6 +223,9 @@ def _run_subprocess(
     truncate_bytes: int = 64_000,
 ) -> SubResult:
     """Run cmd and return a SubResult.  Never raises; timeouts are captured."""
+    # .bat files on Windows are not directly executable; wrap with cmd /c
+    if sys.platform == "win32" and cmd and Path(cmd[0]).suffix.lower() == ".bat":
+        cmd = ["cmd", "/c"] + cmd
     TRUNC_MARKER = b"\n[... output truncated ...]\n"
     try:
         proc = subprocess.run(
@@ -238,6 +244,11 @@ def _run_subprocess(
         stderr_b = exc.stderr or b""
         timed_out = True
         returncode = -1
+    except FileNotFoundError:
+        stdout_b = b""
+        stderr_b = f"command not found: {cmd[0]}".encode()
+        timed_out = False
+        returncode = 127
 
     # Truncate
     if len(stdout_b) > truncate_bytes:
@@ -511,12 +522,7 @@ def _execute_ncu(
         if not bin_path.exists():
             raise ExecutorError("binary_not_found", path=source_or_path)
 
-    ncu_output = workspace.allocate("ncu", ".csv")
-    cmd = [
-        ncu,
-        "--csv",
-        "--log-file", str(ncu_output),
-    ]
+    cmd = [ncu, "--csv"]
     if kernel_name:
         cmd += ["--kernel-name", kernel_name]
     if metrics:
@@ -530,17 +536,42 @@ def _execute_ncu(
         truncate_bytes=cfg.stdout_truncate_bytes,
     )
 
-    raw_csv = ""
-    if ncu_output.exists():
-        raw_csv = ncu_output.read_text(encoding="utf-8", errors="replace")
-    if not raw_csv:
-        raw_csv = sub.stdout
+    raw_csv = sub.stdout or ""
+
+    if "ERR_NVGPUCTRPERM" in raw_csv or "ERR_NVGPUCTRPERM" in (sub.stderr or ""):
+        return {
+            "error": "ncu_permission_denied",
+            "error_class": "infrastructure",
+            "stderr": sub.stderr[-2000:] if sub.stderr else "",
+            "hint": (
+                "ERR_NVGPUCTRPERM: no permission to read GPU hardware counters. "
+                "Do NOT retry ncu — use run_cuda_probe self-instrumentation instead."
+            ),
+            "metrics": {},
+            "notes": ["ERR_NVGPUCTRPERM: run ncu as admin to enable hardware counters"],
+            "returncode": sub.returncode,
+        }
+
+    if not raw_csv and sub.returncode != 0:
+        return {
+            "error": "ncu_failed",
+            "error_class": "infrastructure",
+            "stderr": sub.stderr[-2000:] if sub.stderr else "",
+            "hint": (
+                "NCU command failed with no output. Common causes: "
+                "(1) requires admin/root privileges, "
+                "(2) metric names unsupported on this GPU arch. "
+                "Do NOT retry with different metric names — "
+                "switch to run_cuda_probe self-instrumentation instead."
+            ),
+            "metrics": {},
+            "notes": ["NCU command exited non-zero with no output"],
+            "returncode": sub.returncode,
+        }
 
     reduced = _reduce_ncu(raw_csv, metrics)
-    reduced["stdout"] = sub.stdout
     reduced["stderr"] = sub.stderr[-2000:] if sub.stderr else ""
     reduced["returncode"] = sub.returncode
-    reduced["raw_path"] = workspace.rel(ncu_output) if ncu_output.exists() else None
     return reduced
 
 
@@ -658,6 +689,27 @@ def _execute_torch(
 # 9. Environment auto-detection
 # ===========================================================================
 
+_NVCC_SEARCH_PATHS_LINUX: list[str] = [
+    "/usr/local/cuda/bin/nvcc",
+    "/usr/local/cuda-13/bin/nvcc",
+    "/usr/local/cuda-12/bin/nvcc",
+    "/usr/local/cuda-11/bin/nvcc",
+    "/opt/cuda/bin/nvcc",
+]
+
+_NCU_SEARCH_PATHS_LINUX: list[str] = [
+    "/usr/local/cuda/bin/ncu",
+    "/usr/local/cuda-13/bin/ncu",
+    "/usr/local/cuda-12/bin/ncu",
+    "/opt/cuda/bin/ncu",
+]
+
+_NSYS_SEARCH_PATHS_LINUX: list[str] = [
+    "/usr/local/cuda/bin/nsys",
+    "/opt/nvidia/nsight-systems/2024.6/target-linux-x64/nsys",
+    "/opt/nvidia/nsight-systems/2024.3/target-linux-x64/nsys",
+]
+
 _NCU_SEARCH_PATHS_WIN: list[str] = [
     r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.1\ncu.exe",
     r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2024.3\ncu.exe",
@@ -684,6 +736,22 @@ def _detect_arch_flags() -> str | None:
         if cc.isdigit():
             return f"-arch=sm_{cc}"
     return None
+
+
+def _validate_arch_flag(arch: str, nvcc_bin: str, ccbin: str = "") -> bool:
+    """Return True if nvcc accepts the given -arch flag (test compile a no-op kernel)."""
+    import tempfile
+    minimal_src = "__global__ void _k(){} int main(){return 0;}\n"
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "arch_test.cu"
+        out = Path(d) / ("arch_test.exe" if sys.platform == "win32" else "arch_test")
+        src.write_text(minimal_src)
+        cmd = [nvcc_bin]
+        if ccbin:
+            cmd += ["-ccbin", ccbin]
+        cmd += [arch, "-o", str(out), str(src)]
+        r = _run_subprocess(cmd, timeout_s=30)
+        return r.returncode == 0
 
 
 def _detect_msvc_ccbin() -> str | None:
@@ -714,13 +782,32 @@ def _detect_msvc_ccbin() -> str | None:
     return None
 
 
+_LINUX_SEARCH_ROOTS: list[str] = ["/usr", "/opt", "/snap", "/home"]
+
+
 def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
-    """Return the first existing path in search_list if the tool is not on PATH."""
+    """Return an override path for the tool; None means already on PATH or not found."""
     if shutil.which(on_path_name) is not None:
         return None
     for candidate in search_list:
         if Path(candidate).exists():
             return candidate
+    # Fallback: ask the OS to search the filesystem
+    if sys.platform == "win32":
+        r = _run_subprocess(["where", on_path_name], timeout_s=10)
+        if r.returncode == 0:
+            lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+            if lines:
+                return lines[0]
+    else:
+        r = _run_subprocess(
+            ["find"] + _LINUX_SEARCH_ROOTS + ["-maxdepth", "8", "-name", on_path_name, "-type", "f"],
+            timeout_s=15,
+        )
+        if r.returncode == 0:
+            found = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+            if found:
+                return found[0]
     return None
 
 
@@ -731,17 +818,17 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
     changes: dict[str, Any] = {}
     notes: list[str] = []
 
-    if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
-        arch = _detect_arch_flags()
-        if arch:
-            changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
-            notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
+    # Auto-detect nvcc if not in PATH (common on Linux where it lives in /usr/local/cuda/bin)
+    if cfg.nvcc_bin == "nvcc" and shutil.which("nvcc") is None:
+        search = [] if sys.platform == "win32" else _NVCC_SEARCH_PATHS_LINUX
+        detected = _detect_tool_path("nvcc", search)
+        if detected:
+            changes["nvcc_bin"] = detected
+            notes.append(f"[auto-detect] nvcc: {detected}")
         else:
-            notes.append(
-                "[auto-detect] GPU arch: nvidia-smi unavailable; "
-                "set AGENT_NVCC_FLAGS=-arch=sm_NNN if compilation fails"
-            )
+            notes.append("[auto-detect] nvcc: not found; set AGENT_NVCC_BIN or add to PATH")
 
+    # Detect ccbin FIRST — needed for arch validation on Windows (nvcc needs cl.exe)
     if not cfg.nvcc_ccbin:
         ccbin = _detect_msvc_ccbin()
         if ccbin:
@@ -753,17 +840,58 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
                 "set AGENT_NVCC_CCBIN if compilation fails on Windows"
             )
 
+    if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
+        arch = _detect_arch_flags()
+        if arch:
+            effective_nvcc = changes.get("nvcc_bin") or cfg.nvcc_bin
+            effective_ccbin = changes.get("nvcc_ccbin") or cfg.nvcc_ccbin
+            if _validate_arch_flag(arch, effective_nvcc, ccbin=effective_ccbin):
+                changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
+                notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
+            else:
+                notes.append(
+                    f"[auto-detect] GPU arch: {arch} detected but nvcc rejects it "
+                    f"(toolkit too old for this GPU); compiling without -arch flag. "
+                    f"Set AGENT_NVCC_FLAGS=-arch=sm_NNN to override."
+                )
+        else:
+            notes.append(
+                "[auto-detect] GPU arch: nvidia-smi unavailable; "
+                "set AGENT_NVCC_FLAGS=-arch=sm_NNN if compilation fails"
+            )
+
     if cfg.ncu_bin == "ncu":
-        detected = _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        search = _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else _NCU_SEARCH_PATHS_LINUX
+        detected = _detect_tool_path("ncu", search)
         if detected:
             changes["ncu_bin"] = detected
             notes.append(f"[auto-detect] ncu: {detected}")
 
     if cfg.nsys_bin == "nsys":
-        detected = _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else [])
+        search = _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else _NSYS_SEARCH_PATHS_LINUX
+        detected = _detect_tool_path("nsys", search)
         if detected:
             changes["nsys_bin"] = detected
             notes.append(f"[auto-detect] nsys: {detected}")
+
+    # Auto-detect python binary: prefer sys.executable so we always use the
+    # same interpreter that launched the agent (handles python3-only Linux envs).
+    if cfg.python_bin == "python":
+        current_py = sys.executable or ""
+        if current_py and shutil.which(current_py) is not None:
+            stem = Path(current_py).stem  # e.g. "python3", "python3.11"
+            changes["python_bin"] = current_py
+            allowed = list(cfg.allowed_binaries)
+            if "python" in allowed and stem not in allowed:
+                allowed = [b for b in allowed if b != "python"] + [stem]
+                changes["allowed_binaries"] = allowed
+            notes.append(f"[auto-detect] python: using {current_py}")
+        elif shutil.which("python3") is not None:
+            changes["python_bin"] = "python3"
+            allowed = list(cfg.allowed_binaries)
+            if "python" in allowed and "python3" not in allowed:
+                changes["allowed_binaries"] = [b for b in allowed if b != "python"] + ["python3"]
+            notes.append("[auto-detect] python: using python3")
 
     if changes:
         cfg = dataclasses.replace(cfg, **changes)
@@ -793,6 +921,7 @@ class Executor:
         self.detect_notes: list[str] = detect_notes
         self._job_listeners: list[Callable[[JobResult], None]] = []
         self._listeners_lock = threading.Lock()
+        self._cfg_lock = threading.Lock()
         if on_job_complete is not None:
             self._job_listeners.append(on_job_complete)
         self.workspace = _Workspace(cfg.workspace_root)
@@ -1002,3 +1131,39 @@ class Executor:
             },
         )
         return self._run_job(spec, _execute_torch)
+
+    def find_binary(self, binary_name: str) -> dict:
+        """Search the filesystem for binary_name and update executor config if found.
+
+        Call this when a tool returns binary_not_found to recover without restarting.
+        """
+        import dataclasses as _dc
+
+        found: str | None = None
+        if sys.platform == "win32":
+            r = _run_subprocess(["where", binary_name], timeout_s=10)
+            if r.returncode == 0:
+                lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+                found = lines[0] if lines else None
+        else:
+            r = _run_subprocess(
+                ["find"] + _LINUX_SEARCH_ROOTS + ["-maxdepth", "8", "-name", binary_name, "-type", "f"],
+                timeout_s=15,
+            )
+            found_list = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+            found = found_list[0] if found_list else None
+
+        if found is None:
+            return {
+                "status": "not_found",
+                "binary": binary_name,
+                "hint": f"Install {binary_name} or set AGENT_{binary_name.upper()}_BIN env var.",
+            }
+
+        field_map = {"nvcc": "nvcc_bin", "ncu": "ncu_bin", "nsys": "nsys_bin"}
+        field = field_map.get(Path(found).stem)
+        if field:
+            with self._cfg_lock:
+                self._cfg = _dc.replace(self._cfg, **{field: found})
+
+        return {"status": "found", "binary": binary_name, "path": found, "config_updated": field is not None}

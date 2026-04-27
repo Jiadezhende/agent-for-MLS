@@ -79,6 +79,11 @@ class AgentLoop:
             else:
                 print(self._prefix, *args, file=sys.stderr, flush=True)
 
+    def _missing_targets(self) -> list[str]:
+        """Return targets not yet recorded in ctx.results."""
+        recorded = {r.metric for r in self.ctx.results}
+        return [t for t in self.ctx.task.payload.get("targets", []) if t not in recorded]
+
     def run(self) -> AgentContext:
         messages: list[dict] = [
             {"role": "system", "content": self._system_prompt},
@@ -112,10 +117,16 @@ class AgentLoop:
                     raise RuntimeError(
                         "LLM replied without a tool call twice in a row. Aborting."
                     )
-                messages.append({
-                    "role": "user",
-                    "content": "You must call a tool to proceed. When all metrics are recorded, call submit_results.",
-                })
+                missing = self._missing_targets()
+                if missing:
+                    nudge_content = (
+                        f"You must call a tool. Still unrecorded: {missing}. "
+                        "Call record_measurement for each measured target, "
+                        "then call submit_results when all are done."
+                    )
+                else:
+                    nudge_content = "All targets recorded. Call submit_results now."
+                messages.append({"role": "user", "content": nudge_content})
                 nudged = True
                 continue
 

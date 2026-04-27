@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -126,11 +127,13 @@ def main() -> None:
     worker_logs: list[dict] = []
 
     if state is not None:
+        raw_results: list[dict] = []
         for step in state.steps:
             out = state.outputs.get(step.id)
             if out is None:
                 continue
-            all_results.extend(out.results)
+            raw_results.extend(out.results)
+            attempts = state.history.get(step.id, [out])
             worker_logs.append({
                 "step_id":      step.id,
                 "task":         step.task,
@@ -138,9 +141,25 @@ def main() -> None:
                 "success":      out.success,
                 "n_results":    len(out.results),
                 "summary":      out.summary,
-                "reasoning_log": out.reasoning_log,
-                "events":       out.events,
+                "attempts": [
+                    {
+                        "reasoning_log": a.reasoning_log,
+                        "events":        a.events,
+                        "n_results":     len(a.results),
+                        "success":       a.success,
+                        "summary":       a.summary,
+                    }
+                    for a in attempts
+                ],
             })
+
+        # Deduplicate by metric: keep the entry with the highest confidence
+        seen: dict[str, dict] = {}
+        for r in raw_results:
+            metric = r.get("metric", "")
+            if metric not in seen or r.get("confidence", 0) > seen[metric].get("confidence", 0):
+                seen[metric] = r
+        all_results = list(seen.values())
 
         failed_steps = [s.id for s in state.steps if not state.outputs.get(s.id, None) or
                         not state.outputs[s.id].success]
@@ -151,9 +170,21 @@ def main() -> None:
     output_path = Path(args.output)
     log_path    = output_path.with_name("reasoning_log.json")
 
+    flat_results: dict[str, int | float] = {}
+    for r in all_results:
+        raw = r.get("value")
+        if raw is None:
+            continue
+        try:
+            fval = float(raw)
+            val: int | float = int(fval) if fval == int(fval) else fval
+        except (TypeError, ValueError):
+            continue
+        flat_results[r["metric"]] = val
+
     try:
         output_path.write_text(
-            json.dumps(all_results, indent=2, default=str),
+            json.dumps(flat_results, indent=2),
             encoding="utf-8",
         )
         log_path.write_text(
@@ -173,7 +204,7 @@ def main() -> None:
     else:
         print(f"[info] Workspace retained at: {executor.workspace.root}", file=sys.stderr)
 
-    sys.exit(exit_code)
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":

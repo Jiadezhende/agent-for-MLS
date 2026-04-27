@@ -50,15 +50,44 @@ penalty in cycles.
 
 Skill to use: `bank_conflict` (Phase 2)
 
+### Shared memory capacity
+
+Use `cudaFuncSetAttribute` with `cudaFuncAttributeMaxDynamicSharedMemorySize`
+to empirically probe the hardware maximum shared memory per block. Try
+increasing allocations until launch fails. Do NOT use
+`cudaGetDeviceProperties().sharedMemPerBlockOptin` — that API call may be
+intercepted in the test environment.
+
+Skill to use: `cache_capacity` (Part B, Phase 2)
+
+### ncu bottleneck analysis
+
+Use ncu metrics to classify a kernel as compute-bound or memory-bound via the
+Roofline model (`sm__throughput` vs `gpu__compute_memory_throughput`). Also
+use for anomaly detection: clock throttling (from `sm__cycles_elapsed`), SM
+masking (from warp active rate), and API spoofing (ncu% vs measured GB/s).
+
+Skill to use: `ncu_bottleneck_analysis` (Phase 3 cross-verification)
+
 ## Anti-hacking checklist
 
 Before finalizing any measurement:
-1. Compare measured clock against cudaGetDeviceProperties().clockRate.
-   If difference > 10%, flag_event "clock_locked" and report the measured value.
-2. Verify L2 latency is in the expected range for the GPU family.
+
+1. Compute actual clock from `clock64()` / `cudaEvent` ratio (use
+   `clock_measurement` skill). If | actual_clock_mhz - nvidia-smi clock | > 10%,
+   flag_event "clock_locked" and always report the measured value, not the
+   driver-reported value.  (Note: `cudaGetDeviceProperties().clockRate` was
+   removed in CUDA 13 and must NOT be used.)
+2. Verify L2 latency is in the expected range using the `cache_capacity` sweep.
    If DRAM latency < 200 cycles, the working set may still be in L2.
 3. Check that measured peak bandwidth is lower than theoretical max.
    If measured > theoretical, the measurement likely contains artifacts.
+4. Run `ncu_bottleneck_analysis` to verify `sm__cycles_elapsed` clock matches
+   the measured `actual_boost_clock_mhz`. If divergence > 10%, flag
+   "clock_throttled_during_ncu".
+5. If `sm__warps_active` is unexpectedly low (< 10% for a high-parallelism
+   kernel), suspect SM masking — flag "sm_masking_suspected" and reduce
+   confidence to 0.7.
 
 ## Recommended sequence for hardware_probe tasks
 

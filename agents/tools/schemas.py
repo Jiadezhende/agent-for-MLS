@@ -71,7 +71,11 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Complete CUDA C++ source code (.cu content).",
+                        "description": (
+                            "Complete CUDA C++ source code (.cu content). "
+                            "MUST be actual code starting with #include or __global__. "
+                            "NEVER pass a skill name, filename, or description here."
+                        ),
                     },
                     "probe_name": {
                         "type": "string",
@@ -376,6 +380,31 @@ TOOL_SCHEMAS: list[dict] = [
                     }
                 },
                 "required": ["summary"],
+            },
+        },
+    },
+    # ------------------------------------------------------------------
+    # Environment tools
+    # ------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "find_binary",
+            "description": (
+                "Search the filesystem for a required binary (nvcc, ncu, nsys) that "
+                "was not found in PATH. Updates the executor config for this session "
+                "if found. Call this when you receive a binary_not_found infrastructure error."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "binary_name": {
+                        "type": "string",
+                        "enum": ["nvcc", "ncu", "nsys"],
+                        "description": "Name of the binary to locate.",
+                    },
+                },
+                "required": ["binary_name"],
             },
         },
     },

@@ -12,59 +12,56 @@ from agents.core.agent import Agent
 from agents.core.llm import LLMClient
 from agents.core.types import Step
 
+_SPLIT_THRESHOLD = 3       # targets per same-type group that triggers splitting
+_MAX_WORKERS_PER_TYPE = 2  # hard cap; never split into more than 2 per type
 
 # ---------------------------------------------------------------------------
-# Prompts (inlined from agents/planner/prompt.py)
+# Prompts
 # ---------------------------------------------------------------------------
 
 _PLANNER_BASE_PROMPT = """\
-You are a multi-agent task planner. Given a list of targets, assign each to
-the most appropriate agent type and group related targets into workers.
-Workers run in parallel, so targets that share measurement infrastructure
-may be grouped to reduce overhead. Independent targets should go to separate
-workers.
+You are a multi-agent task planner. Given a list of targets, group them by
+agent type domain and assign each group to workers.
 
 Available agent types:
 {agent_types_block}
 
 You MUST respond with a JSON object in this exact format:
 {{
-  "steps": [
+  "workers": [
     {{
       "id": "step_0",
-      "task": "<target name or description>",
       "worker": "<agent_type>",
-      "hints": ["<optional strategy hint>"]
+      "targets": ["<target_name>", "<target_name>"]
     }}
   ]
 }}
 
 Rules:
-- Each step has a unique id starting from "step_0"
+- Each worker has a unique id starting from "step_0"
 - "worker" must be one of the available agent types listed above
-- "hints" is optional; omit or leave empty if no specific hints apply
+- "targets" is a JSON array of target name strings — one entry per target, no comma-joining
+- Group targets by agent type domain; each group becomes one worker entry
 - Do not include any text outside the JSON object\
 """
 
 _FALLBACK_PROMPT = """\
 You are a GPU benchmark task planner. Given a list of target metrics,
-assign each to a worker.
+assign them all to one hardware_probe worker.
 
 You MUST respond with a JSON object in this exact format:
 {
-  "steps": [
+  "workers": [
     {
       "id": "step_0",
-      "task": "<target name>",
       "worker": "hardware_probe",
-      "hints": []
+      "targets": ["<target_name>"]
     }
   ]
 }
 
 Rules:
-- Each step has a unique id starting from "step_0"
-- Default to "hardware_probe" as the worker type
+- Put all targets in a single worker
 - Do not include any text outside the JSON object\
 """
 
@@ -89,8 +86,9 @@ def _build_system_prompt(agent_registry: dict) -> str:
 class PlannerAgent(Agent):
     """Single LLM call that maps targets → list[Step].
 
-    The LLM is asked to respond with a JSON object containing a 'steps' list.
-    Falls back to 1:1 mapping (one Step per target) on any failure.
+    Falls back to 1:1 mapping on any failure.
+    After LLM routing, large groups (>= _SPLIT_THRESHOLD) are split into
+    at most _MAX_WORKERS_PER_TYPE steps for parallelism.
     """
 
     def __init__(
@@ -116,7 +114,7 @@ class PlannerAgent(Agent):
 
         system_prompt = _build_system_prompt(self.agent_registry)
         user_msg = (
-            "Plan parallel workers for these targets:\n"
+            "Assign these targets to workers:\n"
             + "\n".join(f"  - {t}" for t in target_names)
             + "\n\nRespond with the JSON object only."
         )
@@ -133,6 +131,8 @@ class PlannerAgent(Agent):
             if self.verbose:
                 print(f"[planner] LLM call failed ({exc}); falling back to 1:1.", file=sys.stderr)
             plan = _fallback_plan(target_names, default_agent_type)
+
+        plan = _maybe_split_steps(plan)
 
         if self.verbose:
             print(
@@ -153,45 +153,74 @@ class PlannerAgent(Agent):
                 lines = text.splitlines()
                 text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
             data = json.loads(text)
-            raw_steps = data.get("steps", [])
-            if not raw_steps:
+            raw_workers = data.get("workers", data.get("steps", []))
+            if not raw_workers:
                 return _fallback_plan(target_names, default_agent_type)
 
-            steps: list[Step] = []
             valid_types = set(self.agent_registry.keys()) or {"hardware_probe"}
-            for item in raw_steps:
+            steps: list[Step] = []
+            covered: set[str] = set()
+            for i, item in enumerate(raw_workers):
                 worker = item.get("worker", default_agent_type)
                 if worker not in valid_types:
                     worker = default_agent_type
+                targets = item.get("targets", [])
+                if isinstance(targets, str):
+                    targets = [t.strip() for t in targets.split(",")]
+                targets = [t for t in targets if t and t not in covered]
+                covered.update(targets)
+                if not targets:
+                    continue
                 steps.append(Step(
-                    id=item.get("id", f"step_{len(steps)}"),
-                    task=item.get("task", ""),
+                    id=item.get("id", f"step_{i}"),
                     worker=worker,
-                    hints=item.get("hints", []),
+                    targets=targets,
+                    task=", ".join(targets),
                 ))
 
-            planned_tasks = {s.task for s in steps}
             for t in target_names:
-                if t not in planned_tasks:
+                if t not in covered:
                     steps.append(Step(
                         id=f"step_{len(steps)}",
-                        task=t,
                         worker=default_agent_type,
+                        targets=[t],
+                        task=t,
                     ))
 
             return steps
 
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             if self.verbose:
-                print(f"[planner] JSON parse error ({exc}); falling back to 1:1.", file=sys.stderr)
+                print(f"[planner] JSON parse error ({exc}); falling back.", file=sys.stderr)
             return _fallback_plan(target_names, default_agent_type)
 
 
+def _maybe_split_steps(steps: list[Step]) -> list[Step]:
+    """Split any Step with >= _SPLIT_THRESHOLD targets into two Steps."""
+    result: list[Step] = []
+    for step in steps:
+        if len(step.targets) >= _SPLIT_THRESHOLD:
+            mid = (len(step.targets) + 1) // 2
+            groups = [step.targets[:mid], step.targets[mid:]]
+        else:
+            groups = [step.targets]
+        for targets in groups:
+            result.append(Step(
+                id=f"step_{len(result)}",
+                worker=step.worker,
+                targets=list(targets),
+                task=", ".join(targets),
+            ))
+    return result
+
+
 def _fallback_plan(target_names: list[str], default_agent_type: str) -> list[Step]:
-    return [
-        Step(id=f"step_{i}", task=t, worker=default_agent_type)
-        for i, t in enumerate(target_names)
-    ]
+    return [Step(
+        id="step_0",
+        worker=default_agent_type,
+        targets=target_names,
+        task=", ".join(target_names),
+    )]
 
 
 def _normalize_target_names(targets: list) -> list[str]:

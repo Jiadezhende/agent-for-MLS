@@ -9,7 +9,7 @@ Multiple targets are measured **in parallel** by a multi-agent pipeline: Planner
 ## How to run
 
 ```bash
-cp .env.example .env   # fill in OPENAI_API_KEY and AGENT_LLM_MODEL
+cp .env.example .env   # fill in API_KEY and BASE_MODEL
 python main.py --spec target_spec.json --output results.json --verbose
 ```
 
@@ -24,15 +24,15 @@ python main.py --spec target_spec.json
       │
       ▼
   main.py                          load config, build LLMClient + Executor + Task
-      │                            import agent.tasks → registers all task plugins
+      │                            import agents → registers all agent plugins
       ▼
-  Orchestrator.run()               pure-code scheduler (fixed 4-phase pipeline, NOT a loop)
+  Orchestrator.run()               pure-code scheduler (fixed 3-phase pipeline, NOT a loop)
       │
-      ├─ Phase 1  plan_tasks()     ONE LLM call → [WorkerSpec with agent_type]
+      ├─ Phase 1  PlannerAgent     ONE LLM call → [Step with worker agent_type]
       │           Planner decides: which agent type, how to group targets
       │
       ├─ Phase 2  ThreadPoolExecutor
-      │           ├── Worker-0: looks up TaskDefinition by agent_type
+      │           ├── Worker-0: looks up AgentDefinition by agent_type
       │           │     AgentLoop (ReAct loop, LLM-driven)
       │           │     ├── iter 1: LLM call → tool calls → Executor → observe
       │           │     ├── iter 2: LLM call → tool calls → Executor → observe
@@ -40,10 +40,8 @@ python main.py --spec target_spec.json
       │           └── Worker-1: AgentLoop (runs concurrently)
       │                 └── ...
       │
-      ├─ Phase 3  Aggregate        merge all ctx.results → flat list[Result]
-      │                            each Result carries task_type
-      │
-      └─ Phase 4  critique_results group by task_type → one LLM call per group
+      └─ Phase 3  CriticAgent      reviews all WorkerOutputs
+                                   accept / retry per step → retry loop until done
       │
       ▼
   main.py writes results.json + reasoning_log.json → exit
@@ -54,17 +52,26 @@ python main.py --spec target_spec.json
 - `Orchestrator` = fixed pipeline executor (like an Airflow DAG); no LLM, no looping
 - `AgentLoop` = the actual ReAct loop (Reason → Act → Observe → repeat until `submit_results`)
 
-### Component layers
+### Package layers (three-tier, mirrors hello-agents)
+
+```text
+agents/
+├── core/        Framework layer: Agent ABC, LLMClient, config, exceptions, loop, types
+├── tools/       Tool system layer: ToolRegistry, CircuitBreaker, CUDA executor, builtin tools
+└── agents/      Agent implementation layer: PlannerAgent, CriticAgent, HardwareProbeAgent
+```
 
 ```text
 main.py
-  └── Orchestrator (agent/orchestrator.py)   pure-code scheduler
-        ├── Planner  (agent/planner.py)       LLM: route + group targets → WorkerSpec list
+  └── Orchestrator (orchestrator.py)         pure-code scheduler
+        ├── PlannerAgent  (agents/agents/planner_agent.py)
+        │   LLM: route + group targets → Step list
         ├── Worker Pool (ThreadPoolExecutor)
         │     ├── Worker-0: AgentContext + CircuitBreaker (isolated per worker)
         │     │     └── AgentLoop → ToolRegistry → Executor
         │     └── Worker-1: ...
-        └── Critic   (agent/critic.py)        LLM: per-task cross-validate → confidence adjustments
+        └── CriticAgent  (agents/agents/critic_agent.py)
+            LLM: review WorkerOutputs → accept / retry
 ```
 
 ```text
@@ -73,7 +80,7 @@ Each Worker (AgentLoop):
   for iter in range(max_iterations):
       LLM call(messages, tools)
       → tool_calls → ToolRegistry.dispatch()
-                          ├── CircuitBreaker check
+                          ├── CircuitBreaker check  (applies to ALL tools)
                           ├── JSON Schema validation
                           ├── fn(Executor / recording tool)
                           └── CircuitBreaker update
@@ -82,7 +89,7 @@ Each Worker (AgentLoop):
 ```
 
 ```text
-Executor (executor.py)               shared across all workers (thread-safe)
+Executor (agents/tools/cuda_executor.py)     shared across all workers (thread-safe)
   ├── run_cuda_probe    PRIMARY: compile + run .cu, stdout = measurement
   ├── profile_with_ncu  cross-verify with Nsight Compute counters
   ├── profile_with_nsys CPU-GPU timeline (operator analysis, not hardware probing)
@@ -97,89 +104,84 @@ Executor (executor.py)               shared across all workers (thread-safe)
 | --- | --- | --- |
 | Nature | LLM (decision maker) | Pure code (executor) |
 | Decides | Which agent type handles each target; how to group | How to run: threads, timeout, retry |
-| Inputs | targets list + registered agent types | [WorkerSpec] from Planner |
-| Outputs | [WorkerSpec] with agent_type + targets + hints | [WorkerResult] |
+| Inputs | targets list + registered agent types | [Step] from Planner |
+| Outputs | [Step] with worker + hints | [WorkerOutput] |
 | Fails | Falls back to 1:1 mapping | Collects partial results, continues |
 
-### Task type design principle
+### Agent type design principle
 
-Task type granularity is by **domain**, not by individual metric.
+Agent type granularity is by **domain**, not by individual metric.
 All GPU hardware metrics share the same tools, workflow, and domain knowledge —
-they belong to one task type (`hardware_probe`). Parallelism across metrics is
-already handled at the **WorkerSpec** level by the Planner.
+they belong to one agent type (`hardware_probe`). Parallelism across metrics is
+already handled at the **Step** level by the Planner.
 
-| Task Type | Tools | Domain | Status |
+| Agent Type | Tools | Domain | Status |
 | --- | --- | --- | --- |
-| `hardware_probe` | `run_cuda_probe`, `profile_with_ncu` | CUDA C microbenchmarks | implemented (plugin) |
+| `hardware_probe` | `run_cuda_probe`, `profile_with_ncu` | CUDA C microbenchmarks | implemented |
 | `op_profiler` | `profile_with_nsys`, `profile_with_torch` | PyTorch operator timeline | future |
 | `bottleneck_analyst` | reads upstream results | roofline model, arithmetic intensity | future |
-
-These three are genuinely distinct task types because they differ in tools, workflow,
-and Critic validation rules. Splitting `dram_latency` and `boost_clock` into separate
-task types would only produce near-identical prompts — the wrong level of abstraction.
 
 ## Key files
 
 | File | Purpose |
 | --- | --- |
-| `executor.py` | Compilation, sandboxing, auto-detection, error classification; thread-safe |
-| `agent/orchestrator.py` | Drives Planner → Worker pool → Critic; manages `ThreadPoolExecutor`; receives `task_registry` |
-| `agent/planner.py` | `plan_tasks(task_registry)` — one LLM call routes + groups targets into `WorkerSpec`s |
-| `agent/critic.py` | `critique_results(task_registry)` — groups by `task_type`, runs per-task critic, merges |
-| `agent/loop.py` | ReAct loop per worker; accepts `system_prompt` param; `--verbose` prefixes with `[Wn]` |
-| `agent/types.py` | `AgentContext`, `CircuitBreaker`, `Result` (with `task_type`), `WorkerSpec` (with `agent_type`), `WorkerResult`, `CritiqueResult` |
-| `agent/tool_registry.py` | `ToolRegistry` class + circuit breaker enforcement |
-| `agent/prompts.py` | Generic `build_user_message()` only; system prompts live in task plugins |
-| `agent/tasks/_registry.py` | `TaskDefinition` dataclass + `register / get / all_definitions` |
-| `agent/tasks/__init__.py` | Imports all built-in task plugins to trigger registration |
-| `agent/tasks/hardware_probe/` | `hardware_probe` plugin: `prompt.py`, `tools.py`, `critic_rules.py`, `__init__.py` |
-| `config.py` | Three dataclasses: `LLMConfig`, `AgentConfig`, `ExecutorConfig` |
+| `agents/tools/cuda_executor.py` | Compilation, sandboxing, auto-detection, error classification; thread-safe |
+| `orchestrator.py` | Drives Planner → Worker pool → Critic retry loop; manages `ThreadPoolExecutor` |
+| `agents/agents/planner_agent.py` | One LLM call routes + groups targets into `Step` list |
+| `agents/agents/critic_agent.py` | Reviews `WorkerOutput`s → accept / retry decisions |
+| `agents/agents/hardware_probe_agent.py` | CUDA hardware probing agent + inlined prompts + plugin registration |
+| `agents/core/loop.py` | ReAct loop per worker; `--verbose` prefixes with `[Wn]` |
+| `agents/core/types.py` | `Task`, `Step`, `WorkerOutput`, `CriticDecision`, `AgentContext`, `Result`, `MemoryStore` |
+| `agents/core/config.py` | Three dataclasses: `LLMConfig`, `AgentConfig`, `ExecutorConfig` |
+| `agents/core/llm.py` | OpenAI SDK wrapper (the only file that imports openai) |
+| `agents/core/exceptions.py` | Unified exception hierarchy: `AgentError`, `ExecutorError`, `CircuitOpenError` |
+| `agents/tools/registry.py` | `ToolRegistry` class + circuit breaker enforcement (all tools) + `ToolFactory` |
+| `agents/tools/circuit_breaker.py` | `CircuitBreaker` — universal, applies to every tool dispatch |
+| `agents/tools/schemas.py` | OpenAI function-calling schemas for all 9 tools |
+| `agents/tools/builtin/recording.py` | `record_measurement`, `flag_event`, `submit_results` |
+| `agents/tools/builtin/skills.py` | `list_skills`, `read_skill` |
+| `agents/_registry.py` | `AgentDefinition` dataclass + `register / get / all_definitions` |
+| `agents/__init__.py` | Imports all built-in agent plugins to trigger registration |
 | `skills/*.md` | Measurement strategy docs the LLM reads via `list_skills`/`read_skill` |
-| `tools/recording.py` | `record_measurement` (sets `Result.task_type` from `ctx.task.type`), `flag_event`, `submit_results` |
 
 ## Orchestrator flow
 
-1. **Planner** — one LLM call with forced tool `assign_workers`; system prompt built dynamically from `TaskDefinition.planner_hints` of all registered types. Each assignment includes `agent_type`. Falls back to 1:1 on failure.
-2. **Worker pool** — `ThreadPoolExecutor`; each worker looks up `TaskDefinition` by `spec.agent_type`, gets task-specific `system_prompt` and `build_registry()`. Each worker has isolated `AgentContext` + `CircuitBreaker`.
-3. **Aggregate** — results from all worker contexts collected into a flat list; each `Result` carries `task_type`.
-4. **Critic** — results grouped by `task_type`; one LLM call per group using that task's `critic_system_prompt` + `critic_tool_schema`; `CritiqueResult`s merged. No-op on failure.
+1. **PlannerAgent** — one LLM call with forced tool `assign_workers`; system prompt built dynamically from `AgentDefinition.planner_hints` of all registered types. Falls back to 1:1 on failure.
+2. **Worker pool** — `ThreadPoolExecutor`; each worker looks up `AgentDefinition` by `step.worker`, instantiates `agent_def.agent_class`, builds tools via `ToolFactory`. Each worker has isolated `AgentContext` + `CircuitBreaker`.
+3. **CriticAgent** — reviews all `WorkerOutput`s; issues `accept` / `retry` decisions; retry loop continues until no pending steps or max retries reached.
 
 Output files:
 
-- `results.json` — flat list of `Result` objects (post-critique confidence, includes `task_type`)
-- `reasoning_log.json` — per-worker `reasoning_log`/`events`/`job_history` + merged critique block
+- `results.json` — flat list of `Result` objects (includes `task_type`)
+- `reasoning_log.json` — per-worker `reasoning_log`/`events` + Critic decisions
 
-## Task plugin system
+## Agent plugin system
 
-Task types are registered at startup via `agent/tasks/__init__.py`.
-Each plugin provides a `TaskDefinition` with:
+Agent types register at startup via `agents/__init__.py`.
+Each plugin calls `register(AgentDefinition(...))` from its module.
 
 | Field | Used by |
 | --- | --- |
-| `task_type` | `WorkerSpec.agent_type` key; `Result.task_type` tag |
+| `agent_type` | `Step.worker` key; routing by Planner |
 | `description` | Injected into Planner system prompt |
-| `system_prompt` | Passed to `AgentLoop` for workers of this type |
-| `build_registry` | Called per-worker to build tool set |
-| `planner_hints` | Grouping/routing rules in Planner system prompt |
-| `critic_system_prompt` | Critic LLM system prompt for this task's results |
-| `critic_tool_schema` | Forced tool schema for Critic call |
+| `agent_class` | Instantiated per worker by Orchestrator |
+| `required_tools` | `ToolFactory.build()` — which tools to inject |
+| `planner_hints` | Grouping/routing rules shown to Planner LLM |
+| `critic_system_prompt` | Critic LLM system prompt for reviewing this type's outputs |
+| `critic_tool_schema` | Forced-tool JSON schema for the Critic call |
 
-**To add a new task type** (e.g. `op_profiler`):
+**To add a new agent type** (e.g. `op_profiler`):
 
-```text
-agent/tasks/
-  op_profiler/
-    __init__.py        # calls register(TaskDefinition(...))
-    prompt.py          # SYSTEM_PROMPT + PLANNER_HINTS
-    tools.py           # build_registry(executor) -> ToolRegistry
-    critic_rules.py    # CRITIC_SYSTEM_PROMPT + AUDIT_SCHEMA
-```
+1. Create `agents/agents/op_profiler_agent.py` — a single file containing:
+   - The agent class (inherits `Agent`, implements `run(step, tools) -> WorkerOutput`)
+   - All prompts inlined as module-level constants
+   - `register(AgentDefinition(...))` call at the bottom
 
-Then add one line to `agent/tasks/__init__.py`:
+2. Add one line to `agents/__init__.py`:
 
-```python
-import agent.tasks.op_profiler  # noqa: F401
-```
+   ```python
+   import agents.agents.op_profiler_agent  # noqa: F401
+   ```
 
 No changes needed to Orchestrator, Planner, Critic, or AgentLoop.
 
@@ -188,8 +190,8 @@ No changes needed to Orchestrator, Planner, Critic, or AgentLoop.
 `--verbose` enables per-worker prefixed output to stderr:
 
 ```text
-[orchestrator] Phase 1: Planning worker assignments …
-[orchestrator] Planner produced 2 worker(s): W0(hardware_probe)=['dram_latency_cycles'], W1(hardware_probe)=['actual_boost_clock_mhz']
+[orchestrator] [plan] output: {"steps": [...]}
+[orchestrator] [workers] start: {"pending": ["step-0", "step-1"]}
 [W0] ── iter 1/40 ────────────────────────────────────────────
 [W1] ── iter 1/40 ────────────────────────────────────────────
 [W0]   call: run_cuda_probe  {"source":"<3842 chars>","probe_name":"dram_latency"}
@@ -212,13 +214,15 @@ On startup, `Executor.__init__` auto-detects GPU arch (`-arch=sm_NNN` via `nvidi
 
 ## Circuit breaker
 
+The circuit breaker is **universal** — it applies to every tool, not just executor tools.
+
 Three states per `(tool, error_kind)` pair:
 
 | State | Condition | Behavior |
 | --- | --- | --- |
 | CLOSED | default | normal operation |
 | OPEN | >= N consecutive failures | `dispatch()` returns `{"status": "circuit_open"}` |
-| HALF-OPEN | OPEN for > `half_open_timeout_s` seconds | one probe allowed through; success -> CLOSED, failure -> OPEN (timer reset) |
+| HALF-OPEN | OPEN for > `half_open_timeout_s` seconds | one probe allowed through; success → CLOSED, failure → OPEN (timer reset) |
 
 Threshold: `AGENT_CB_THRESHOLD` env var (default 3).
 Half-open timeout: `AGENT_HALF_OPEN_TIMEOUT_S` env var (default 60 s).

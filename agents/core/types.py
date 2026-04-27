@@ -114,9 +114,10 @@ class AgentContext:
 class Step:
     """One unit of work produced by the Planner for one worker agent."""
     id: str
-    task: str           # target / task description passed to the worker
-    worker: str         # agent_type key in the registry
-    hints: list[str] = field(default_factory=list)
+    worker: str                              # agent_type key in the registry
+    targets: list[str] = field(default_factory=list)  # target names assigned to this worker
+    task: str = ""                           # auto-generated log label, not sent to Worker LLM
+    retry_context: dict | None = None        # set on retry steps; contains reason + previous bad values
 
 
 @dataclass
@@ -125,6 +126,7 @@ class WorkerOutput:
     step_id: str
     results: list[dict]     # list of Result.to_dict() entries
     success: bool
+    targets_requested: list[str] = field(default_factory=list)  # Step.targets forwarded for Critic coverage check
     reasoning_log: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
     summary: str = ""
@@ -137,3 +139,4 @@ class CriticDecision:
     decision: str       # "accept" | "retry"
     confidence: float
     reason: str
+    failing_targets: list[str] = field(default_factory=list)  # which targets to re-measure

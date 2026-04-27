@@ -7,12 +7,87 @@ basic exponential-backoff retry.  Streaming + tenacity come in Phase 2.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import openai
 
 from agents.core.config import LLMConfig
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """o-series and GPT-5+ models don't accept temperature and use max_completion_tokens."""
+    m = model.lower()
+    return bool(re.match(r"o\d", m)) or m.startswith("gpt-5")
+
+
+def _build_create_kwargs(cfg: LLMConfig) -> dict[str, Any]:
+    """Return only the API params this model family accepts."""
+    kwargs: dict[str, Any] = {"timeout": cfg.request_timeout_s}
+    if _is_reasoning_model(cfg.model):
+        if cfg.max_tokens:
+            kwargs["max_completion_tokens"] = cfg.max_tokens
+        # temperature not supported on reasoning models
+    else:
+        if cfg.max_tokens:
+            kwargs["max_tokens"] = cfg.max_tokens
+        kwargs["temperature"] = cfg.temperature
+    return kwargs
+
+
+# ---------------------------------------------------------------------------
+# GLM streaming-artifact cleaner
+# ---------------------------------------------------------------------------
+
+_GLM_ARTIFACT_START = re.compile(r'\{"index":\s*\d+')
+
+
+def _strip_glm_artifacts(text: str | None) -> str | None:
+    """Remove GLM-API streaming delta JSON objects accidentally embedded in content.
+
+    GLM's non-streaming mode appends raw SSE delta objects like
+    {"index":0,"finish_reason":"tool_calls","delta":{...}} to the text content.
+    These pollute conversation history and confuse subsequent LLM calls.
+    Uses brace-counting to correctly handle nested JSON.
+    """
+    if not text:
+        return text
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m = _GLM_ARTIFACT_START.search(text, i)
+        if m is None:
+            parts.append(text[i:])
+            break
+        parts.append(text[i:m.start()])
+        # Walk forward counting braces to find the matching closing brace
+        j = m.start()
+        depth = 0
+        in_str = False
+        esc = False
+        while j < n:
+            c = text[j]
+            if esc:
+                esc = False
+            elif c == '\\' and in_str:
+                esc = True
+            elif c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+            j += 1
+        i = j
+    cleaned = ''.join(parts).strip()
+    return cleaned or None
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +132,7 @@ class ChatResponse:
             for tc in msg.tool_calls:
                 tcs.append(ToolCall.from_openai(tc))
         return cls(
-            content=msg.content,
+            content=_strip_glm_artifacts(msg.content),
             tool_calls=tcs,
             finish_reason=choice.finish_reason or "",
             _raw_tool_calls=msg.tool_calls or [],
@@ -121,9 +196,7 @@ class LLMClient:
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
-                    max_tokens=self._cfg.max_tokens,
-                    temperature=self._cfg.temperature,
-                    timeout=self._cfg.request_timeout_s,
+                    **_build_create_kwargs(self._cfg),
                 )
                 return ChatResponse.from_openai(raw)
             except (
@@ -132,18 +205,27 @@ class LLMClient:
                 openai.APIConnectionError,
             ) as exc:
                 last_exc = exc
-                wait = 2 ** attempt          # 1 s, 2 s, 4 s, …
+                is_rate_limit = isinstance(exc, openai.RateLimitError)
+                base = 15 if is_rate_limit else 1
+                wait = base * (2 ** attempt)   # rate-limit: 15s, 30s, 60s, …
                 print(
                     f"[llm] transient error (attempt {attempt + 1}/"
                     f"{self._cfg.max_retries}): {exc}. "
-                    f"Retrying in {wait}s …"
+                    f"Retrying in {wait}s …",
+                    flush=True,
                 )
                 time.sleep(wait)
             except openai.APIStatusError as exc:
                 # 4xx errors (except 429) are not transient — surface immediately.
                 if exc.status_code == 429:
                     last_exc = exc
-                    wait = 2 ** attempt
+                    wait = 15 * (2 ** attempt)  # 15s, 30s, 60s, …
+                    print(
+                        f"[llm] rate-limited (attempt {attempt + 1}/"
+                        f"{self._cfg.max_retries}): {exc}. "
+                        f"Retrying in {wait}s …",
+                        flush=True,
+                    )
                     time.sleep(wait)
                 else:
                     raise

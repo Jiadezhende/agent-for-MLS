@@ -162,6 +162,7 @@ class ToolFactory:
             "record_measurement": (record_measurement,                    True),
             "flag_event":         (flag_event,                            True),
             "submit_results":     (submit_results,                        True),
+            "find_binary":        (self._executor.find_binary,            False),
         }
 
         reg = ToolRegistry()

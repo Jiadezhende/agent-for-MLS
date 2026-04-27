@@ -181,7 +181,10 @@ class TestAutodetectEnvToolPaths:
         with patch("agents.tools.cuda_executor._run_subprocess", return_value=_mock_subprocess_ok("12.0\n")), \
              patch("shutil.which", return_value=None), \
              patch("agents.tools.cuda_executor._NCU_SEARCH_PATHS_WIN", []), \
-             patch("agents.tools.cuda_executor._NSYS_SEARCH_PATHS_WIN", []):
+             patch("agents.tools.cuda_executor._NSYS_SEARCH_PATHS_WIN", []), \
+             patch("agents.tools.cuda_executor._NVCC_SEARCH_GLOBS_LIN", []), \
+             patch("agents.tools.cuda_executor._NCU_SEARCH_GLOBS_LIN", []), \
+             patch("agents.tools.cuda_executor._NSYS_SEARCH_GLOBS_LIN", []):
             updated, notes = _autodetect_env(cfg)
         assert updated.ncu_bin == "ncu"    # unchanged default
         assert updated.nsys_bin == "nsys"  # unchanged default

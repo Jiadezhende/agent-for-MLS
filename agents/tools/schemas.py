@@ -206,49 +206,6 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "profile_with_torch",
-            "description": (
-                "Run Python code under PyTorch Profiler to capture operator-level "
-                "statistics. Use this to identify hotspot operators in a PyTorch "
-                "model or function, measure GPU time per operator, and see memory "
-                "allocation patterns."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "python_code": {
-                        "type": "string",
-                        "description": (
-                            "Python code that defines and calls the operation to profile. "
-                            "The Executor wraps it with torch.profiler automatically. "
-                            "Must import torch and define the operation inline."
-                        ),
-                    },
-                    "op_name": {
-                        "type": "string",
-                        "description": (
-                            "Human-readable name for this operation "
-                            "(used in logs and cache keys)."
-                        ),
-                    },
-                    "num_iters": {
-                        "type": "integer",
-                        "default": 100,
-                        "description": "Number of iterations to run (for warmup + profiling).",
-                    },
-                    "timeout_s": {
-                        "type": "integer",
-                        "default": 300,
-                    },
-                },
-                "required": ["python_code", "op_name"],
-            },
-        },
-    },
-
     # ------------------------------------------------------------------
     # Recording tools (need AgentContext injection)
     # ------------------------------------------------------------------

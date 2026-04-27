@@ -214,4 +214,10 @@ workspace/cache.json
 
 results.json
 reasoning_log.json
+reasoning_log_*.json
+output.json
+logs
+.tmp/
+test_tmp/
 *.exe
+$null

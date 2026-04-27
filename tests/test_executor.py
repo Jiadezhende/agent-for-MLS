@@ -397,6 +397,21 @@ class TestNcuReduction:
         assert reduced["kernel_names_seen"] == ["k"]
         assert reduced["kernels_profiled"] == 2
 
+    def test_wide_raw_csv_format_from_newer_ncu(self):
+        raw = '''==PROF== Connected
+"ID","Process Name","Host Name","Kernel Name","sm__cycles_elapsed.avg.per_second","sm__cycles_elapsed.avg","dram__bytes.sum"
+"","","","","cycle/nsecond","cycle","byte"
+"0","probe.exe","127.0.0.1","probe_kernel","99","1,234.5","10"
+"1","probe.exe","127.0.0.1","probe_kernel","88","2,000.5","20"
+'''
+        reduced = _reduce_ncu(raw, ["sm__cycles_elapsed.avg", "dram__bytes.sum"])
+        assert reduced["kernel_names_seen"] == ["probe_kernel"]
+        assert reduced["kernels_profiled"] == 2
+        assert reduced["metrics"]["sm__cycles_elapsed.avg"] == 1617.5
+        assert reduced["metrics"]["dram__bytes.sum"] == 30.0
+        assert "sm__cycles_elapsed.avg.per_second" not in reduced["metrics"]
+        assert reduced["missing_metrics"] == []
+
 
 class TestCompileErrorParsing:
     """Tests for _extract_nvcc_errors and _classify_compile_error helpers."""

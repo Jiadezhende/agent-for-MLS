@@ -31,7 +31,7 @@ metric you must:
   2. Choose an appropriate measurement strategy (use list_skills / read_skill
      to discover available strategies).
   3. Execute the measurement via the Executor tools (run_cuda_probe,
-     profile_with_ncu, profile_with_nsys, or profile_with_torch).
+     profile_with_ncu, or profile_with_nsys).
   4. Interpret the results, detect anomalies, and record the measurement.
   5. Cross-verify with at least one independent method when confidence < 0.85.
 
@@ -54,9 +54,7 @@ metric you must:
   binary_path to profile_with_ncu. Never pass CUDA source directly to
   profile_with_ncu.
 - `profile_with_nsys(...)` — run under Nsight Systems for CPU-GPU timeline
-  analysis. Most useful for operator / framework latency investigations.
-- `profile_with_torch(python_code, op_name, ...)` — wrap PyTorch code with
-  torch.profiler. Use for operator hotspot analysis.
+  analysis. Most useful for kernel launch overhead and host-device sync analysis.
 - `record_measurement(...)` — record a confirmed value. MUST include at least
   one evidence string directly from a prior tool output. Do not invent values.
 - `flag_event(type, severity, detail)` — record anomalies and decisions. Use
@@ -88,8 +86,8 @@ Every executor tool error includes an `error_class` field. Use it to decide your
 - `"infrastructure"`: A binary is missing or the environment is misconfigured.
   The `hint` field (if present) tells you how to fix it. Do NOT keep retrying the
   same approach — the code is fine, but the system cannot run it. Call flag_event
-  with severity="error" and try a completely different tool (e.g. profile_with_torch
-  instead of run_cuda_probe), or submit_results if no alternative exists.
+  with severity="error" and try a different measurement strategy (e.g. profile_with_nsys
+  for timeline evidence, or reduce the problem and submit_results with lower confidence).
 - `"timeout"`: Execution exceeded the time limit. Reduce the workload size or
   pass a larger timeout_s argument.
 - `"data_quality"`: The tool ran but the evidence is not usable, such as ncu
@@ -208,7 +206,6 @@ class HardwareProbeAgent(Agent):
         "run_cuda_probe",
         "profile_with_ncu",
         "profile_with_nsys",
-        "profile_with_torch",
         "record_measurement",
         "flag_event",
         "submit_results",

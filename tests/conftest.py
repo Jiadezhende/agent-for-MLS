@@ -3,13 +3,23 @@ conftest.py — Shared pytest fixtures.
 """
 from __future__ import annotations
 
+import os
+import tempfile
 import uuid
 import pytest
 from pathlib import Path
 from dotenv import load_dotenv
 
 # Load .env so ExecutorConfig.from_env() has AGENT_NVCC_CCBIN etc.
-load_dotenv(Path(__file__).parent.parent / ".env")
+_REPO_ROOT = Path(__file__).parent.parent
+_PYTEST_TMP = _REPO_ROOT / ".tmp" / "pytest"
+_PYTEST_TMP.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("TMP", str(_PYTEST_TMP))
+os.environ.setdefault("TEMP", str(_PYTEST_TMP))
+os.environ.setdefault("TMPDIR", str(_PYTEST_TMP))
+tempfile.tempdir = str(_PYTEST_TMP)
+
+load_dotenv(_REPO_ROOT / ".env")
 
 
 # ---------------------------------------------------------------------------

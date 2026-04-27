@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import uuid
 from pathlib import Path
 
 from agents.core.config import ExecutorConfig
@@ -26,7 +27,8 @@ def _compile_cuda(
 
     src_path = workspace.write(f"src/{name}.cu", source)
     suffix = ".exe" if sys.platform == "win32" else ""
-    out_path = workspace.root / "bin" / f"{name}{suffix}"
+    _uid = uuid.uuid4().hex[:6]
+    out_path = workspace.root / "bin" / f"{name}_{_uid}{suffix}"
 
     ccbin_flags = ["-ccbin", cfg.nvcc_ccbin] if cfg.nvcc_ccbin else []
     cmd = [

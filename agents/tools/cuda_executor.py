@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sys
 import textwrap
@@ -201,6 +202,14 @@ def _execute_ncu(
     args: list[str] = p.get("args", [])
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
 
+    if not metrics:
+        raise ExecutorError(
+            "invalid_args",
+            error_class="user_code",
+            phase="profile",
+            hint="metrics must be a non-empty list of ncu metric names.",
+        )
+
     permission_hint = _precheck_ncu_permission()
     if permission_hint:
         raise ExecutorError(
@@ -269,10 +278,13 @@ def _execute_ncu(
             kernel_name=kernel_name,
             kernel_names_seen=reduced.get("kernel_names_seen", []),
             missing_metrics=reduced.get("missing_metrics", metrics),
+            stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+            returncode=sub.returncode,
         )
 
-    reduced["stdout_tail"] = sub.stdout[-2000:] if sub.stdout else ""
-    reduced["stderr"] = sub.stderr[-2000:] if sub.stderr else ""
+    if sub.stderr:
+        reduced["stderr"] = sub.stderr[-2000:]
     reduced["returncode"] = sub.returncode
     reduced["ncu_version"] = _detect_ncu_version(cfg)
     return reduced
@@ -451,6 +463,15 @@ def _detect_arch_flags() -> str | None:
         cc = r.stdout.strip().replace(".", "")   # "12.0" → "120"
         if cc.isdigit():
             return f"-arch=sm_{cc}"
+    # Fallback for older nvidia-smi that lacks --query-gpu=compute_cap
+    r2 = _run_subprocess(["nvidia-smi", "-q"], timeout_s=10)
+    if r2.returncode == 0:
+        m = re.search(
+            r"CUDA Capability Major/Minor Version Number\s*:\s*(\d+)\.(\d+)",
+            r2.stdout,
+        )
+        if m:
+            return f"-arch=sm_{m.group(1)}{m.group(2)}"
     return None
 
 

@@ -13,7 +13,7 @@ def _safe_join(root: Path, rel: str) -> Path:
     if Path(rel).is_absolute():
         raise ExecutorError(
             "path_escape",
-            error_class="user_code",
+            error_class="infrastructure",
             rel=rel,
             reason="absolute path not allowed",
         )
@@ -24,7 +24,7 @@ def _safe_join(root: Path, rel: str) -> Path:
     except ValueError:
         raise ExecutorError(
             "path_escape",
-            error_class="user_code",
+            error_class="infrastructure",
             rel=rel,
             reason="path escapes workspace",
         )

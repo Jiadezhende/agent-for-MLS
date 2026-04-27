@@ -105,11 +105,13 @@ def _subprocess_encoding() -> str:
 def _reduce_probe_output(stdout: str | bytes, encoding: str | None = None) -> dict:
     """Return compact LLM-facing stdout evidence, preserving tail measurements."""
     enc = encoding or _subprocess_encoding()
-    stdout_b = stdout.encode(enc, errors="replace") if isinstance(stdout, str) else stdout
+    stdout_b: bytes = stdout.encode(enc, errors="replace") if isinstance(stdout, str) else stdout
     total = len(stdout_b)
     if total <= STDOUT_TAIL_BYTES + STDOUT_HEAD_BYTES:
+        stdout_s = stdout_b.decode(enc, errors="replace")
         return {
-            "stdout": stdout_b.decode(enc, errors="replace"),
+            "stdout": stdout_s,
+            "stdout_tail": stdout_s,
             "stdout_total_bytes": total,
         }
 
@@ -128,4 +130,3 @@ def _reduce_probe_output(stdout: str | bytes, encoding: str | None = None) -> di
         "stdout_tail": tail_b.decode(enc, errors="replace"),
         "stdout_total_bytes": total,
     }
-

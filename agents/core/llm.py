@@ -18,21 +18,43 @@ from agents.core.config import LLMConfig
 
 
 def _is_reasoning_model(model: str) -> bool:
-    """o-series and GPT-5+ models don't accept temperature and use max_completion_tokens."""
+    """Models that don't accept temperature (must omit or fix at 1).
+
+    - OpenAI: o-series (o1, o3, o4-mini …), gpt-5+
+    - DeepSeek: deepseek-reasoner, deepseek-r1* — API error if temperature != 1
+    """
     m = model.lower()
-    return bool(re.match(r"o\d", m)) or m.startswith("gpt-5")
+    return (
+        bool(re.match(r"o\d", m))
+        or m.startswith("gpt-5")
+        or m.startswith("deepseek-reasoner")
+        or m.startswith("deepseek-r1")
+    )
 
 
-def _build_create_kwargs(cfg: LLMConfig) -> dict[str, Any]:
-    """Return only the API params this model family accepts."""
+def _max_tokens_param(model: str) -> str:
+    """Only OpenAI o-series / gpt-5+ use max_completion_tokens; all others use max_tokens."""
+    m = model.lower()
+    if bool(re.match(r"o\d", m)) or m.startswith("gpt-5"):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def _build_create_kwargs(
+    cfg: LLMConfig,
+    skip_temperature: bool = False,
+    force_max_tokens: bool = False,
+) -> dict[str, Any]:
+    """Return only the API params this model family accepts.
+
+    skip_temperature / force_max_tokens are runtime-learned overrides applied
+    after a 400 param error is detected by LLMClient.chat().
+    """
     kwargs: dict[str, Any] = {"timeout": cfg.request_timeout_s}
-    if _is_reasoning_model(cfg.model):
-        if cfg.max_tokens:
-            kwargs["max_completion_tokens"] = cfg.max_tokens
-        # temperature not supported on reasoning models
-    else:
-        if cfg.max_tokens:
-            kwargs["max_tokens"] = cfg.max_tokens
+    if cfg.max_tokens:
+        param = "max_tokens" if force_max_tokens else _max_tokens_param(cfg.model)
+        kwargs[param] = cfg.max_tokens
+    if not skip_temperature and not _is_reasoning_model(cfg.model):
         kwargs["temperature"] = cfg.temperature
     return kwargs
 
@@ -189,6 +211,36 @@ class LLMClient:
             api_key=cfg.api_key,
             base_url=cfg.base_url,          # None → uses OpenAI default
         )
+        # Runtime-learned param compatibility overrides (sticky across calls).
+        # Set automatically on first 400 param error; avoids repeating bad params.
+        self._skip_temperature: bool = False   # learned: provider rejects temperature
+        self._force_max_tokens: bool = False   # learned: provider rejects max_completion_tokens
+
+    def _try_param_fallback(self, exc: openai.APIStatusError) -> bool:
+        """Inspect a 400 error body and update sticky param overrides.
+
+        Returns True if an override was applied (caller should retry immediately),
+        False if the error is unrelated to parameter compatibility.
+        """
+        body = str(exc).lower()
+        changed = False
+        if not self._skip_temperature and "temperature" in body:
+            self._skip_temperature = True
+            print(
+                f"[llm] provider rejected temperature for model '{self._cfg.model}'; "
+                "disabling for all subsequent calls.",
+                flush=True,
+            )
+            changed = True
+        if not self._force_max_tokens and "max_completion_tokens" in body:
+            self._force_max_tokens = True
+            print(
+                f"[llm] provider rejected max_completion_tokens for model '{self._cfg.model}'; "
+                "falling back to max_tokens.",
+                flush=True,
+            )
+            changed = True
+        return changed
 
     def chat(
         self,
@@ -197,6 +249,8 @@ class LLMClient:
     ) -> ChatResponse:
         """Call the LLM with retry on transient errors.
 
+        On 400 parameter-incompatibility errors (temperature, max_completion_tokens)
+        the client updates sticky overrides and retries once before giving up.
         Raises the last exception if all retries are exhausted.
         """
         last_exc: Exception | None = None
@@ -207,7 +261,11 @@ class LLMClient:
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
-                    **_build_create_kwargs(self._cfg),
+                    **_build_create_kwargs(
+                        self._cfg,
+                        skip_temperature=self._skip_temperature,
+                        force_max_tokens=self._force_max_tokens,
+                    ),
                 )
                 return ChatResponse.from_openai(raw)
             except (
@@ -227,7 +285,6 @@ class LLMClient:
                 )
                 time.sleep(wait)
             except openai.APIStatusError as exc:
-                # 4xx errors (except 429) are not transient — surface immediately.
                 if exc.status_code == 429:
                     last_exc = exc
                     wait = 15 * (2 ** attempt)  # 15s, 30s, 60s, …
@@ -238,6 +295,9 @@ class LLMClient:
                         flush=True,
                     )
                     time.sleep(wait)
+                elif exc.status_code == 400 and self._try_param_fallback(exc):
+                    # Param override applied — retry immediately, don't count as attempt.
+                    continue
                 else:
                     raise
 

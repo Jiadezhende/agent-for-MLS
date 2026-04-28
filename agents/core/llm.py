@@ -120,6 +120,7 @@ class ToolCall:
 class ChatResponse:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning_content: str | None = None
     finish_reason: str = ""
     _raw_tool_calls: list = field(default_factory=list, repr=False)
 
@@ -131,9 +132,17 @@ class ChatResponse:
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 tcs.append(ToolCall.from_openai(tc))
+
+        reasoning_content = getattr(msg, "reasoning_content", None)
+        if reasoning_content is None:
+            model_extra = getattr(msg, "model_extra", None)
+            if isinstance(model_extra, dict):
+                reasoning_content = model_extra.get("reasoning_content")
+
         return cls(
             content=_strip_glm_artifacts(msg.content),
             tool_calls=tcs,
+            reasoning_content=reasoning_content,
             finish_reason=choice.finish_reason or "",
             _raw_tool_calls=msg.tool_calls or [],
         )
@@ -146,6 +155,8 @@ class ChatResponse:
         we append afterwards.
         """
         msg: dict = {"role": "assistant", "content": self.content}
+        if self.reasoning_content is not None:
+            msg["reasoning_content"] = self.reasoning_content
         if self._raw_tool_calls:
             msg["tool_calls"] = [
                 {

@@ -5,41 +5,44 @@ The Executor is the ONLY code that runs subprocesses, compiles CUDA, or
 invokes profiling tools. The LLM never calls nvcc / ncu / nsys directly;
 it calls Executor public methods (registered as tools in registry.py).
 
-Sections:
-  1. Data structures (JobSpec, JobResult, SubResult)
-  2. Workspace (per-run temp directory)
-  3. Cache (in-memory, keyed by payload hash)
-  4. Sandbox (binary whitelist, path traversal guard)
-  5. Subprocess helpers
-  6. Compilation
-  7. Post-processing (output reducers for ncu / nsys / torch)
-  8. Backends (_execute_cuda_probe, _execute_ncu, _execute_nsys, _execute_torch)
-  9. Environment auto-detection
- 10. Executor (public API)
+This file is now the facade/glue layer. Implementation details live in
+agents/tools/executor/:
+  - workspace.py: workspace and path sandboxing
+  - subprocess_runner.py: process tree kill, encoding, probe stdout reduction
+  - binaries.py: binary whitelist and resolution
+  - nvcc.py: CUDA compilation
+  - reducers.py: ncu/nsys output reducers
+  - classifiers.py: structured error taxonomy
+  - ncu.py: Nsight Compute permission/version helpers
 """
 from __future__ import annotations
 
-import csv
 import hashlib
-import io
 import json
-import os
 import re
 import shutil
-import subprocess
 import sys
-import tempfile
-import textwrap
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from agents.core.config import ExecutorConfig
 from agents.core.exceptions import ExecutorError
+from agents.tools.executor.binaries import _check_binary
+from agents.tools.executor.classifiers import _classify_subprocess_failure
+from agents.tools.executor.ncu import _detect_ncu_version, _precheck_ncu_permission
+from agents.tools.executor.nvcc import _compile_cuda
+from agents.tools.executor.reducers import _reduce_ncu, _reduce_nsys
+from agents.tools.executor.subprocess_runner import (
+    SubResult,
+    _reduce_probe_output,
+    _run_subprocess,
+)
+from agents.tools.executor.workspace import _safe_join, _Workspace
 
 
 # ===========================================================================
@@ -60,14 +63,6 @@ class JobSpec:
             sort_keys=True,
         )
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
-
-
-@dataclass
-class SubResult:
-    stdout: str
-    stderr: str
-    returncode: int
-    timed_out: bool = False
 
 
 @dataclass
@@ -107,51 +102,7 @@ class JobResult:
 
 
 # ===========================================================================
-# 2. Workspace
-# ===========================================================================
-
-class _Workspace:
-    """Per-run temporary directory with deterministic sub-paths."""
-
-    SUBDIRS = ("src", "bin", "ncu", "nsys", "torch", "logs")
-
-    def __init__(self, root: str) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        uid = uuid.uuid4().hex[:8]
-        self.root = Path(root).resolve() / f"run_{ts}_{uid}"
-        self.root.mkdir(parents=True, exist_ok=True)
-        for sub in self.SUBDIRS:
-            (self.root / sub).mkdir(exist_ok=True)
-
-    def allocate(self, kind: str, suffix: str) -> Path:
-        """Return a unique path inside the workspace (file not yet created)."""
-        uid = uuid.uuid4().hex[:6]
-        return self.root / kind / f"{kind}_{uid}{suffix}"
-
-    def write(self, rel: str, content: str | bytes) -> Path:
-        """Write content to a workspace-relative path (creates parent dirs)."""
-        target = _safe_join(self.root, rel)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, str):
-            target.write_text(content, encoding="utf-8")
-        else:
-            target.write_bytes(content)
-        return target
-
-    def cleanup(self, keep: bool = False) -> None:
-        if not keep and self.root.exists():
-            shutil.rmtree(self.root, ignore_errors=True)
-
-    def rel(self, path: Path) -> str:
-        """Return POSIX-style path relative to workspace root."""
-        try:
-            return path.relative_to(self.root).as_posix()
-        except ValueError:
-            return path.as_posix()
-
-
-# ===========================================================================
-# 3. Cache
+# 2. Cache
 # ===========================================================================
 
 class _JobCache:
@@ -169,303 +120,8 @@ class _JobCache:
 
 
 # ===========================================================================
-# 4. Sandbox helpers
+# 3. Compilation helpers
 # ===========================================================================
-
-def _safe_join(root: Path, rel: str) -> Path:
-    """Resolve rel relative to root and reject path traversal / absolute paths."""
-    if Path(rel).is_absolute():
-        raise ExecutorError("path_escape", error_class="user_code",
-                            rel=rel, reason="absolute path not allowed")
-    resolved = (root / rel).resolve()
-    root_resolved = root.resolve()
-    try:
-        resolved.relative_to(root_resolved)
-    except ValueError:
-        raise ExecutorError("path_escape", error_class="user_code",
-                            rel=rel, reason="path escapes workspace")
-    return resolved
-
-
-def _check_binary(cfg: ExecutorConfig, name: str) -> str:
-    """Return the resolved path for a binary name if it's on the whitelist."""
-    basename = Path(name).stem
-    if basename not in cfg.allowed_binaries:
-        raise ExecutorError(
-            "binary_not_whitelisted",
-            error_class="infrastructure",
-            name=name,
-            allowed=cfg.allowed_binaries,
-        )
-    # Accept absolute paths that exist directly (e.g. from auto-detect or find_binary)
-    if Path(name).is_absolute() and Path(name).exists():
-        return name
-    resolved = shutil.which(name)
-    if resolved is None:
-        raise ExecutorError(
-            "binary_not_found",
-            error_class="infrastructure",
-            hint=_BINARY_HINTS.get(basename, f"Install {basename} or set the AGENT_{basename.upper()}_BIN env var."),
-            name=name,
-        )
-    return resolved
-
-
-# ===========================================================================
-# 5. Subprocess helpers
-# ===========================================================================
-
-def _run_subprocess(
-    cmd: list[str],
-    timeout_s: int,
-    cwd: Path | None = None,
-    env: dict | None = None,
-    truncate_bytes: int = 64_000,
-) -> SubResult:
-    """Run cmd and return a SubResult.  Never raises; timeouts are captured."""
-    # .bat files on Windows are not directly executable; wrap with cmd /c
-    if sys.platform == "win32" and cmd and Path(cmd[0]).suffix.lower() == ".bat":
-        cmd = ["cmd", "/c"] + cmd
-    TRUNC_MARKER = b"\n[... output truncated ...]\n"
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=timeout_s,
-            cwd=cwd,
-            env=env,
-        )
-        stdout_b = proc.stdout
-        stderr_b = proc.stderr
-        timed_out = False
-        returncode = proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        stdout_b = exc.stdout or b""
-        stderr_b = exc.stderr or b""
-        timed_out = True
-        returncode = -1
-    except FileNotFoundError:
-        stdout_b = b""
-        stderr_b = f"command not found: {cmd[0]}".encode()
-        timed_out = False
-        returncode = 127
-
-    # Truncate
-    if len(stdout_b) > truncate_bytes:
-        stdout_b = stdout_b[:truncate_bytes] + TRUNC_MARKER
-    if len(stderr_b) > truncate_bytes:
-        stderr_b = stderr_b[:truncate_bytes] + TRUNC_MARKER
-
-    # Use system locale encoding so MSVC/GBK output on Chinese Windows is readable
-    _enc = sys.stdout.encoding or "utf-8"
-    return SubResult(
-        stdout=stdout_b.decode(_enc, errors="replace"),
-        stderr=stderr_b.decode(_enc, errors="replace"),
-        returncode=returncode,
-        timed_out=timed_out,
-    )
-
-
-# ===========================================================================
-# 6. Compilation helpers
-# ===========================================================================
-
-_BINARY_HINTS: dict[str, str] = {
-    "ncu":  "Set AGENT_NCU_BIN env var, or install Nsight Compute.",
-    "nsys": "Set AGENT_NSYS_BIN env var, or install Nsight Systems.",
-    "nvcc": "Set AGENT_NVCC_BIN env var, or install the CUDA Toolkit.",
-}
-
-_DIAG_RE = re.compile(
-    r"(error:|warning:|note:|undefined reference|undefined symbol|"
-    r"\d+ error(s)? detected|cannot open source file|fatal error)",
-    re.IGNORECASE,
-)
-
-
-def _extract_nvcc_errors(combined: str, max_chars: int = 3000) -> str:
-    """Extract only diagnostic lines from nvcc stderr/stdout mix.
-
-    nvcc output looks like:
-        nvcc.EXE -ccbin … (invocation — skip)
-        /path/file.cu(42): error: 'clockRate' is not a member of …
-        1 error detected in compilation of …
-
-    We keep lines that contain diagnostic keywords and strip the workspace
-    path prefix so line references are stable across runs.
-    Fallback: if nothing matches, return the last 2000 chars of combined.
-    """
-    lines = combined.splitlines()
-    kept = [l.strip() for l in lines if l.strip() and _DIAG_RE.search(l)]
-    result = "\n".join(kept) if kept else combined[-2000:]
-    return result[:max_chars]
-
-
-def _classify_compile_error(combined: str) -> str:
-    """Return 'user_code' or 'infrastructure' based on nvcc error content."""
-    low = combined.lower()
-    if "command not found" in low:
-        return "infrastructure"
-    if "nvcc fatal" in low and "no input files" not in low:
-        return "infrastructure"
-    # ccbin-related: the host compiler path is wrong (env misconfiguration)
-    if "-ccbin" in combined and ("cannot find" in low or "no such file" in low):
-        return "infrastructure"
-    return "user_code"
-
-
-def _compile_cuda(
-    source: str,
-    name: str,
-    flags: list[str],
-    workspace: _Workspace,
-    cfg: ExecutorConfig,
-) -> Path:
-    """Write CUDA source to workspace/src and compile with nvcc.
-
-    Returns path to the compiled binary.
-    Raises ExecutorError("compile_failed") on non-zero nvcc exit.
-    """
-    nvcc = _check_binary(cfg, cfg.nvcc_bin)
-
-    src_path = workspace.write(f"src/{name}.cu", source)
-    # On Windows nvcc produces .exe
-    suffix = ".exe" if sys.platform == "win32" else ""
-    out_path = workspace.root / "bin" / f"{name}{suffix}"
-
-    ccbin_flags = ["-ccbin", cfg.nvcc_ccbin] if cfg.nvcc_ccbin else []
-    cmd = [nvcc, *ccbin_flags, *cfg.nvcc_default_flags, *flags, "-o", str(out_path), str(src_path)]
-    result = _run_subprocess(
-        cmd,
-        timeout_s=cfg.default_compile_timeout_s,
-        truncate_bytes=cfg.stdout_truncate_bytes,
-    )
-
-    if result.returncode != 0 and not result.timed_out:
-        # nvcc prints errors to stdout on some platforms; capture both
-        combined = (result.stdout + "\n" + result.stderr).strip()
-        ec = _classify_compile_error(combined)
-        raise ExecutorError(
-            "compile_failed",
-            error_class=ec,
-            returncode=result.returncode,
-            # Clean stderr: only diagnostic lines, not the nvcc invocation.
-            # Omitting cmd prevents LLM from misreading flags as the error cause.
-            stderr=_extract_nvcc_errors(combined),
-            arch_flags=[f for f in cmd if f.startswith("-arch") or f.startswith("--generate-code")],
-        )
-    if result.timed_out:
-        raise ExecutorError("compile_timeout", error_class="timeout",
-                            source_name=name)
-
-    return out_path
-
-
-# ===========================================================================
-# 7. Post-processing (output reducers)
-# ===========================================================================
-
-def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
-    """Parse ncu --csv output and extract requested metrics."""
-    result: dict[str, Any] = {}
-    notes: list[str] = []
-
-    lines = raw_text.strip().splitlines()
-    if not lines:
-        return {"metrics": {}, "notes": ["empty ncu output"]}
-
-    try:
-        reader = csv.DictReader(io.StringIO(raw_text))
-        rows = list(reader)
-        for row in rows:
-            for m in metrics_requested:
-                for col in row:
-                    if m in col or col in m:
-                        val_str = row[col].strip().strip('"')
-                        try:
-                            result[m] = float(val_str.replace(",", ""))
-                        except ValueError:
-                            result[m] = val_str
-    except Exception as exc:
-        notes.append(f"CSV parse error: {exc}")
-
-    for m in metrics_requested:
-        if m not in result:
-            pattern = re.compile(
-                r"(?i)" + re.escape(m) + r"[^\d\-]*([0-9]+(?:\.[0-9]+)?)"
-            )
-            match = pattern.search(raw_text)
-            if match:
-                result[m] = float(match.group(1))
-
-    missing = [m for m in metrics_requested if m not in result]
-    if missing:
-        notes.append(f"Could not parse metrics: {missing}")
-
-    return {"metrics": result, "notes": notes}
-
-
-def _reduce_nsys(raw_text: str) -> dict:
-    """Extract top GPU kernels from nsys stats text output."""
-    lines = raw_text.strip().splitlines()
-    result: dict[str, Any] = {"timeline_summary": [], "notes": []}
-
-    in_table = False
-    header: list[str] = []
-    rows: list[dict] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if in_table:
-                in_table = False
-            continue
-        if "Time (%)" in stripped and not in_table:
-            header = [h.strip() for h in stripped.split(",")]
-            in_table = True
-            continue
-        if in_table:
-            parts = stripped.split(",")
-            if len(parts) == len(header):
-                rows.append(dict(zip(header, [p.strip() for p in parts])))
-
-    if rows:
-        result["timeline_summary"] = rows[:10]
-    else:
-        result["timeline_summary"] = lines[:50]
-        result["notes"].append("Could not parse nsys stats table; raw excerpt returned")
-
-    return result
-
-
-def _reduce_torch(raw_text: str) -> dict:
-    """Parse torch.profiler text output and return top operators by self CPU time."""
-    lines = raw_text.strip().splitlines()
-    result: dict[str, Any] = {"op_stats": [], "notes": []}
-
-    header_idx = -1
-    for i, line in enumerate(lines):
-        if "Self CPU" in line or "CPU total" in line:
-            header_idx = i
-            break
-
-    if header_idx >= 0:
-        data_lines = lines[header_idx + 1:]
-        ops = []
-        for line in data_lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("-"):
-                continue
-            ops.append(stripped)
-            if len(ops) >= 20:
-                break
-        result["op_stats"] = ops
-    else:
-        result["op_stats"] = lines[:30]
-        result["notes"].append("Could not parse torch profiler table; raw excerpt returned")
-
-    return result
-
 
 # ===========================================================================
 # 8. Backends
@@ -475,8 +131,8 @@ def _execute_cuda_probe(
     spec: JobSpec,
     workspace: _Workspace,
     cfg: ExecutorConfig,
-) -> SubResult:
-    """Compile and run a CUDA kernel; return raw stdout/stderr."""
+) -> dict:
+    """Compile and run a CUDA kernel; return reduced stdout evidence."""
     p = spec.payload
     source: str = p["source"]
     name: str = p["probe_name"].replace(" ", "_")
@@ -487,12 +143,40 @@ def _execute_cuda_probe(
     bin_path = _compile_cuda(source, name, flags, workspace, cfg)
 
     run_cmd = [str(bin_path)] + args
-    return _run_subprocess(
+    sub = _run_subprocess(
         run_cmd,
         timeout_s=timeout_s,
         cwd=workspace.root,
-        truncate_bytes=cfg.stdout_truncate_bytes,
+        truncate_bytes=None,
     )
+    if sub.returncode != 0 or sub.timed_out:
+        combined = (sub.stdout + "\n" + sub.stderr).strip()
+        classified = _classify_subprocess_failure(
+            combined,
+            phase="run",
+            timed_out=sub.timed_out,
+            returncode=sub.returncode,
+        )
+        evidence = _reduce_probe_output(sub.stdout)
+        raise ExecutorError(
+            classified["error"],
+            error_class=classified["error_class"],
+            hint=classified.get("hint"),
+            phase=classified["phase"],
+            returncode=sub.returncode,
+            timed_out=sub.timed_out,
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+            **evidence,
+        )
+
+    reduced = _reduce_probe_output(sub.stdout)
+    reduced.update({
+        "binary_path": workspace.rel(bin_path),
+        "stderr": sub.stderr[-2000:] if sub.stderr else "",
+        "returncode": sub.returncode,
+        "timed_out": sub.timed_out,
+    })
+    return reduced
 
 
 def _execute_ncu(
@@ -504,25 +188,46 @@ def _execute_ncu(
     p = spec.payload
     ncu = _check_binary(cfg, cfg.ncu_bin)
 
-    source_type: str = p["source_type"]
-    source_or_path: str = p["source_or_path"]
+    binary_path: str = p["binary_path"]
     kernel_name: str = p.get("kernel_name", "")
     metrics: list[str] = p.get("metrics", [])
-    flags: list[str] = p.get("compile_flags", [])
     args: list[str] = p.get("args", [])
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
-    probe_name: str = p.get("probe_name", spec.name)
 
-    if source_type == "cuda_source":
-        bin_path = _compile_cuda(
-            source_or_path, probe_name.replace(" ", "_"), flags, workspace, cfg
+    if not metrics:
+        raise ExecutorError(
+            "invalid_args",
+            error_class="user_code",
+            phase="profile",
+            hint="metrics must be a non-empty list of ncu metric names.",
         )
-    else:
-        bin_path = _safe_join(workspace.root, source_or_path)
-        if not bin_path.exists():
-            raise ExecutorError("binary_not_found", path=source_or_path)
 
-    cmd = [ncu, "--csv"]
+    permission_hint = _precheck_ncu_permission()
+    if permission_hint:
+        raise ExecutorError(
+            "ncu_permission_denied",
+            error_class="infrastructure",
+            phase="profile",
+            hint=permission_hint,
+        )
+
+    bin_path = _safe_join(workspace.root, binary_path)
+    if not bin_path.exists():
+        raise ExecutorError(
+            "binary_not_found",
+            error_class="user_code",
+            phase="profile",
+            path=binary_path,
+            hint="Pass binary_path returned by a successful run_cuda_probe call.",
+        )
+
+    cmd = [
+        ncu,
+        "--csv",
+        "--page", "raw",
+        "--replay-mode", "kernel",
+        "--target-processes", "all",
+    ]
     if kernel_name:
         cmd += ["--kernel-name", kernel_name]
     if metrics:
@@ -533,45 +238,79 @@ def _execute_ncu(
         cmd,
         timeout_s=timeout_s,
         cwd=workspace.root,
-        truncate_bytes=cfg.stdout_truncate_bytes,
+        truncate_bytes=None,
+        encoding="utf-8",
     )
 
-    raw_csv = sub.stdout or ""
+    combined = (sub.stdout + "\n" + sub.stderr).strip()
 
-    if "ERR_NVGPUCTRPERM" in raw_csv or "ERR_NVGPUCTRPERM" in (sub.stderr or ""):
-        return {
-            "error": "ncu_permission_denied",
-            "error_class": "infrastructure",
-            "stderr": sub.stderr[-2000:] if sub.stderr else "",
-            "hint": (
-                "ERR_NVGPUCTRPERM: no permission to read GPU hardware counters. "
-                "Do NOT retry ncu — use run_cuda_probe self-instrumentation instead."
+    # Check for ERR_NVGPUCTRPERM before the returncode check: some ncu versions
+    # exit 0 even when GPU counter access is denied, so the permission error would
+    # otherwise silently fall through to _reduce_ncu → kernels_profiled==0.
+    if "ERR_NVGPUCTRPERM" in combined or "erf_no_privileged_mode" in combined.lower():
+        raise ExecutorError(
+            "ncu_permission_denied",
+            error_class="infrastructure",
+            phase="profile",
+            hint=(
+                "ERR_NVGPUCTRPERM: no permission for GPU hardware counters. "
+                "Do NOT retry ncu — switch to run_cuda_probe self-timed kernels instead."
             ),
-            "metrics": {},
-            "notes": ["ERR_NVGPUCTRPERM: run ncu as admin to enable hardware counters"],
-            "returncode": sub.returncode,
-        }
+            returncode=sub.returncode,
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+        )
 
-    if not raw_csv and sub.returncode != 0:
-        return {
-            "error": "ncu_failed",
-            "error_class": "infrastructure",
-            "stderr": sub.stderr[-2000:] if sub.stderr else "",
-            "hint": (
-                "NCU command failed with no output. Common causes: "
-                "(1) requires admin/root privileges, "
-                "(2) metric names unsupported on this GPU arch. "
-                "Do NOT retry with different metric names — "
-                "switch to run_cuda_probe self-instrumentation instead."
-            ),
-            "metrics": {},
-            "notes": ["NCU command exited non-zero with no output"],
-            "returncode": sub.returncode,
-        }
+    if sub.returncode != 0 or sub.timed_out:
+        # Empty combined output with a non-zero exit is an infrastructure failure
+        # (ncu couldn't start or crashed before producing any output).
+        if not combined:
+            raise ExecutorError(
+                "ncu_failed",
+                error_class="infrastructure",
+                phase="profile",
+                hint=(
+                    "ncu exited non-zero with no output. Common causes: missing admin "
+                    "privileges, unsupported GPU, or broken toolkit. "
+                    "Do NOT retry — switch to run_cuda_probe instead."
+                ),
+                returncode=sub.returncode,
+                stderr=sub.stderr[-2000:] if sub.stderr else "",
+            )
+        classified = _classify_subprocess_failure(
+            combined,
+            phase="profile",
+            timed_out=sub.timed_out,
+            returncode=sub.returncode,
+        )
+        raise ExecutorError(
+            classified["error"],
+            error_class=classified["error_class"],
+            phase=classified["phase"],
+            hint=classified.get("hint"),
+            returncode=sub.returncode,
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+            stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
+        )
 
-    reduced = _reduce_ncu(raw_csv, metrics)
-    reduced["stderr"] = sub.stderr[-2000:] if sub.stderr else ""
+    reduced = _reduce_ncu(sub.stdout, metrics)
+    if metrics and reduced["kernels_profiled"] == 0:
+        raise ExecutorError(
+            "ncu_no_kernel_found",
+            error_class="data_quality",
+            phase="profile",
+            hint="Check kernel_name spelling or whether the binary launches the kernel.",
+            kernel_name=kernel_name,
+            kernel_names_seen=reduced.get("kernel_names_seen", []),
+            missing_metrics=reduced.get("missing_metrics", metrics),
+            stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+            returncode=sub.returncode,
+        )
+
+    if sub.stderr:
+        reduced["stderr"] = sub.stderr[-2000:]
     reduced["returncode"] = sub.returncode
+    reduced["ncu_version"] = _detect_ncu_version(cfg)
     return reduced
 
 
@@ -620,6 +359,23 @@ def _execute_nsys(
         truncate_bytes=cfg.stdout_truncate_bytes,
     )
 
+    if sub.returncode != 0 or sub.timed_out:
+        combined = (sub.stdout + "\n" + sub.stderr).strip()
+        classified = _classify_subprocess_failure(
+            combined,
+            phase="profile",
+            timed_out=sub.timed_out,
+            returncode=sub.returncode,
+        )
+        raise ExecutorError(
+            classified["error"],
+            error_class=classified["error_class"],
+            phase=classified["phase"],
+            hint=classified.get("hint"),
+            returncode=sub.returncode,
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+        )
+
     reduced = _reduce_nsys(sub.stdout + sub.stderr)
     reduced["returncode"] = sub.returncode
     reduced["timed_out"] = sub.timed_out
@@ -628,87 +384,9 @@ def _execute_nsys(
     return reduced
 
 
-def _execute_torch(
-    spec: JobSpec,
-    workspace: _Workspace,
-    cfg: ExecutorConfig,
-) -> dict:
-    """Run user Python code under torch.profiler and return op stats."""
-    p = spec.payload
-    python_code: str = p["python_code"]
-    op_name: str = p.get("op_name", spec.name)
-    num_iters: int = p.get("num_iters", 100)
-    timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
-
-    python = _check_binary(cfg, cfg.python_bin)
-
-    wrapper = textwrap.dedent(f"""\
-        import torch
-        from torch.profiler import profile, ProfilerActivity, record_function
-
-        # ---- user code start ----
-        {textwrap.indent(python_code, '        ')}
-        # ---- user code end ----
-
-        NUM_ITERS = {num_iters}
-        OP_NAME = {repr(op_name)}
-
-        # Warmup
-        for _ in range(max(1, NUM_ITERS // 10)):
-            pass
-
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-        ) as prof:
-            with record_function(OP_NAME):
-                for _ in range(NUM_ITERS):
-                    pass
-
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-    """)
-
-    script_path = workspace.write(
-        f"torch/{op_name.replace(' ', '_')}_prof.py", wrapper
-    )
-
-    sub = _run_subprocess(
-        [python, str(script_path)],
-        timeout_s=timeout_s,
-        cwd=workspace.root,
-        truncate_bytes=cfg.stdout_truncate_bytes,
-    )
-
-    reduced = _reduce_torch(sub.stdout)
-    reduced["returncode"] = sub.returncode
-    reduced["stderr"] = sub.stderr[-1000:] if sub.stderr else ""
-    return reduced
-
-
 # ===========================================================================
 # 9. Environment auto-detection
 # ===========================================================================
-
-_NVCC_SEARCH_PATHS_LINUX: list[str] = [
-    "/usr/local/cuda/bin/nvcc",
-    "/usr/local/cuda-13/bin/nvcc",
-    "/usr/local/cuda-12/bin/nvcc",
-    "/usr/local/cuda-11/bin/nvcc",
-    "/opt/cuda/bin/nvcc",
-]
-
-_NCU_SEARCH_PATHS_LINUX: list[str] = [
-    "/usr/local/cuda/bin/ncu",
-    "/usr/local/cuda-13/bin/ncu",
-    "/usr/local/cuda-12/bin/ncu",
-    "/opt/cuda/bin/ncu",
-]
-
-_NSYS_SEARCH_PATHS_LINUX: list[str] = [
-    "/usr/local/cuda/bin/nsys",
-    "/opt/nvidia/nsight-systems/2024.6/target-linux-x64/nsys",
-    "/opt/nvidia/nsight-systems/2024.3/target-linux-x64/nsys",
-]
 
 _NCU_SEARCH_PATHS_WIN: list[str] = [
     r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.1\ncu.exe",
@@ -724,6 +402,22 @@ _NSYS_SEARCH_PATHS_WIN: list[str] = [
     r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2023.4.1\target-windows-x64\nsys.exe",
 ]
 
+_NVCC_SEARCH_GLOBS_LIN: list[str] = [
+    "/usr/local/cuda/bin/nvcc",
+    "/usr/local/cuda-*/bin/nvcc",
+]
+_NCU_SEARCH_GLOBS_LIN: list[str] = [
+    "/usr/local/cuda/bin/ncu",
+    "/usr/local/cuda-*/bin/ncu",
+    "/opt/nvidia/nsight-compute-*/ncu",
+]
+_NSYS_SEARCH_GLOBS_LIN: list[str] = [
+    "/usr/local/cuda/bin/nsys",
+    "/usr/local/cuda-*/bin/nsys",
+    "/opt/nvidia/nsight-systems-*/target-linux-x64/nsys",
+    "/opt/nvidia/nsight-systems-*/bin/nsys",
+]
+
 
 def _detect_arch_flags() -> str | None:
     """Query nvidia-smi for GPU compute capability and return '-arch=sm_NNN'."""
@@ -735,23 +429,16 @@ def _detect_arch_flags() -> str | None:
         cc = r.stdout.strip().replace(".", "")   # "12.0" → "120"
         if cc.isdigit():
             return f"-arch=sm_{cc}"
+    # Fallback for older nvidia-smi that lacks --query-gpu=compute_cap
+    r2 = _run_subprocess(["nvidia-smi", "-q"], timeout_s=10)
+    if r2.returncode == 0:
+        m = re.search(
+            r"CUDA Capability Major/Minor Version Number\s*:\s*(\d+)\.(\d+)",
+            r2.stdout,
+        )
+        if m:
+            return f"-arch=sm_{m.group(1)}{m.group(2)}"
     return None
-
-
-def _validate_arch_flag(arch: str, nvcc_bin: str, ccbin: str = "") -> bool:
-    """Return True if nvcc accepts the given -arch flag (test compile a no-op kernel)."""
-    import tempfile
-    minimal_src = "__global__ void _k(){} int main(){return 0;}\n"
-    with tempfile.TemporaryDirectory() as d:
-        src = Path(d) / "arch_test.cu"
-        out = Path(d) / ("arch_test.exe" if sys.platform == "win32" else "arch_test")
-        src.write_text(minimal_src)
-        cmd = [nvcc_bin]
-        if ccbin:
-            cmd += ["-ccbin", ccbin]
-        cmd += [arch, "-o", str(out), str(src)]
-        r = _run_subprocess(cmd, timeout_s=30)
-        return r.returncode == 0
 
 
 def _detect_msvc_ccbin() -> str | None:
@@ -782,32 +469,27 @@ def _detect_msvc_ccbin() -> str | None:
     return None
 
 
-_LINUX_SEARCH_ROOTS: list[str] = ["/usr", "/opt", "/snap", "/home"]
-
-
 def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
-    """Return an override path for the tool; None means already on PATH or not found."""
+    """Return the first existing path in search_list if the tool is not on PATH."""
     if shutil.which(on_path_name) is not None:
         return None
     for candidate in search_list:
         if Path(candidate).exists():
             return candidate
-    # Fallback: ask the OS to search the filesystem
-    if sys.platform == "win32":
-        r = _run_subprocess(["where", on_path_name], timeout_s=10)
-        if r.returncode == 0:
-            lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
-            if lines:
-                return lines[0]
-    else:
-        r = _run_subprocess(
-            ["find"] + _LINUX_SEARCH_ROOTS + ["-maxdepth", "8", "-name", on_path_name, "-type", "f"],
-            timeout_s=15,
-        )
-        if r.returncode == 0:
-            found = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
-            if found:
-                return found[0]
+    return None
+
+
+def _detect_tool_path_linux(on_path_name: str, glob_patterns: list[str]) -> str | None:
+    """Search Linux CUDA install paths via glob; pick newest version by lexicographic sort."""
+    import glob as _glob
+    if shutil.which(on_path_name) is not None:
+        return None
+    candidates: list[str] = []
+    for pattern in glob_patterns:
+        candidates.extend(_glob.glob(pattern))
+    for candidate in sorted(candidates, reverse=True):
+        if Path(candidate).is_file():
+            return candidate
     return None
 
 
@@ -818,17 +500,17 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
     changes: dict[str, Any] = {}
     notes: list[str] = []
 
-    # Auto-detect nvcc if not in PATH (common on Linux where it lives in /usr/local/cuda/bin)
-    if cfg.nvcc_bin == "nvcc" and shutil.which("nvcc") is None:
-        search = [] if sys.platform == "win32" else _NVCC_SEARCH_PATHS_LINUX
-        detected = _detect_tool_path("nvcc", search)
-        if detected:
-            changes["nvcc_bin"] = detected
-            notes.append(f"[auto-detect] nvcc: {detected}")
+    if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
+        arch = _detect_arch_flags()
+        if arch:
+            changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
+            notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
         else:
-            notes.append("[auto-detect] nvcc: not found; set AGENT_NVCC_BIN or add to PATH")
+            notes.append(
+                "[auto-detect] GPU arch: nvidia-smi unavailable; "
+                "set AGENT_NVCC_FLAGS=-arch=sm_NNN if compilation fails"
+            )
 
-    # Detect ccbin FIRST — needed for arch validation on Windows (nvcc needs cl.exe)
     if not cfg.nvcc_ccbin:
         ccbin = _detect_msvc_ccbin()
         if ccbin:
@@ -840,58 +522,34 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
                 "set AGENT_NVCC_CCBIN if compilation fails on Windows"
             )
 
-    if not any(f.startswith("-arch") for f in cfg.nvcc_default_flags):
-        arch = _detect_arch_flags()
-        if arch:
-            effective_nvcc = changes.get("nvcc_bin") or cfg.nvcc_bin
-            effective_ccbin = changes.get("nvcc_ccbin") or cfg.nvcc_ccbin
-            if _validate_arch_flag(arch, effective_nvcc, ccbin=effective_ccbin):
-                changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
-                notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
-            else:
-                notes.append(
-                    f"[auto-detect] GPU arch: {arch} detected but nvcc rejects it "
-                    f"(toolkit too old for this GPU); compiling without -arch flag. "
-                    f"Set AGENT_NVCC_FLAGS=-arch=sm_NNN to override."
-                )
-        else:
+    if cfg.nvcc_bin == "nvcc" and sys.platform != "win32":
+        detected = _detect_tool_path_linux("nvcc", _NVCC_SEARCH_GLOBS_LIN)
+        if detected:
+            changes["nvcc_bin"] = detected
+            notes.append(f"[auto-detect] nvcc: {detected}")
+        elif shutil.which("nvcc") is None:
             notes.append(
-                "[auto-detect] GPU arch: nvidia-smi unavailable; "
-                "set AGENT_NVCC_FLAGS=-arch=sm_NNN if compilation fails"
+                "[auto-detect] nvcc: not found on PATH or known Linux paths. "
+                "Set AGENT_NVCC_BIN or call probe_environment tool at runtime."
             )
 
     if cfg.ncu_bin == "ncu":
-        search = _NCU_SEARCH_PATHS_WIN if sys.platform == "win32" else _NCU_SEARCH_PATHS_LINUX
-        detected = _detect_tool_path("ncu", search)
+        detected = (
+            _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN) if sys.platform == "win32"
+            else _detect_tool_path_linux("ncu", _NCU_SEARCH_GLOBS_LIN)
+        )
         if detected:
             changes["ncu_bin"] = detected
             notes.append(f"[auto-detect] ncu: {detected}")
 
     if cfg.nsys_bin == "nsys":
-        search = _NSYS_SEARCH_PATHS_WIN if sys.platform == "win32" else _NSYS_SEARCH_PATHS_LINUX
-        detected = _detect_tool_path("nsys", search)
+        detected = (
+            _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN) if sys.platform == "win32"
+            else _detect_tool_path_linux("nsys", _NSYS_SEARCH_GLOBS_LIN)
+        )
         if detected:
             changes["nsys_bin"] = detected
             notes.append(f"[auto-detect] nsys: {detected}")
-
-    # Auto-detect python binary: prefer sys.executable so we always use the
-    # same interpreter that launched the agent (handles python3-only Linux envs).
-    if cfg.python_bin == "python":
-        current_py = sys.executable or ""
-        if current_py and shutil.which(current_py) is not None:
-            stem = Path(current_py).stem  # e.g. "python3", "python3.11"
-            changes["python_bin"] = current_py
-            allowed = list(cfg.allowed_binaries)
-            if "python" in allowed and stem not in allowed:
-                allowed = [b for b in allowed if b != "python"] + [stem]
-                changes["allowed_binaries"] = allowed
-            notes.append(f"[auto-detect] python: using {current_py}")
-        elif shutil.which("python3") is not None:
-            changes["python_bin"] = "python3"
-            allowed = list(cfg.allowed_binaries)
-            if "python" in allowed and "python3" not in allowed:
-                changes["allowed_binaries"] = [b for b in allowed if b != "python"] + ["python3"]
-            notes.append("[auto-detect] python: using python3")
 
     if changes:
         cfg = dataclasses.replace(cfg, **changes)
@@ -918,10 +576,12 @@ class Executor:
     ) -> None:
         cfg, detect_notes = _autodetect_env(cfg)
         self._cfg = cfg
+        self._cfg_lock = threading.Lock()
         self.detect_notes: list[str] = detect_notes
         self._job_listeners: list[Callable[[JobResult], None]] = []
         self._listeners_lock = threading.Lock()
-        self._cfg_lock = threading.Lock()
+        self._gpu_lock = threading.Lock()   # serializes GPU execution across all workers
+        self._log_lock = threading.Lock()   # protects jobs.jsonl append on Windows
         if on_job_complete is not None:
             self._job_listeners.append(on_job_complete)
         self.workspace = _Workspace(cfg.workspace_root)
@@ -935,6 +595,73 @@ class Executor:
     def remove_job_listener(self, fn: Callable[[JobResult], None]) -> None:
         with self._listeners_lock:
             self._job_listeners.remove(fn)
+
+    def probe_environment(self, force_rescan: bool = False) -> dict:
+        """Scan filesystem for nvcc/ncu/nsys and reconfigure Executor if found.
+
+        Does NOT execute any binary — only Path.is_file() checks.
+        Safe to call at any point during agent execution.
+        """
+        import dataclasses
+        import glob as _glob
+
+        with self._cfg_lock:
+            cfg = self._cfg
+
+        def _first_glob(patterns: list[str]) -> str | None:
+            candidates: list[str] = []
+            for p in patterns:
+                candidates.extend(_glob.glob(p))
+            for c in sorted(candidates, reverse=True):
+                if Path(c).is_file():
+                    return c
+            return None
+
+        scan = [
+            ("nvcc", cfg.nvcc_bin, _NVCC_SEARCH_GLOBS_LIN if sys.platform != "win32" else []),
+            ("ncu",  cfg.ncu_bin,  _NCU_SEARCH_GLOBS_LIN  if sys.platform != "win32" else _NCU_SEARCH_PATHS_WIN),
+            ("nsys", cfg.nsys_bin, _NSYS_SEARCH_GLOBS_LIN if sys.platform != "win32" else _NSYS_SEARCH_PATHS_WIN),
+        ]
+
+        found: dict[str, str] = {}
+        already: dict[str, str] = {}
+        not_found: list[str] = []
+        changes: dict[str, str] = {}
+
+        for name, current, patterns in scan:
+            if current != name and Path(current).is_file():
+                already[name] = current
+                continue
+            hit = shutil.which(name)
+            if hit and not force_rescan:
+                already[name] = hit
+                continue
+            if sys.platform == "win32":
+                hit = next((p for p in patterns if Path(p).is_file()), None)
+            else:
+                hit = _first_glob(patterns)
+            if hit:
+                found[name] = hit
+                changes[f"{name}_bin"] = hit
+            else:
+                not_found.append(name)
+
+        if changes:
+            with self._cfg_lock:
+                self._cfg = dataclasses.replace(self._cfg, **changes)
+
+        return {
+            "ok": True,
+            "already_configured": already,
+            "newly_found": found,
+            "not_found": not_found,
+            "reconfigured": bool(changes),
+            "hint": (
+                f"Not found: {not_found}. "
+                "Set AGENT_NVCC_BIN / AGENT_NCU_BIN / AGENT_NSYS_BIN env vars."
+                if not_found else "All CUDA tools resolved."
+            ),
+        }
 
     def _detect_gpu_arch(self) -> str:
         try:
@@ -981,7 +708,8 @@ class Executor:
         t0 = time.monotonic()
 
         try:
-            raw = execute_fn(spec, self.workspace, self._cfg)
+            with self._gpu_lock:
+                raw = execute_fn(spec, self.workspace, self._cfg)
             status = "done"
             if isinstance(raw, SubResult):
                 summary: dict = {
@@ -1022,8 +750,9 @@ class Executor:
 
         try:
             log_path = self.workspace.root / "logs" / "jobs.jsonl"
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(job_result.to_log_dict(), default=str) + "\n")
+            with self._log_lock:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(job_result.to_log_dict(), default=str) + "\n")
         except Exception:
             pass
 
@@ -1070,19 +799,40 @@ class Executor:
         args: list[str] | None = None,
         timeout_s: int = 600,
     ) -> dict:
-        """Run Nsight Compute on a kernel to collect hardware counters."""
+        """Run Nsight Compute on a kernel to collect hardware counters.
+
+        source_type='cuda_source': source_or_path is CUDA source; compiled internally.
+        source_type='binary': source_or_path is a workspace-relative binary path.
+        """
+        if source_type == "cuda_source":
+            # Compile first, then hand off the binary path to _execute_ncu
+            compile_spec = JobSpec(
+                backend="cuda_probe",
+                name=f"ncu_compile_{kernel_name}",
+                payload={
+                    "source": source_or_path,
+                    "probe_name": f"ncu_target_{kernel_name}",
+                    "compile_flags": compile_flags or [],
+                    "args": [],
+                    "timeout_s": min(timeout_s, 120),
+                },
+            )
+            compile_result = self._run_job(compile_spec, _execute_cuda_probe)
+            if compile_result.get("status") == "error":
+                return compile_result
+            binary_path = compile_result.get("binary_path", "")
+        else:
+            binary_path = source_or_path
+
         spec = JobSpec(
             backend="ncu",
             name=f"ncu_{kernel_name}",
             payload={
-                "source_type": source_type,
-                "source_or_path": source_or_path,
+                "binary_path": binary_path,
                 "kernel_name": kernel_name,
                 "metrics": metrics,
-                "compile_flags": compile_flags or [],
                 "args": args or [],
                 "timeout_s": timeout_s,
-                "probe_name": kernel_name,
             },
         )
         return self._run_job(spec, _execute_ncu)
@@ -1112,58 +862,3 @@ class Executor:
         )
         return self._run_job(spec, _execute_nsys)
 
-    def profile_with_torch(
-        self,
-        python_code: str,
-        op_name: str,
-        num_iters: int = 100,
-        timeout_s: int = 300,
-    ) -> dict:
-        """Run PyTorch Profiler on user-provided Python code."""
-        spec = JobSpec(
-            backend="torch",
-            name=op_name,
-            payload={
-                "python_code": python_code,
-                "op_name": op_name,
-                "num_iters": num_iters,
-                "timeout_s": timeout_s,
-            },
-        )
-        return self._run_job(spec, _execute_torch)
-
-    def find_binary(self, binary_name: str) -> dict:
-        """Search the filesystem for binary_name and update executor config if found.
-
-        Call this when a tool returns binary_not_found to recover without restarting.
-        """
-        import dataclasses as _dc
-
-        found: str | None = None
-        if sys.platform == "win32":
-            r = _run_subprocess(["where", binary_name], timeout_s=10)
-            if r.returncode == 0:
-                lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
-                found = lines[0] if lines else None
-        else:
-            r = _run_subprocess(
-                ["find"] + _LINUX_SEARCH_ROOTS + ["-maxdepth", "8", "-name", binary_name, "-type", "f"],
-                timeout_s=15,
-            )
-            found_list = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
-            found = found_list[0] if found_list else None
-
-        if found is None:
-            return {
-                "status": "not_found",
-                "binary": binary_name,
-                "hint": f"Install {binary_name} or set AGENT_{binary_name.upper()}_BIN env var.",
-            }
-
-        field_map = {"nvcc": "nvcc_bin", "ncu": "ncu_bin", "nsys": "nsys_bin"}
-        field = field_map.get(Path(found).stem)
-        if field:
-            with self._cfg_lock:
-                self._cfg = _dc.replace(self._cfg, **{field: found})
-
-        return {"status": "found", "binary": binary_name, "path": found, "config_updated": field is not None}

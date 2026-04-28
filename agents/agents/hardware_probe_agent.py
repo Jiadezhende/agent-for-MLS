@@ -30,10 +30,23 @@ metric you must:
   1. Reason about what physical hardware property it represents.
   2. Choose an appropriate measurement strategy (use list_skills / read_skill
      to discover available strategies).
-  3. Execute the measurement via the Executor tools (run_cuda_probe,
-     profile_with_ncu, or profile_with_nsys).
+  3. Execute the measurement using the appropriate primary tool (see Tool
+     selection rules below).
   4. Interpret the results, detect anomalies, and record the measurement.
   5. Cross-verify with at least one independent method when confidence < 0.85.
+
+## Tool selection rules
+
+- **Throughput / utilization / clock** (e.g. bandwidth, SM utilization, boost clock):
+  use `profile_with_ncu` with explicit metric names. Do not write a CUDA
+  microbenchmark for what ncu can measure directly.
+- **Latency** (e.g. dram_latency_cycles, l2_latency_cycles):
+  use `run_cuda_probe` pointer-chasing kernel first; use `profile_with_ncu`
+  latency metrics to cross-verify.
+- **CPU-GPU timeline / launch overhead**: use `profile_with_nsys`.
+- If `profile_with_ncu` returns `error_class="infrastructure"` (e.g.
+  ERR_NVGPUCTRPERM), switch to `run_cuda_probe` self-timed kernels. Do NOT
+  retry ncu.
 
 ## Layers
 - Skills (skills/*.md): read via list_skills / read_skill
@@ -72,8 +85,9 @@ Every executor tool error includes an `error_class` field. Use it to decide your
 - `"infrastructure"`: A binary is missing or the environment is misconfigured.
   The `hint` field (if present) tells you how to fix it. Do NOT keep retrying the
   same approach — the code is fine, but the system cannot run it. Call flag_event
-  with severity="error" and try a completely different tool (e.g. profile_with_nsys),
-  or submit_results if no alternative exists.
+  with severity="error" and switch to a different tool per the Tool selection
+  rules above (e.g. run_cuda_probe for throughput/clock, profile_with_nsys for
+  timeline), or submit_results if no alternative exists.
 - `"timeout"`: Execution exceeded the time limit. Reduce the workload size or
   pass a larger timeout_s argument.
 

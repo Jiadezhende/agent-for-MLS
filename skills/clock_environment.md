@@ -26,6 +26,25 @@ Use CUDA events for wall time and `clock64()` from inside the measured kernel.
 Run long enough to reduce launch overhead, usually 100 ms or more. Repeat two or
 three times if the value looks unstable.
 
+### Anti-optimization: use a clock64 busy-wait loop
+
+Empty `for` loops and arithmetic-only loops are silently eliminated by the
+compiler; the kernel finishes in nanoseconds and the clock estimate becomes
+nonsensically high. The only loop the compiler cannot remove is one whose
+condition reads `clock64()` directly — the compiler cannot prove `clock64()` is
+pure, so every iteration must execute:
+
+```text
+while (clock64() - start < target_cycles) {}
+```
+
+Always warm up with a short spin before the timed run; the first kernel launch
+often executes at a lower frequency before boost engages.
+
+On architectures where inline PTX is available, `mov.u64 %globaltimer` can be
+used as an independent nanosecond-scale wall-clock cross-check. Keep the primary
+reported clock based on direct in-kernel cycles divided by measured elapsed time.
+
 `cudaDeviceProp.clockRate` and driver/API queries are **secondary evidence only**.
 Use them to cross-check, not as the primary measurement. On some drivers they
 report the TDP boost ceiling, not the sustained operating clock.
@@ -81,6 +100,9 @@ For environment anomalies, compare measured results against `nvidia-smi` or CUDA
 properties only as secondary evidence. Never replace measured values with spec
 sheet values.
 
+Nsight Compute clock metrics are validation context, not the primary clock
+answer, unless direct timing cannot run.
+
 ## Anomaly signals
 
 - Measured clock differs from API or driver clock by more than 10 percent:
@@ -88,6 +110,10 @@ sheet values.
 - Large run-to-run clock variance: flag `clock_unstable` and report median.
 - Effective SM count is much lower than API count: flag `sm_masked`.
 - API values contradict measured launch limits or counters: flag `api_spoofed`.
+- `cudaDeviceProp.clockRate` may be missing in newer CUDA versions; do not use
+  it as a required field in probe templates.
+- `clock64()` returning zero is usually a launch/setup problem. Check launch
+  errors and architecture flags before concluding that clock access is disabled.
 
 ## Failure fallback
 

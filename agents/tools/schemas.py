@@ -112,12 +112,12 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "profile_with_ncu",
             "description": (
                 "Run a kernel under NVIDIA Nsight Compute to collect hardware performance "
-                "counters. Compiles with -lineinfo for source-line correlation and saves a "
+                "counters. Specify exact metric names via the metrics list. "
+                "Compiles with -lineinfo for source-line correlation and saves a "
                 ".ncu-rep report (openable in Nsight Compute GUI). "
-                "Specify what to measure via section_set (recommended for broad analysis), "
-                "sections (targeted deep-dive), or metrics (exact counter names). "
                 "source_type='cuda_source' compiles and profiles directly; "
-                "source_type='binary' profiles an existing workspace binary."
+                "source_type='binary' profiles an existing workspace binary. "
+                "Output is a human-readable table with Metric Name, Metric Unit, Metric Value."
             ),
             "parameters": {
                 "type": "object",
@@ -146,36 +146,15 @@ TOOL_SCHEMAS: list[dict] = [
                             "ncu will only instrument matching kernels."
                         ),
                     },
-                    "section_set": {
-                        "type": "string",
-                        "description": (
-                            "Predefined ncu section set (--set). Recommended starting point. "
-                            "'default' covers Speed-of-Light, memory, compute utilisation. "
-                            "'full' adds all sections (slow). 'roofline' adds roofline model. "
-                            "Leave empty if using sections or metrics instead."
-                        ),
-                        "default": "",
-                    },
-                    "sections": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Targeted ncu sections (--section). Use for focused analysis. "
-                            "Examples: ['SpeedOfLight', 'MemoryWorkloadAnalysis', "
-                            "'ComputeWorkloadAnalysis', 'Occupancy', 'SchedulerStats']. "
-                            "Can be combined with metrics."
-                        ),
-                        "default": [],
-                    },
                     "metrics": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Explicit ncu metric names (--metrics). Use when you need "
-                            "precise counters not covered by sections. "
-                            "Examples: ['l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum', "
-                            "'sm__cycles_elapsed.avg.per_second']. "
-                            "At least one of metrics / sections / section_set is required."
+                            "ncu metric names to collect (--metrics). Required. "
+                            "Examples: ['sm__throughput.avg.pct_of_peak_sustained_elapsed', "
+                            "'gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed', "
+                            "'l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum', "
+                            "'sm__cycles_elapsed.avg.per_second']."
                         ),
                         "default": [],
                     },

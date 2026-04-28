@@ -215,3 +215,4 @@ workspace/cache.json
 results.json
 reasoning_log.json
 *.exe
+.tmp/

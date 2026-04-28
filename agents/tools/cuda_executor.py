@@ -36,7 +36,6 @@ from agents.tools.executor.binaries import _check_binary
 from agents.tools.executor.classifiers import _classify_subprocess_failure
 from agents.tools.executor.ncu import _detect_ncu_version, _precheck_ncu_permission
 from agents.tools.executor.nvcc import _compile_cuda, _compile_cuda_for_ncu
-from agents.tools.executor.reducers import _reduce_ncu, _reduce_nsys
 from agents.tools.executor.subprocess_runner import (
     SubResult,
     _reduce_probe_output,
@@ -191,21 +190,15 @@ def _execute_ncu(
     binary_path: str = p["binary_path"]
     kernel_name: str = p.get("kernel_name", "")
     metrics: list[str] = p.get("metrics", [])
-    sections: list[str] = p.get("sections", [])
-    section_set: str = p.get("section_set", "")
     args: list[str] = p.get("args", [])
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
 
-    if not metrics and not sections and not section_set:
+    if not metrics:
         raise ExecutorError(
             "invalid_args",
             error_class="user_code",
             phase="profile",
-            hint=(
-                "Provide at least one of: metrics (list of ncu metric names), "
-                "sections (list of section names like 'SpeedOfLight'), "
-                "or section_set ('default' / 'full' / 'roofline')."
-            ),
+            hint="Provide at least one ncu metric name in the metrics list.",
         )
 
     permission_hint = _precheck_ncu_permission()
@@ -234,20 +227,13 @@ def _execute_ncu(
     report_base = workspace.allocate("ncu", "")  # ncu appends .ncu-rep automatically
     cmd = [
         ncu,
-        "--csv",
-        "--page", "raw",
         "--replay-mode", "kernel",
         "--target-processes", "all",
         "-o", str(report_base),
     ]
     if kernel_name:
         cmd += ["--kernel-name", kernel_name]
-    if section_set:
-        cmd += ["--set", section_set]
-    for section in sections:
-        cmd += ["--section", section]
-    if metrics:
-        cmd += ["--metrics", ",".join(metrics)]
+    cmd += ["--metrics", ",".join(metrics)]
     cmd += [str(bin_path)] + args
 
     sub = _run_subprocess(
@@ -261,8 +247,7 @@ def _execute_ncu(
     combined = (sub.stdout + "\n" + sub.stderr).strip()
 
     # Check for ERR_NVGPUCTRPERM before the returncode check: some ncu versions
-    # exit 0 even when GPU counter access is denied, so the permission error would
-    # otherwise silently fall through to _reduce_ncu → kernels_profiled==0.
+    # exit 0 even when GPU counter access is denied.
     if "ERR_NVGPUCTRPERM" in combined or "erf_no_privileged_mode" in combined.lower():
         raise ExecutorError(
             "ncu_permission_denied",
@@ -306,28 +291,28 @@ def _execute_ncu(
             stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
         )
 
-    reduced = _reduce_ncu(sub.stdout, metrics)
-    if metrics and reduced["kernels_profiled"] == 0:
+    if "Metric Value" not in sub.stdout:
         raise ExecutorError(
             "ncu_no_kernel_found",
             error_class="data_quality",
             phase="profile",
             hint="Check kernel_name spelling or whether the binary launches the kernel.",
             kernel_name=kernel_name,
-            kernel_names_seen=reduced.get("kernel_names_seen", []),
-            missing_metrics=reduced.get("missing_metrics", metrics),
             stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
             stderr=sub.stderr[-2000:] if sub.stderr else "",
             returncode=sub.returncode,
         )
 
     rep_file = report_base.with_suffix(".ncu-rep")
-    reduced["report_path"] = workspace.rel(rep_file) if rep_file.exists() else None
+    result: dict = {
+        "output": sub.stdout,
+        "returncode": sub.returncode,
+        "report_path": workspace.rel(rep_file) if rep_file.exists() else None,
+    }
     if sub.stderr:
-        reduced["stderr"] = sub.stderr[-2000:]
-    reduced["returncode"] = sub.returncode
+        result["stderr"] = sub.stderr[-2000:]
     # ncu_version injected by profile_with_ncu from cached value
-    return reduced
+    return result
 
 
 def _execute_nsys(
@@ -395,26 +380,33 @@ def _execute_nsys(
             stderr=sub.stderr[-2000:] if sub.stderr else "",
         )
 
-    # Step 2: extract kernel summary as CSV from the saved report
+    # Step 2: extract kernel summary table from the saved report
     rep_file = report_base.with_suffix(".nsys-rep")
-    csv_text = ""
+    stats_output = ""
+    stats_error = ""
     if rep_file.exists():
         stats_sub = _run_subprocess(
             [nsys, "stats", str(rep_file),
-             "--format", "csv",
+             "--format", "table",
              "--report", "cuda_gpu_kern_sum"],
             timeout_s=30,
             encoding="utf-8",
             truncate_bytes=None,
         )
         if stats_sub.returncode == 0 and stats_sub.stdout.strip():
-            csv_text = stats_sub.stdout
+            stats_output = stats_sub.stdout
+        elif stats_sub.stderr:
+            stats_error = stats_sub.stderr[-2000:]
 
-    reduced = _reduce_nsys(csv_text)
-    reduced["returncode"] = sub.returncode
-    reduced["timed_out"] = sub.timed_out
-    reduced["report_path"] = workspace.rel(rep_file) if rep_file.exists() else None
-    return reduced
+    result: dict = {
+        "output": stats_output,
+        "returncode": sub.returncode,
+        "timed_out": sub.timed_out,
+        "report_path": workspace.rel(rep_file) if rep_file.exists() else None,
+    }
+    if stats_error:
+        result["stats_error"] = stats_error
+    return result
 
 
 # ===========================================================================
@@ -837,21 +829,14 @@ class Executor:
         source_or_path: str,
         kernel_name: str,
         metrics: list[str] | None = None,
-        sections: list[str] | None = None,
-        section_set: str | None = None,
         compile_flags: list[str] | None = None,
         args: list[str] | None = None,
         timeout_s: int = 600,
     ) -> dict:
-        """Run Nsight Compute on a kernel to collect hardware counters.
+        """Run Nsight Compute on a kernel to collect hardware counters via --metrics.
 
         source_type='cuda_source': compiles with -lineinfo then profiles (no pre-run).
         source_type='binary': profiles an existing workspace binary directly.
-
-        Specify what to collect via at least one of:
-          metrics     – explicit ncu metric names (--metrics)
-          sections    – section names like ['SpeedOfLight', 'MemoryWorkloadAnalysis'] (--section)
-          section_set – predefined set: 'default' | 'full' | 'roofline' (--set)
         """
         import time as _time
         import uuid as _uuid
@@ -888,8 +873,6 @@ class Executor:
                 "binary_path": binary_path,
                 "kernel_name": kernel_name,
                 "metrics": metrics or [],
-                "sections": sections or [],
-                "section_set": section_set or "",
                 "args": args or [],
                 "timeout_s": timeout_s,
             },
@@ -923,4 +906,3 @@ class Executor:
             },
         )
         return self._run_job(spec, _execute_nsys)
-

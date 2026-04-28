@@ -8,19 +8,22 @@ The agent loads these documents on demand via the `read_skill` tool.
 Files starting with `_` are excluded from `list_skills` (they are templates
 or internal references).
 
-## File naming convention
+## Discoverable skills
 
-Use lowercase snake_case, e.g.:
+Keep the discoverable skill set small and grouped by measurement workflow.
+The worker should normally see:
 
-- `memory_latency.md`
-- `memory_bandwidth.md`
-- `cache_capacity.md`
-- `clock_measurement.md`
-- `bank_conflict.md`
-- `operator_analysis.md`
+- `gpu_profiling_overview.md`
+- `memory_hierarchy.md`
+- `throughput_resources.md`
+- `clock_environment.md`
+
+Older single-metric notes should either be merged into one of these files or
+renamed with a leading `_` so `list_skills` hides them.
 
 ## Adding a new skill
 
 1. Copy `_template.md` to a new file.
-2. Fill in all sections.
-3. Test by running the agent with a target that should trigger this skill.
+2. Prefer a workflow-level name over a metric-level name.
+3. Fill in all sections.
+4. Test by running the agent with a target that should trigger this skill.

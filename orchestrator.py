@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from dataclasses import dataclass, field
 from typing import Any
 
-from agents._registry import all_definitions, get as _get_agent_def
+from agents._registry import all_definitions
 from agents.agents.critic_agent import CriticAgent
 from agents.agents.planner_agent import PlannerAgent
 from agents.core.llm import LLMClient
@@ -217,6 +217,8 @@ class Orchestrator:
         max_threads = min(len(steps), 8)
         future_to_step: dict = {}
         results: list[WorkerOutput] = []
+        collected: set = set()
+        interrupted = False
 
         pool = ThreadPoolExecutor(max_workers=max_threads)
         try:
@@ -227,26 +229,22 @@ class Orchestrator:
             try:
                 for future in as_completed(future_to_step, timeout=timeout_s):
                     step = future_to_step[future]
-                    try:
-                        results.append(future.result())
-                    except Exception as exc:
-                        self._emit(f"[orchestrator] Step {step.id} raised: {exc}")
-                        results.append(WorkerOutput(
-                            step_id=step.id, results=[], success=False
-                        ))
+                    collected.add(future)
+                    results.append(self._future_output(future, step))
 
             except FuturesTimeout:
-                self._emit("[orchestrator] Worker pool timed out. Collecting partial results.")
+                self._emit(
+                    "[orchestrator] Worker pool timed out. "
+                    "Waiting for running workers to finish."
+                )
                 for future, step in future_to_step.items():
+                    if future in collected:
+                        continue
                     if future.done():
-                        try:
-                            results.append(future.result())
-                        except Exception:
-                            results.append(WorkerOutput(
-                                step_id=step.id, results=[], success=False
-                            ))
-                    else:
-                        future.cancel()
+                        collected.add(future)
+                        results.append(self._future_output(future, step))
+                    elif future.cancel():
+                        collected.add(future)
                         results.append(WorkerOutput(
                             step_id=step.id, results=[], success=False,
                             summary="worker_timeout",
@@ -261,24 +259,50 @@ class Orchestrator:
                         summary="cancelled",
                     ))
                 elif future.done():
-                    try:
-                        results.append(future.result())
-                    except Exception:
-                        results.append(WorkerOutput(
-                            step_id=step.id, results=[], success=False
-                        ))
+                    results.append(self._future_output(future, step))
             pool.shutdown(wait=False, cancel_futures=True)
-            raise  # re-raise so run()'s KeyboardInterrupt handler fires
+            raise
         finally:
-            pool.shutdown(wait=False)
+            if not interrupted:
+                pool.shutdown(wait=True)
+
+        # Running threads cannot be forcibly cancelled. After the soft timeout,
+        # shutdown(wait=True) lets already-started workers finish so their real
+        # outputs are not replaced by stale timeout placeholders.
+        for future, step in future_to_step.items():
+            if future in collected:
+                continue
+            collected.add(future)
+            if future.cancelled():
+                results.append(WorkerOutput(
+                    step_id=step.id, results=[], success=False, summary="worker_timeout",
+                ))
+            elif future.done():
+                results.append(self._future_output(future, step))
+            else:
+                results.append(WorkerOutput(
+                    step_id=step.id, results=[], success=False, summary="worker_timeout",
+                ))
 
         return results
+
+    def _future_output(self, future: Any, step: Step) -> WorkerOutput:
+        try:
+            return future.result()
+        except Exception as exc:
+            self._emit(f"[orchestrator] Step {step.id} raised: {exc}")
+            return WorkerOutput(step_id=step.id, results=[], success=False)
 
     def _run_single_step(self, step: Step, worker_id: int) -> WorkerOutput:
         """Instantiate and run the agent for one Step. Runs on a thread."""
         self._emit(f"[W{worker_id}] Starting step={step.id} task='{step.task}'")
 
-        agent_def = _get_agent_def(step.worker)
+        env_notes = getattr(self.executor, "detect_notes", [])
+        if env_notes:
+            from dataclasses import replace as _dc_replace
+            step = _dc_replace(step, hints=list(step.hints) + [f"[env] {n}" for n in env_notes])
+
+        agent_def = self.agent_registry.get(step.worker)
         if agent_def is None:
             msg = f"Unknown agent_type '{step.worker}'"
             self._emit(f"[W{worker_id}] Error: {msg}")

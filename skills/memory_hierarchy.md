@@ -38,6 +38,30 @@ Recommended working sets:
 For L2 capacity, sweep working-set sizes and look for the first sustained
 latency cliff. Use powers of two or a dense range around the suspected cliff.
 
+## Probe hygiene
+
+- Let the Executor supply the GPU architecture. Do not add hardcoded flags such
+  as `-arch=sm_75` unless earlier evidence shows the default is wrong.
+- Before interpreting zero cycles, missing device writes, or sub-nanosecond
+  timings, add explicit checks after every launch:
+  `cudaGetLastError()` and `cudaDeviceSynchronize()`. A wrong architecture can
+  make kernels fail to launch while host-side memcpy still works.
+- Prefer a host-visible output buffer for timing results. Device `printf` is
+  useful for debugging only; absence of device printf output is not measurement
+  evidence.
+- Declare the chase array as `volatile` in the kernel parameter — this is the
+  only reliable way to prevent the compiler from caching or removing dependent
+  loads. A non-volatile pointer chase produces all-zero latencies because the
+  compiler proves the loop is pure and eliminates it. Do NOT reach for inline
+  PTX (`ld.global`, `mov.u64 %globaltimer`, etc.) — it is not needed for this
+  and fails silently on some arch/driver combinations.
+- Write the final chase index to an output buffer and copy it back to host so
+  the loop result escapes; otherwise the compiler may still treat it as dead code
+  even with dependent indexing.
+- One successful ncu counter check after a successful CUDA probe is enough for
+  cross-verification. Avoid repeated long ncu runs once load-sector counts and
+  kernel execution are confirmed.
+
 ## Output fields
 
 Print one key per line:

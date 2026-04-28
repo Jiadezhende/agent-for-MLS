@@ -222,49 +222,6 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "profile_with_torch",
-            "description": (
-                "Run Python code under PyTorch Profiler to capture operator-level "
-                "statistics. Use this to identify hotspot operators in a PyTorch "
-                "model or function, measure GPU time per operator, and see memory "
-                "allocation patterns."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "python_code": {
-                        "type": "string",
-                        "description": (
-                            "Python code that defines and calls the operation to profile. "
-                            "The Executor wraps it with torch.profiler automatically. "
-                            "Must import torch and define the operation inline."
-                        ),
-                    },
-                    "op_name": {
-                        "type": "string",
-                        "description": (
-                            "Human-readable name for this operation "
-                            "(used in logs and cache keys)."
-                        ),
-                    },
-                    "num_iters": {
-                        "type": "integer",
-                        "default": 100,
-                        "description": "Number of iterations to run (for warmup + profiling).",
-                    },
-                    "timeout_s": {
-                        "type": "integer",
-                        "default": 300,
-                    },
-                },
-                "required": ["python_code", "op_name"],
-            },
-        },
-    },
-
     # ------------------------------------------------------------------
     # Recording tools (need AgentContext injection)
     # ------------------------------------------------------------------
@@ -389,22 +346,27 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "find_binary",
+            "name": "probe_environment",
             "description": (
-                "Search the filesystem for a required binary (nvcc, ncu, nsys) that "
-                "was not found in PATH. Updates the executor config for this session "
-                "if found. Call this when you receive a binary_not_found infrastructure error."
+                "Scan the filesystem for nvcc, ncu, and nsys binaries without executing them. "
+                "Call this when error_class='infrastructure' and error='binary_not_found'. "
+                "If binaries are found, the Executor is reconfigured automatically so "
+                "subsequent tool calls use the discovered paths. "
+                "Does NOT run any subprocess — only filesystem stat checks."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "binary_name": {
-                        "type": "string",
-                        "enum": ["nvcc", "ncu", "nsys"],
-                        "description": "Name of the binary to locate.",
+                    "force_rescan": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, re-scans even if a binary appears to be on PATH. "
+                            "Use only if you suspect PATH-based resolution is wrong. "
+                            "Default: false."
+                        ),
                     },
                 },
-                "required": ["binary_name"],
+                "required": [],
             },
         },
     },

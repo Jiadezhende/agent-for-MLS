@@ -35,7 +35,7 @@ from agents.core.exceptions import ExecutorError
 from agents.tools.executor.binaries import _check_binary
 from agents.tools.executor.classifiers import _classify_subprocess_failure
 from agents.tools.executor.ncu import _detect_ncu_version, _precheck_ncu_permission
-from agents.tools.executor.nvcc import _compile_cuda
+from agents.tools.executor.nvcc import _compile_cuda, _compile_cuda_for_ncu
 from agents.tools.executor.reducers import _reduce_ncu, _reduce_nsys
 from agents.tools.executor.subprocess_runner import (
     SubResult,
@@ -184,22 +184,28 @@ def _execute_ncu(
     workspace: _Workspace,
     cfg: ExecutorConfig,
 ) -> dict:
-    """Run Nsight Compute and return reduced metrics dict."""
+    """Run Nsight Compute and return reduced metrics dict plus .ncu-rep report path."""
     p = spec.payload
     ncu = _check_binary(cfg, cfg.ncu_bin)
 
     binary_path: str = p["binary_path"]
     kernel_name: str = p.get("kernel_name", "")
     metrics: list[str] = p.get("metrics", [])
+    sections: list[str] = p.get("sections", [])
+    section_set: str = p.get("section_set", "")
     args: list[str] = p.get("args", [])
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
 
-    if not metrics:
+    if not metrics and not sections and not section_set:
         raise ExecutorError(
             "invalid_args",
             error_class="user_code",
             phase="profile",
-            hint="metrics must be a non-empty list of ncu metric names.",
+            hint=(
+                "Provide at least one of: metrics (list of ncu metric names), "
+                "sections (list of section names like 'SpeedOfLight'), "
+                "or section_set ('default' / 'full' / 'roofline')."
+            ),
         )
 
     permission_hint = _precheck_ncu_permission()
@@ -218,18 +224,28 @@ def _execute_ncu(
             error_class="user_code",
             phase="profile",
             path=binary_path,
-            hint="Pass binary_path returned by a successful run_cuda_probe call.",
+            hint=(
+                "Binary not found in workspace. "
+                "For source_type='cuda_source', use profile_with_ncu directly — "
+                "it compiles the source automatically."
+            ),
         )
 
+    report_base = workspace.allocate("ncu", "")  # ncu appends .ncu-rep automatically
     cmd = [
         ncu,
         "--csv",
         "--page", "raw",
         "--replay-mode", "kernel",
         "--target-processes", "all",
+        "-o", str(report_base),
     ]
     if kernel_name:
         cmd += ["--kernel-name", kernel_name]
+    if section_set:
+        cmd += ["--set", section_set]
+    for section in sections:
+        cmd += ["--section", section]
     if metrics:
         cmd += ["--metrics", ",".join(metrics)]
     cmd += [str(bin_path)] + args
@@ -261,8 +277,6 @@ def _execute_ncu(
         )
 
     if sub.returncode != 0 or sub.timed_out:
-        # Empty combined output with a non-zero exit is an infrastructure failure
-        # (ncu couldn't start or crashed before producing any output).
         if not combined:
             raise ExecutorError(
                 "ncu_failed",
@@ -307,10 +321,12 @@ def _execute_ncu(
             returncode=sub.returncode,
         )
 
+    rep_file = report_base.with_suffix(".ncu-rep")
+    reduced["report_path"] = workspace.rel(rep_file) if rep_file.exists() else None
     if sub.stderr:
         reduced["stderr"] = sub.stderr[-2000:]
     reduced["returncode"] = sub.returncode
-    reduced["ncu_version"] = _detect_ncu_version(cfg)
+    # ncu_version injected by profile_with_ncu from cached value
     return reduced
 
 
@@ -319,7 +335,7 @@ def _execute_nsys(
     workspace: _Workspace,
     cfg: ExecutorConfig,
 ) -> dict:
-    """Run Nsight Systems and return a minimal timeline summary."""
+    """Run Nsight Systems: profile → save .nsys-rep → extract kernel stats via nsys stats."""
     p = spec.payload
     nsys = _check_binary(cfg, cfg.nsys_bin)
 
@@ -327,6 +343,7 @@ def _execute_nsys(
     source_or_path: str = p["source_or_path"]
     flags: list[str] = p.get("compile_flags", [])
     args: list[str] = p.get("args", [])
+    duration_s: int = p.get("duration_s", 0)   # 0 = capture full app lifetime
     timeout_s: int = p.get("timeout_s", cfg.default_profile_timeout_s)
     probe_name: str = p.get("probe_name", spec.name).replace(" ", "_")
 
@@ -342,15 +359,17 @@ def _execute_nsys(
         target_cmd = [str(bin_path)] + args
 
     report_base = workspace.allocate("nsys", "")
-    report_path = str(report_base)
 
+    # Step 1: profile and save .nsys-rep
     cmd = [
         nsys, "profile",
-        "--output", report_path,
+        "-o", str(report_base),
         "--force-overwrite", "true",
-        "--stats", "true",
-        "--export", "sqlite",
-    ] + target_cmd
+        "--trace", "cuda,nvtx",
+    ]
+    if duration_s > 0:
+        cmd += ["-d", str(duration_s)]
+    cmd += target_cmd
 
     sub = _run_subprocess(
         cmd,
@@ -376,11 +395,25 @@ def _execute_nsys(
             stderr=sub.stderr[-2000:] if sub.stderr else "",
         )
 
-    reduced = _reduce_nsys(sub.stdout + sub.stderr)
+    # Step 2: extract kernel summary as CSV from the saved report
+    rep_file = report_base.with_suffix(".nsys-rep")
+    csv_text = ""
+    if rep_file.exists():
+        stats_sub = _run_subprocess(
+            [nsys, "stats", str(rep_file),
+             "--format", "csv",
+             "--report", "cuda_gpu_kern_sum"],
+            timeout_s=30,
+            encoding="utf-8",
+            truncate_bytes=None,
+        )
+        if stats_sub.returncode == 0 and stats_sub.stdout.strip():
+            csv_text = stats_sub.stdout
+
+    reduced = _reduce_nsys(csv_text)
     reduced["returncode"] = sub.returncode
     reduced["timed_out"] = sub.timed_out
-    reduced["raw_path"] = workspace.rel(report_base.with_suffix(".nsys-rep")) \
-        if (report_base.with_suffix(".nsys-rep")).exists() else None
+    reduced["report_path"] = workspace.rel(rep_file) if rep_file.exists() else None
     return reduced
 
 
@@ -582,11 +615,20 @@ class Executor:
         self._listeners_lock = threading.Lock()
         self._gpu_lock = threading.Lock()   # serializes GPU execution across all workers
         self._log_lock = threading.Lock()   # protects jobs.jsonl append on Windows
+        self._ncu_version: str | None = None  # lazily populated, then cached
         if on_job_complete is not None:
             self._job_listeners.append(on_job_complete)
         self.workspace = _Workspace(cfg.workspace_root)
         self._cache = _JobCache()
         self._gpu_arch_tag = self._detect_gpu_arch()
+
+    def _get_ncu_version(self) -> str | None:
+        """Return ncu version string, cached after first successful detection."""
+        if self._ncu_version is None:
+            with self._cfg_lock:
+                cfg = self._cfg
+            self._ncu_version = _detect_ncu_version(cfg)
+        return self._ncu_version
 
     def add_job_listener(self, fn: Callable[[JobResult], None]) -> None:
         with self._listeners_lock:
@@ -794,33 +836,48 @@ class Executor:
         source_type: str,
         source_or_path: str,
         kernel_name: str,
-        metrics: list[str],
+        metrics: list[str] | None = None,
+        sections: list[str] | None = None,
+        section_set: str | None = None,
         compile_flags: list[str] | None = None,
         args: list[str] | None = None,
         timeout_s: int = 600,
     ) -> dict:
         """Run Nsight Compute on a kernel to collect hardware counters.
 
-        source_type='cuda_source': source_or_path is CUDA source; compiled internally.
-        source_type='binary': source_or_path is a workspace-relative binary path.
+        source_type='cuda_source': compiles with -lineinfo then profiles (no pre-run).
+        source_type='binary': profiles an existing workspace binary directly.
+
+        Specify what to collect via at least one of:
+          metrics     – explicit ncu metric names (--metrics)
+          sections    – section names like ['SpeedOfLight', 'MemoryWorkloadAnalysis'] (--section)
+          section_set – predefined set: 'default' | 'full' | 'roofline' (--set)
         """
+        import time as _time
+        import uuid as _uuid
+
         if source_type == "cuda_source":
-            # Compile first, then hand off the binary path to _execute_ncu
-            compile_spec = JobSpec(
-                backend="cuda_probe",
-                name=f"ncu_compile_{kernel_name}",
-                payload={
-                    "source": source_or_path,
-                    "probe_name": f"ncu_target_{kernel_name}",
-                    "compile_flags": compile_flags or [],
-                    "args": [],
-                    "timeout_s": min(timeout_s, 120),
-                },
-            )
-            compile_result = self._run_job(compile_spec, _execute_cuda_probe)
-            if compile_result.get("status") == "error":
-                return compile_result
-            binary_path = compile_result.get("binary_path", "")
+            # Compile only (with -lineinfo); do NOT run the kernel before profiling.
+            t0 = _time.monotonic()
+            try:
+                with self._cfg_lock:
+                    cfg = self._cfg
+                probe_name = f"ncu_target_{kernel_name}".replace(" ", "_")
+                binary_path_obj = _compile_cuda_for_ncu(
+                    source_or_path, probe_name, compile_flags or [], self.workspace, cfg,
+                )
+                binary_path = self.workspace.rel(binary_path_obj)
+            except ExecutorError as exc:
+                summary: dict = {"error": exc.kind, "error_class": exc.error_class, **exc.details}
+                if exc.hint:
+                    summary["hint"] = exc.hint
+                return {
+                    "status": "error",
+                    "job_id": "ncu_compile_" + _uuid.uuid4().hex[:8],
+                    "cache_hit": False,
+                    "elapsed_s": round(_time.monotonic() - t0, 2),
+                    **summary,
+                }
         else:
             binary_path = source_or_path
 
@@ -830,12 +887,17 @@ class Executor:
             payload={
                 "binary_path": binary_path,
                 "kernel_name": kernel_name,
-                "metrics": metrics,
+                "metrics": metrics or [],
+                "sections": sections or [],
+                "section_set": section_set or "",
                 "args": args or [],
                 "timeout_s": timeout_s,
             },
         )
-        return self._run_job(spec, _execute_ncu)
+        result = self._run_job(spec, _execute_ncu)
+        if result.get("status") != "error":
+            result["ncu_version"] = self._get_ncu_version()
+        return result
 
     def profile_with_nsys(
         self,

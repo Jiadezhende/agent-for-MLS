@@ -111,12 +111,13 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "profile_with_ncu",
             "description": (
-                "Run a kernel under NVIDIA Nsight Compute to collect hardware "
-                "performance counters. Use this to cross-verify measurements, "
-                "detect clock throttling, check cache efficiency, or measure "
-                "memory bandwidth from the hardware counter side. "
-                "source_type='cuda_source' compiles internally; "
-                "source_type='binary' runs an existing workspace binary."
+                "Run a kernel under NVIDIA Nsight Compute to collect hardware performance "
+                "counters. Compiles with -lineinfo for source-line correlation and saves a "
+                ".ncu-rep report (openable in Nsight Compute GUI). "
+                "Specify what to measure via section_set (recommended for broad analysis), "
+                "sections (targeted deep-dive), or metrics (exact counter names). "
+                "source_type='cuda_source' compiles and profiles directly; "
+                "source_type='binary' profiles an existing workspace binary."
             ),
             "parameters": {
                 "type": "object",
@@ -125,37 +126,65 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "enum": ["cuda_source", "binary"],
                         "description": (
-                            "'cuda_source' to provide CUDA source code (Executor compiles it); "
-                            "'binary' to run a binary already in the workspace."
+                            "'cuda_source': provide CUDA C source — compiled with -lineinfo "
+                            "internally, kernel is NOT pre-run before profiling. "
+                            "'binary': workspace-relative path to an already-compiled binary."
                         ),
                     },
                     "source_or_path": {
                         "type": "string",
                         "description": (
-                            "If source_type='cuda_source': the full CUDA source code. "
-                            "If source_type='binary': workspace-relative path to the binary."
+                            "If source_type='cuda_source': full CUDA C source code. "
+                            "If source_type='binary': workspace-relative binary path "
+                            "(e.g. from a prior run_cuda_probe result's binary_path field)."
                         ),
                     },
                     "kernel_name": {
                         "type": "string",
                         "description": (
-                            "CUDA kernel function name to profile. "
-                            "ncu will only instrument this kernel."
+                            "Kernel function name or regex passed to ncu --kernel-name. "
+                            "ncu will only instrument matching kernels."
                         ),
+                    },
+                    "section_set": {
+                        "type": "string",
+                        "description": (
+                            "Predefined ncu section set (--set). Recommended starting point. "
+                            "'default' covers Speed-of-Light, memory, compute utilisation. "
+                            "'full' adds all sections (slow). 'roofline' adds roofline model. "
+                            "Leave empty if using sections or metrics instead."
+                        ),
+                        "default": "",
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Targeted ncu sections (--section). Use for focused analysis. "
+                            "Examples: ['SpeedOfLight', 'MemoryWorkloadAnalysis', "
+                            "'ComputeWorkloadAnalysis', 'Occupancy', 'SchedulerStats']. "
+                            "Can be combined with metrics."
+                        ),
+                        "default": [],
                     },
                     "metrics": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "List of ncu metric names to collect. "
+                            "Explicit ncu metric names (--metrics). Use when you need "
+                            "precise counters not covered by sections. "
                             "Examples: ['l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum', "
-                            "'sm__cycles_elapsed.avg.per_second', "
-                            "'l2__throughput.avg.pct_of_peak_sustained_elapsed']"
+                            "'sm__cycles_elapsed.avg.per_second']. "
+                            "At least one of metrics / sections / section_set is required."
                         ),
+                        "default": [],
                     },
                     "compile_flags": {
                         "type": "array",
                         "items": {"type": "string"},
+                        "description": (
+                            "Extra nvcc flags. -lineinfo is always injected automatically."
+                        ),
                         "default": [],
                     },
                     "args": {
@@ -166,10 +195,10 @@ TOOL_SCHEMAS: list[dict] = [
                     "timeout_s": {
                         "type": "integer",
                         "default": 600,
-                        "description": "Total timeout for ncu run in seconds.",
+                        "description": "Total timeout for the ncu run in seconds.",
                     },
                 },
-                "required": ["source_type", "source_or_path", "kernel_name", "metrics"],
+                "required": ["source_type", "source_or_path", "kernel_name"],
             },
         },
     },

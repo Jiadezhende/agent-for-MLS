@@ -15,6 +15,24 @@ from agents.tools.executor.subprocess_runner import _run_subprocess
 from agents.tools.executor.workspace import _Workspace
 
 
+def _compile_cuda_for_ncu(
+    source: str,
+    name: str,
+    flags: list[str],
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> Path:
+    """Compile CUDA source with -lineinfo for ncu source-line correlation.
+
+    Unlike _compile_cuda, this never runs the binary — it only returns the
+    compiled binary path so the caller can hand it directly to ncu.
+    """
+    flags_with_lineinfo = list(flags)
+    if "-lineinfo" not in flags_with_lineinfo:
+        flags_with_lineinfo.append("-lineinfo")
+    return _compile_cuda(source, name, flags_with_lineinfo, workspace, cfg)
+
+
 def _compile_cuda(
     source: str,
     name: str,

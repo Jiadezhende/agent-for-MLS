@@ -43,7 +43,7 @@ def _classify_subprocess_failure(
         "erf_no_privileged_mode" in low
         or "err_nvgpuctrperm" in low
         or ("access denied" in low and phase == "profile")
-        or "permission denied" in low and "ncu" in low
+        or ("permission denied" in low and "ncu" in low)
     ):
         return {
             "error": "ncu_permission_denied",
@@ -59,7 +59,7 @@ def _classify_subprocess_failure(
         or "no cuda-capable device" in low
         or "cudaerrornodevice" in low
         or "failed to initialize cuda" in low
-        or "cuda driver" in low and "not found" in low
+        or ("cuda driver" in low and "not found" in low)
     ):
         return {
             "error": "cuda_environment_unavailable",
@@ -94,7 +94,7 @@ def _classify_subprocess_failure(
     if (
         "unsupported gpu architecture" in low
         or "unsupported architecture" in low
-        or "value 'sm_" in low and "not defined" in low
+        or ("value 'sm_" in low and "not defined" in low)
         or "invalid value for --gpu-architecture" in low
         or "not a supported gpu architecture" in low
     ):
@@ -106,7 +106,7 @@ def _classify_subprocess_failure(
         }
     if (
         "cl.exe" in low and ("not found" in low or "cannot find" in low)
-        or "-ccbin" in combined and ("cannot find" in low or "no such file" in low)
+        or ("-ccbin" in combined and ("cannot find" in low or "no such file" in low))
         or "host compiler targets unsupported os" in low
     ):
         return {

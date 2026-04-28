@@ -29,8 +29,10 @@ def _aggregate_ncu_samples(
     samples: dict[str, list[float | str]],
     metrics_requested: list[str],
 ) -> dict[str, float | str]:
+    # Empty metrics_requested means "aggregate all found metrics"
+    targets = metrics_requested if metrics_requested else list(samples.keys())
     metrics: dict[str, float | str] = {}
-    for metric in metrics_requested:
+    for metric in targets:
         values = samples.get(metric, [])
         numeric_values = [v for v in values if isinstance(v, float)]
         if not numeric_values:
@@ -51,6 +53,7 @@ def _reduce_ncu_long_rows(rows: list[list[str]], metrics_requested: list[str]) -
     )
     header = rows[header_idx]
     indexes = {name: idx for idx, name in enumerate(header)}
+    collect_all = not metrics_requested
     samples: dict[str, list[float | str]] = {m: [] for m in metrics_requested}
     metric_units: dict[str, str] = {}
     kernel_names_seen: list[str] = []
@@ -73,13 +76,15 @@ def _reduce_ncu_long_rows(rows: list[list[str]], metrics_requested: list[str]) -
             elif instance_idx is not None and instance_idx < len(row) and row[instance_idx]:
                 invocation_id = row[instance_idx]
             invocation_keys.add((invocation_id, kernel_name))
-        if metric_name not in requested:
+        if not collect_all and metric_name not in requested:
             continue
 
         value_idx = indexes["Metric Value"]
         if value_idx >= len(row):
             notes.append(f"Metric Value column missing for {metric_name}")
             continue
+        if metric_name not in samples:
+            samples[metric_name] = []
         samples[metric_name].append(_parse_metric_value(row[value_idx]))
         unit_idx = indexes.get("Metric Unit")
         if unit_idx is not None and unit_idx < len(row) and row[unit_idx]:
@@ -104,23 +109,45 @@ def _reduce_ncu_wide_rows(rows: list[list[str]], metrics_requested: list[str]) -
     """Parse newer ncu raw CSV where each requested metric is a column."""
     header_idx = next(i for i, row in enumerate(rows) if "Kernel Name" in row)
     header = rows[header_idx]
+    collect_all = not metrics_requested
     samples: dict[str, list[float | str]] = {m: [] for m in metrics_requested}
     metric_units: dict[str, str] = {}
     kernel_names_seen: list[str] = []
     invocation_keys: set[tuple[str, str]] = set()
     notes: list[str] = []
 
+    # Non-metric columns to skip when collecting all
+    _NON_METRIC_COLS = {"ID", "Kernel Name", "Kernel Time (ns)", "Context", "Stream",
+                        "Block", "Grid", "Device", "Process ID", "Process Name",
+                        "Host Name", "Section Name"}
+
     column_indexes: dict[str, int] = {}
-    for metric in metrics_requested:
-        matches = [idx for idx, name in enumerate(header) if name == metric]
-        if matches:
-            column_indexes[metric] = matches[0]
+    if collect_all:
+        column_indexes = {
+            name: idx for idx, name in enumerate(header)
+            if name and name not in _NON_METRIC_COLS
+        }
+    else:
+        for metric in metrics_requested:
+            matches = [idx for idx, name in enumerate(header) if name == metric]
+            if matches:
+                column_indexes[metric] = matches[0]
 
     unit_row: list[str] | None = None
     data_start = header_idx + 1
     if data_start < len(rows):
         candidate = rows[data_start]
-        if not candidate or (candidate[0] == "" and not candidate[0].isdigit()):
+        # A unit row has no numeric first cell and contains unit strings like "ns", "%", "cycle"
+        is_unit_row = bool(candidate) and (
+            not candidate[0]
+            or not any(c.isdigit() for c in candidate[0])
+        ) and any(
+            cell.lower() in {"ns", "%", "cycle", "cycles", "byte", "bytes",
+                              "gb/s", "tb/s", "mhz", "ghz", "warp", "warps", "inst"}
+            for cell in candidate
+            if cell
+        )
+        if is_unit_row:
             unit_row = candidate
             data_start += 1
 
@@ -143,6 +170,8 @@ def _reduce_ncu_wide_rows(rows: list[list[str]], metrics_requested: list[str]) -
         for metric, col_idx in column_indexes.items():
             if col_idx >= len(row) or row[col_idx] == "":
                 continue
+            if metric not in samples:
+                samples[metric] = []
             samples[metric].append(_parse_metric_value(row[col_idx]))
             if unit_row is not None and col_idx < len(unit_row) and unit_row[col_idx]:
                 metric_units[metric] = unit_row[col_idx]
@@ -151,7 +180,7 @@ def _reduce_ncu_wide_rows(rows: list[list[str]], metrics_requested: list[str]) -
     missing = [m for m in metrics_requested if m not in metrics]
     if missing:
         notes.append(f"Could not parse metrics exactly: {missing}")
-    if not column_indexes and metrics_requested:
+    if not column_indexes and not collect_all:
         notes.append("ncu CSV uses wide raw format, but no requested metric columns were present")
 
     return {
@@ -213,36 +242,42 @@ def _reduce_ncu(raw_text: str, metrics_requested: list[str]) -> dict:
     }
 
 
-def _reduce_nsys(raw_text: str) -> dict:
-    """Extract top GPU kernels from nsys stats text output."""
-    lines = raw_text.strip().splitlines()
+def _reduce_nsys(csv_text: str) -> dict:
+    """Parse nsys stats --format csv output (cuda_gpu_kern_sum report).
+
+    Expected input: CSV from `nsys stats <report>.nsys-rep --format csv --report cuda_gpu_kern_sum`.
+    Falls back to raw text excerpt if CSV parsing fails.
+    """
     result: dict[str, Any] = {"timeline_summary": [], "notes": []}
-
-    in_table = False
-    header: list[str] = []
-    rows: list[dict] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if in_table:
-                in_table = False
-            continue
-        if "Time (%)" in stripped and not in_table:
-            header = [h.strip() for h in stripped.split(",")]
-            in_table = True
-            continue
-        if in_table:
-            parts = stripped.split(",")
-            if len(parts) == len(header):
-                rows.append(dict(zip(header, [p.strip() for p in parts])))
-
-    if rows:
-        result["timeline_summary"] = rows[:10]
-    else:
+    if not csv_text.strip():
+        result["notes"].append("empty nsys stats output")
+        return result
+    try:
+        rows = _read_csv_rows(csv_text)
+        if not rows:
+            raise ValueError("no rows parsed")
+        # Find header: first row that has a time/name column
+        header_idx = next(
+            (i for i, row in enumerate(rows)
+             if any("name" in col.lower() for col in row)
+             and any("time" in col.lower() or col.strip() == "%" for col in row)),
+            None,
+        )
+        if header_idx is not None:
+            header = rows[header_idx]
+            data = [
+                dict(zip(header, row))
+                for row in rows[header_idx + 1:]
+                if len(row) == len(header) and any(cell for cell in row)
+            ]
+            result["timeline_summary"] = data[:15]
+        else:
+            result["timeline_summary"] = rows[:15]
+            result["notes"].append("nsys CSV header not recognized; raw rows returned")
+    except Exception as exc:
+        lines = csv_text.strip().splitlines()
         result["timeline_summary"] = lines[:50]
-        result["notes"].append("Could not parse nsys stats table; raw excerpt returned")
-
+        result["notes"].append(f"nsys stats parse error: {exc}; raw excerpt returned")
     return result
 
 

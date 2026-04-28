@@ -31,7 +31,7 @@ metric you must:
   2. Choose an appropriate measurement strategy (use list_skills / read_skill
      to discover available strategies).
   3. Execute the measurement via the Executor tools (run_cuda_probe,
-     profile_with_ncu, profile_with_nsys, or profile_with_torch).
+     profile_with_ncu, or profile_with_nsys).
   4. Interpret the results, detect anomalies, and record the measurement.
   5. Cross-verify with at least one independent method when confidence < 0.85.
 
@@ -72,8 +72,8 @@ Every executor tool error includes an `error_class` field. Use it to decide your
 - `"infrastructure"`: A binary is missing or the environment is misconfigured.
   The `hint` field (if present) tells you how to fix it. Do NOT keep retrying the
   same approach — the code is fine, but the system cannot run it. Call flag_event
-  with severity="error" and try a completely different tool (e.g. profile_with_torch
-  instead of run_cuda_probe), or submit_results if no alternative exists.
+  with severity="error" and try a completely different tool (e.g. profile_with_nsys),
+  or submit_results if no alternative exists.
 - `"timeout"`: Execution exceeded the time limit. Reduce the workload size or
   pass a larger timeout_s argument.
 
@@ -234,11 +234,10 @@ class HardwareProbeAgent(Agent):
         "run_cuda_probe",
         "profile_with_ncu",
         "profile_with_nsys",
-        "profile_with_torch",
         "record_measurement",
         "flag_event",
         "submit_results",
-        "find_binary",
+        "probe_environment",
     ]
 
     def __init__(

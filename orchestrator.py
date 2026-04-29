@@ -251,6 +251,7 @@ class Orchestrator:
                         ))
 
         except KeyboardInterrupt:
+            interrupted = True
             self._emit("[orchestrator] Interrupted — cancelling pending workers.")
             for future, step in future_to_step.items():
                 if future.cancel():

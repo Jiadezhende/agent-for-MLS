@@ -13,6 +13,7 @@ from agents.core.llm import LLMClient
 from agents.core.prompts import build_user_message
 from agents.core.types import AgentContext
 from agents.tools.registry import ToolRegistry, _Terminated
+from agents.tools.response import ToolResponse, ToolStatus
 
 
 _LARGE_TEXT_ARGS: frozenset[str] = frozenset({"source", "source_or_path", "python_code"})
@@ -31,26 +32,18 @@ def _summarize_args(args: dict | None) -> str:
     return json.dumps(compacted, separators=(",", ":"), default=str)
 
 
-def _summarize_result(result: dict) -> str:
-    status = result.get("status")
-    if status == "error":
-        err = result.get("error", "?")
-        detail = result.get("detail") or result.get("stderr", "")
-        snippet = str(detail)[:80] if detail else ""
-        return f"status=error  error={err}  {snippet}"
-    if status == "circuit_open":
-        return f"status=circuit_open  kinds={result.get('open_error_kinds')}"
-    if status in ("done", "timed_out"):
-        elapsed = result.get("elapsed_s", "?")
-        cache_tag = " [cache_hit]" if result.get("cache_hit") else ""
-        return f"status={status}  elapsed={elapsed}s{cache_tag}"
-    if result.get("ok") is True:
-        extra = {k: v for k, v in result.items() if k != "ok"}
-        return "ok  " + json.dumps(extra, separators=(",", ":"), default=str)
-    if "error" in result:
-        return f"error={result['error']}  " + str(result.get("detail", ""))[:80]
-    raw = json.dumps(result, separators=(",", ":"), default=str)
-    return (raw[:100] + "...") if len(raw) > 100 else raw
+def _summarize_result(response: ToolResponse) -> str:
+    if response.status == ToolStatus.ERROR:
+        code = (response.error_info or {}).get("code", "?")
+        return f"status=error  code={code}  {response.text[:80]}"
+    if response.status == ToolStatus.PARTIAL:
+        return f"status=partial  {response.text[:80]}"
+    # SUCCESS
+    stats   = response.stats or {}
+    elapsed = stats.get("elapsed_s", "")
+    cache   = " [cache_hit]" if stats.get("cache_hit") else ""
+    timing  = f"  elapsed={elapsed}s{cache}" if elapsed else ""
+    return f"status=success{timing}  {response.text[:60]}"
 
 
 class AgentLoop:
@@ -150,7 +143,7 @@ class AgentLoop:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str),
+                    "content": json.dumps(result.to_dict(), default=str),
                 })
 
         raise RuntimeError(

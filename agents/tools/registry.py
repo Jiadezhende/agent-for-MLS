@@ -1,18 +1,22 @@
 """
-agents/tools/registry.py — Maps tool names to callables + JSON schemas.
+agents/tools/registry.py — Maps tool names to Tool objects.
 
-Circuit breaker now applies uniformly to ALL registered tools.
+Circuit breaker applies uniformly to every registered tool.
+Context injection for recording tools uses duck-typing: if a Tool has a _ctx
+attribute the registry sets it before dispatch (no ABC required).
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import jsonschema
 
 from agents.core.types import AgentContext
+from agents.tools.base import Tool
 from agents.tools.circuit_breaker import CircuitBreaker
+from agents.tools.response import ToolErrorCode, ToolResponse, ToolStatus
 
 
 # ---------------------------------------------------------------------------
@@ -27,56 +31,44 @@ class _Terminated(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Registry entry
+# Registry
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ToolEntry:
-    fn: Callable
-    schema: dict
-    needs_ctx: bool = False
-
-
-# ---------------------------------------------------------------------------
-# ToolRegistry — circuit breaker applies to ALL tools
-# ---------------------------------------------------------------------------
-
-def _update_circuit_breaker(cb: CircuitBreaker, tool: str, result: dict) -> None:
-    status = result.get("status", "")
-    kind = result.get("error", "")
-    if kind and (status == "error" or ("status" not in result and "error" in result)):
-        cb.record_failure(tool, kind)
-    elif status == "done" or result.get("ok"):
+def _update_circuit_breaker(cb: CircuitBreaker, tool: str, response: ToolResponse) -> None:
+    if response.status == ToolStatus.ERROR:
+        code = (response.error_info or {}).get("code", "unknown")
+        cb.record_failure(tool, code)
+    else:
         cb.record_success(tool)
 
 
 class ToolRegistry:
     def __init__(self) -> None:
-        self._entries: dict[str, ToolEntry] = {}
+        self._tools: dict[str, Tool] = {}
 
-    def register(
-        self,
-        name: str,
-        fn: Callable,
-        schema: dict,
-        needs_ctx: bool = False,
-    ) -> None:
-        if name in self._entries:
-            raise ValueError(f"Tool '{name}' is already registered.")
-        self._entries[name] = ToolEntry(fn=fn, schema=schema, needs_ctx=needs_ctx)
+    def register(self, tool: Tool) -> None:
+        if tool.name in self._tools:
+            raise ValueError(f"Tool '{tool.name}' is already registered.")
+        self._tools[tool.name] = tool
 
     def schemas(self) -> list[dict]:
-        return [entry.schema for entry in self._entries.values()]
+        return [t.to_openai_schema() for t in self._tools.values()]
 
-    def dispatch(self, name: str, args_dict: Any, ctx: AgentContext) -> dict:
-        """Execute a tool call. Returns a JSON-serializable dict always.
+    def dispatch(self, name: str, args_dict: Any, ctx: AgentContext) -> ToolResponse:
+        """Execute a tool call. Returns ToolResponse always.
 
-        Circuit breaker check applies to all registered tools.
+        Circuit breaker check and update apply to all registered tools.
+        Context is injected into tools that carry a _ctx attribute.
         """
-        entry = self._entries.get(name)
-        if entry is None:
-            return {"error": "unknown_tool", "name": name,
-                    "hint": f"Valid tools: {list(self._entries.keys())}"}
+        tool = self._tools.get(name)
+        if tool is None:
+            return ToolResponse.error(
+                code=ToolErrorCode.UNKNOWN_TOOL,
+                message=(
+                    f"Unknown tool '{name}'. "
+                    f"Valid tools: {list(self._tools.keys())}"
+                ),
+            )
 
         # Universal circuit breaker check
         open_for_tool = [
@@ -84,47 +76,58 @@ class ToolRegistry:
         ]
         if open_for_tool:
             open_kinds = [ek for _, ek in open_for_tool]
-            return {
-                "status": "circuit_open",
-                "tool": name,
-                "open_error_kinds": open_kinds,
-                "failure_counts": {
-                    ek: ctx.circuit_breaker.failure_count(name, ek) for ek in open_kinds
-                },
-                "message": (
+            counts = {ek: ctx.circuit_breaker.failure_count(name, ek) for ek in open_kinds}
+            return ToolResponse.error(
+                code=ToolErrorCode.CIRCUIT_OPEN,
+                message=(
                     f"Tool '{name}' has failed {ctx.circuit_breaker.threshold}+ times "
                     f"with errors {open_kinds}. Circuit is open — stop retrying this approach. "
-                    f"Use a different tool or call submit_results with current findings."
+                    "Use a different tool or call submit_results with current findings."
                 ),
-            }
+                stats={
+                    "tool": name,
+                    "open_error_kinds": open_kinds,
+                    "failure_counts": counts,
+                },
+            )
 
         if args_dict is None:
             args_dict = {}
 
-        param_schema = entry.schema.get("function", {}).get("parameters", {})
+        # JSON schema validation
+        param_schema = (
+            tool.to_openai_schema().get("function", {}).get("parameters", {})
+        )
         if param_schema:
             validator = jsonschema.Draft202012Validator(param_schema, format_checker=None)
             errors = list(validator.iter_errors(args_dict))
             if errors:
                 first = errors[0]
-                return {
-                    "error": "invalid_args",
-                    "detail": first.message,
-                    "path": list(first.absolute_path),
-                }
+                return ToolResponse.error(
+                    code=ToolErrorCode.INVALID_ARGS,
+                    message=f"{first.message} (path: {list(first.absolute_path)})",
+                )
+
+        # Context injection (duck-typing — no ABC needed)
+        if hasattr(tool, "_ctx"):
+            tool._ctx = ctx  # type: ignore[attr-defined]
 
         try:
-            if entry.needs_ctx:
-                result = entry.fn(ctx, **args_dict)
-            else:
-                result = entry.fn(**args_dict)
+            result = tool.run(args_dict)
         except _Terminated:
             raise
         except Exception as exc:  # noqa: BLE001
-            return {"error": exc.__class__.__name__, "detail": str(exc)}
+            return ToolResponse.error(
+                code=ToolErrorCode.EXECUTION_ERROR,
+                message=f"{exc.__class__.__name__}: {exc}",
+            )
 
-        if not isinstance(result, dict):
-            result = {"result": result}
+        if not isinstance(result, ToolResponse):
+            # Defensive: wrap any stray dict/value returned by a tool
+            result = ToolResponse.success(
+                text=str(result),
+                data=result if isinstance(result, dict) else {"result": result},
+            )
 
         # Universal circuit breaker update
         _update_circuit_breaker(ctx.circuit_breaker, name, result)
@@ -139,35 +142,44 @@ class ToolRegistry:
 class ToolFactory:
     """Creates ToolRegistry instances from a tool-name list.
 
-    The executor is injected once at construction; its methods are bound
-    into the registry so agents never reference the executor directly.
+    The executor is injected once at construction; Tool objects are created
+    fresh for each registry build so each worker gets isolated instances.
     """
 
     def __init__(self, executor: Any) -> None:
         self._executor = executor
 
     def build(self, tool_names: list[str]) -> ToolRegistry:
-        from agents.tools.builtin.recording import flag_event, record_measurement, submit_results
-        from agents.tools.builtin.skills import list_skills, read_skill
-        from agents.tools.schemas import TOOL_SCHEMAS
+        from agents.tools.builtin.recording import (
+            FlagEventTool,
+            RecordMeasurementTool,
+            SubmitResultsTool,
+        )
+        from agents.tools.builtin.skills import ListSkillsTool, ReadSkillTool
+        from agents.tools.executor_tools import (
+            ProfileWithNcuTool,
+            ProfileWithNsysTool,
+            ProbeEnvironmentTool,
+            RunCudaProbeTool,
+        )
 
-        schema_map = {s["function"]["name"]: s for s in TOOL_SCHEMAS}
-        all_tools: dict[str, tuple[Callable, bool]] = {
-            "list_skills":        (list_skills,                           False),
-            "read_skill":         (read_skill,                            False),
-            "run_cuda_probe":     (self._executor.run_cuda_probe,         False),
-            "profile_with_ncu":   (self._executor.profile_with_ncu,       False),
-            "profile_with_nsys":  (self._executor.profile_with_nsys,      False),
-            "record_measurement": (record_measurement,                    True),
-            "flag_event":         (flag_event,                            True),
-            "submit_results":     (submit_results,                        True),
-            "probe_environment":  (self._executor.probe_environment,       False),
+        all_tools: dict[str, Tool] = {
+            "list_skills":        ListSkillsTool(),
+            "read_skill":         ReadSkillTool(),
+            "run_cuda_probe":     RunCudaProbeTool(self._executor),
+            "profile_with_ncu":   ProfileWithNcuTool(self._executor),
+            "profile_with_nsys":  ProfileWithNsysTool(self._executor),
+            "probe_environment":  ProbeEnvironmentTool(self._executor),
+            "record_measurement": RecordMeasurementTool(),
+            "flag_event":         FlagEventTool(),
+            "submit_results":     SubmitResultsTool(),
         }
 
         reg = ToolRegistry()
         for name in tool_names:
             if name not in all_tools:
-                raise ValueError(f"Unknown tool '{name}'. Available: {list(all_tools)}")
-            fn, needs_ctx = all_tools[name]
-            reg.register(name, fn, schema_map[name], needs_ctx=needs_ctx)
+                raise ValueError(
+                    f"Unknown tool '{name}'. Available: {list(all_tools)}"
+                )
+            reg.register(all_tools[name])
         return reg

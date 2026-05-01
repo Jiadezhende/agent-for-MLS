@@ -6,27 +6,55 @@ from __future__ import annotations
 import pytest
 
 from agents.tools.registry import _Terminated
-from agents.tools.builtin.recording import flag_event, record_measurement, submit_results
-from agents.tools.builtin.skills import list_skills, read_skill
+from agents.tools.builtin.recording import (
+    FlagEventTool,
+    RecordMeasurementTool,
+    SubmitResultsTool,
+)
+from agents.tools.builtin.skills import ListSkillsTool, ReadSkillTool
+from agents.tools.response import ToolErrorCode, ToolStatus
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_record_tool(ctx):
+    tool = RecordMeasurementTool()
+    tool._ctx = ctx
+    return tool
+
+
+def _make_flag_tool(ctx):
+    tool = FlagEventTool()
+    tool._ctx = ctx
+    return tool
+
+
+def _make_submit_tool(ctx):
+    tool = SubmitResultsTool()
+    tool._ctx = ctx
+    return tool
 
 
 # ===========================================================================
-# recording.py — record_measurement
+# recording.py — RecordMeasurementTool
 # ===========================================================================
 
 class TestRecordMeasurement:
     def test_records_result_in_ctx(self, agent_ctx):
-        ret = record_measurement(
-            agent_ctx,
-            metric="dram_latency_cycles",
-            value=876,
-            unit="cycles",
-            confidence=0.9,
-            method="pointer-chase 256 MB",
-            evidence=["latency_cycles=876"],
-        )
-        assert ret["ok"] is True
-        assert ret["count"] == 1
+        tool = _make_record_tool(agent_ctx)
+        resp = tool.run({
+            "metric":     "dram_latency_cycles",
+            "value":      876,
+            "unit":       "cycles",
+            "confidence": 0.9,
+            "method":     "pointer-chase 256 MB",
+            "evidence":   ["latency_cycles=876"],
+        })
+        assert resp.status == ToolStatus.SUCCESS
+        assert resp.data["ok"] is True
+        assert resp.data["count"] == 1
         assert len(agent_ctx.results) == 1
         r = agent_ctx.results[0]
         assert r.metric == "dram_latency_cycles"
@@ -35,78 +63,66 @@ class TestRecordMeasurement:
         assert r.confidence == 0.9
 
     def test_multiple_records_accumulate(self, agent_ctx):
+        tool = _make_record_tool(agent_ctx)
         for i in range(3):
-            record_measurement(
-                agent_ctx,
-                metric=f"metric_{i}",
-                value=i,
-                unit=None,
-                confidence=0.5,
-                method="test",
-                evidence=[f"evidence_{i}"],
-            )
+            tool.run({
+                "metric": f"metric_{i}", "value": i,
+                "unit": None, "confidence": 0.5,
+                "method": "test", "evidence": [f"evidence_{i}"],
+            })
         assert len(agent_ctx.results) == 3
 
     def test_empty_evidence_returns_error(self, agent_ctx):
-        ret = record_measurement(
-            agent_ctx,
-            metric="x",
-            value=1,
-            unit=None,
-            confidence=1.0,
-            method="test",
-            evidence=[],          # empty — must be rejected
-        )
-        assert "error" in ret
-        assert ret["error"] == "empty_evidence"
-        assert len(agent_ctx.results) == 0   # nothing recorded
+        tool = _make_record_tool(agent_ctx)
+        resp = tool.run({
+            "metric": "x", "value": 1, "unit": None,
+            "confidence": 1.0, "method": "test", "evidence": [],
+        })
+        assert resp.status == ToolStatus.ERROR
+        assert resp.error_info["code"] == ToolErrorCode.EMPTY_EVIDENCE
+        assert len(agent_ctx.results) == 0
 
     def test_count_field_reflects_total(self, agent_ctx):
-        record_measurement(
-            agent_ctx, metric="a", value=1, unit=None,
-            confidence=1.0, method="m", evidence=["e"],
-        )
-        ret = record_measurement(
-            agent_ctx, metric="b", value=2, unit=None,
-            confidence=1.0, method="m", evidence=["e"],
-        )
-        assert ret["count"] == 2
+        tool = _make_record_tool(agent_ctx)
+        tool.run({"metric": "a", "value": 1, "unit": None,
+                  "confidence": 1.0, "method": "m", "evidence": ["e"]})
+        resp = tool.run({"metric": "b", "value": 2, "unit": None,
+                         "confidence": 1.0, "method": "m", "evidence": ["e"]})
+        assert resp.data["count"] == 2
 
     def test_string_value_accepted(self, agent_ctx):
-        ret = record_measurement(
-            agent_ctx,
-            metric="device_name",
-            value="RTX 5060",
-            unit=None,
-            confidence=1.0,
-            method="cudaGetDeviceProperties",
-            evidence=["device_name=RTX 5060"],
-        )
-        assert ret["ok"] is True
+        tool = _make_record_tool(agent_ctx)
+        resp = tool.run({
+            "metric": "device_name", "value": "RTX 5060", "unit": None,
+            "confidence": 1.0, "method": "cudaGetDeviceProperties",
+            "evidence": ["device_name=RTX 5060"],
+        })
+        assert resp.status == ToolStatus.SUCCESS
 
     def test_dict_value_accepted(self, agent_ctx):
-        ret = record_measurement(
-            agent_ctx,
-            metric="breakdown",
-            value={"l1": 30, "l2": 200, "dram": 876},
-            unit="cycles",
-            confidence=0.8,
-            method="pointer-chase multi-tier",
-            evidence=["latency_cycles=876"],
-        )
-        assert ret["ok"] is True
+        tool = _make_record_tool(agent_ctx)
+        resp = tool.run({
+            "metric": "breakdown", "value": {"l1": 30, "l2": 200, "dram": 876},
+            "unit": "cycles", "confidence": 0.8,
+            "method": "pointer-chase multi-tier", "evidence": ["latency_cycles=876"],
+        })
+        assert resp.status == ToolStatus.SUCCESS
 
 
 # ===========================================================================
-# recording.py — flag_event
+# recording.py — FlagEventTool
 # ===========================================================================
 
 class TestFlagEvent:
     def test_appends_to_events(self, agent_ctx):
         agent_ctx.iteration = 3
-        ret = flag_event(agent_ctx, type="clock_throttled", severity="warn",
-                         detail="Measured 800 MHz vs 1500 MHz reported")
-        assert ret["ok"] is True
+        tool = _make_flag_tool(agent_ctx)
+        resp = tool.run({
+            "type": "clock_throttled", "severity": "warn",
+            "detail": "Measured 800 MHz vs 1500 MHz reported",
+        })
+        assert resp.status == ToolStatus.SUCCESS
+        assert resp.data["ok"] is True
         assert len(agent_ctx.events) == 1
         e = agent_ctx.events[0]
         assert e["type"] == "clock_throttled"
@@ -114,109 +130,118 @@ class TestFlagEvent:
         assert e["iteration"] == 3
 
     def test_multiple_events_accumulate(self, agent_ctx):
-        flag_event(agent_ctx, type="e1", severity="info", detail="d1")
-        flag_event(agent_ctx, type="e2", severity="error", detail="d2")
+        tool = _make_flag_tool(agent_ctx)
+        tool.run({"type": "e1", "severity": "info", "detail": "d1"})
+        tool.run({"type": "e2", "severity": "error", "detail": "d2"})
         assert len(agent_ctx.events) == 2
 
     def test_event_detail_preserved(self, agent_ctx):
+        tool = _make_flag_tool(agent_ctx)
         detail = "Some very long detail string about what happened"
-        flag_event(agent_ctx, type="test", severity="info", detail=detail)
+        tool.run({"type": "test", "severity": "info", "detail": detail})
         assert agent_ctx.events[0]["detail"] == detail
 
 
 # ===========================================================================
-# recording.py — submit_results
+# recording.py — SubmitResultsTool
 # ===========================================================================
 
 class TestSubmitResults:
     def test_raises_terminated(self, agent_ctx):
+        tool = _make_submit_tool(agent_ctx)
         with pytest.raises(_Terminated) as exc_info:
-            submit_results(agent_ctx, summary="All metrics collected.")
+            tool.run({"summary": "All metrics collected."})
         assert exc_info.value.summary == "All metrics collected."
 
     def test_stores_summary_in_memory(self, agent_ctx):
+        tool = _make_submit_tool(agent_ctx)
         with pytest.raises(_Terminated):
-            submit_results(agent_ctx, summary="Done.")
+            tool.run({"summary": "Done."})
         assert agent_ctx.memory.get("run", "summary") == "Done."
 
     def test_works_after_recording(self, agent_ctx):
-        record_measurement(
-            agent_ctx, metric="x", value=1, unit=None,
-            confidence=1.0, method="m", evidence=["e"],
-        )
+        rec_tool = _make_record_tool(agent_ctx)
+        rec_tool.run({
+            "metric": "x", "value": 1, "unit": None,
+            "confidence": 1.0, "method": "m", "evidence": ["e"],
+        })
+        sub_tool = _make_submit_tool(agent_ctx)
         with pytest.raises(_Terminated):
-            submit_results(agent_ctx, summary="complete")
+            sub_tool.run({"summary": "complete"})
         assert len(agent_ctx.results) == 1
 
 
 # ===========================================================================
-# skills.py — list_skills
+# skills.py — ListSkillsTool
 # ===========================================================================
 
 class TestListSkills:
     def test_returns_dict_with_skills_key(self):
-        result = list_skills()
-        assert "skills" in result
-        assert isinstance(result["skills"], list)
+        resp = ListSkillsTool().run({})
+        assert resp.status == ToolStatus.SUCCESS
+        assert "skills" in resp.data
+        assert isinstance(resp.data["skills"], list)
 
     def test_includes_known_skills(self):
-        result = list_skills()
-        names = {s["name"] for s in result["skills"]}
+        resp = ListSkillsTool().run({})
+        names = {s["name"] for s in resp.data["skills"]}
         assert "gpu_profiling_overview" in names
         assert "memory_hierarchy" in names
         assert "clock_environment" in names
 
     def test_excludes_template(self):
-        result = list_skills()
-        names = {s["name"] for s in result["skills"]}
+        resp = ListSkillsTool().run({})
+        names = {s["name"] for s in resp.data["skills"]}
         assert "_template" not in names
 
     def test_excludes_readme(self):
-        result = list_skills()
-        names = {s["name"] for s in result["skills"]}
+        resp = ListSkillsTool().run({})
+        names = {s["name"] for s in resp.data["skills"]}
         assert "README" not in names
 
     def test_each_skill_has_summary(self):
-        result = list_skills()
-        for s in result["skills"]:
+        resp = ListSkillsTool().run({})
+        for s in resp.data["skills"]:
             assert "summary" in s
             assert len(s["summary"]) > 0
 
 
 # ===========================================================================
-# skills.py — read_skill
+# skills.py — ReadSkillTool
 # ===========================================================================
 
 class TestReadSkill:
     def test_reads_existing_skill(self):
-        result = read_skill("gpu_profiling_overview")
-        assert "error" not in result
-        assert "content" in result
-        assert len(result["content"]) > 100
+        resp = ReadSkillTool().run({"name": "gpu_profiling_overview"})
+        assert resp.status == ToolStatus.SUCCESS
+        assert "content" in resp.data
+        assert len(resp.data["content"]) > 100
 
     def test_reads_memory_hierarchy(self):
-        result = read_skill("memory_hierarchy")
-        assert "error" not in result
-        assert "pointer" in result["content"].lower()
+        resp = ReadSkillTool().run({"name": "memory_hierarchy"})
+        assert resp.status == ToolStatus.SUCCESS
+        assert "pointer" in resp.data["content"].lower()
 
     def test_reads_clock_environment(self):
-        result = read_skill("clock_environment")
-        assert "error" not in result
-        assert "clock" in result["content"].lower()
+        resp = ReadSkillTool().run({"name": "clock_environment"})
+        assert resp.status == ToolStatus.SUCCESS
+        assert "clock" in resp.data["content"].lower()
 
     def test_missing_skill_returns_error(self):
-        result = read_skill("nonexistent_skill_xyz")
-        assert result["error"] == "skill_not_found"
-        assert "available" in result
+        resp = ReadSkillTool().run({"name": "nonexistent_skill_xyz"})
+        assert resp.status == ToolStatus.ERROR
+        assert resp.error_info["code"] == ToolErrorCode.SKILL_NOT_FOUND
 
     def test_invalid_name_returns_error(self):
-        result = read_skill("../../etc/passwd")
-        assert result["error"] == "invalid_name"
+        resp = ReadSkillTool().run({"name": "../../etc/passwd"})
+        assert resp.status == ToolStatus.ERROR
+        assert resp.error_info["code"] == ToolErrorCode.INVALID_NAME
 
     def test_invalid_name_with_spaces(self):
-        result = read_skill("has spaces")
-        assert result["error"] == "invalid_name"
+        resp = ReadSkillTool().run({"name": "has spaces"})
+        assert resp.status == ToolStatus.ERROR
+        assert resp.error_info["code"] == ToolErrorCode.INVALID_NAME
 
     def test_truncated_flag_false_for_small_file(self):
-        result = read_skill("gpu_profiling_overview")
-        assert result["truncated"] is False
+        resp = ReadSkillTool().run({"name": "gpu_profiling_overview"})
+        assert resp.data["truncated"] is False

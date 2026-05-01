@@ -117,6 +117,7 @@ class Step:
     worker: str                              # agent_type key in the registry
     targets: list[str] = field(default_factory=list)  # target names assigned to this worker
     task: str = ""                           # auto-generated log label, not sent to Worker LLM
+    hints: list[str] = field(default_factory=list)    # environment/routing hints injected by orchestrator
     retry_context: dict | None = None        # set on retry steps; contains reason + previous bad values
 
 

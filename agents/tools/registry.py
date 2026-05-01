@@ -158,11 +158,10 @@ class ToolFactory:
             "run_cuda_probe":     (self._executor.run_cuda_probe,         False),
             "profile_with_ncu":   (self._executor.profile_with_ncu,       False),
             "profile_with_nsys":  (self._executor.profile_with_nsys,      False),
-            "profile_with_torch": (self._executor.profile_with_torch,     False),
             "record_measurement": (record_measurement,                    True),
             "flag_event":         (flag_event,                            True),
             "submit_results":     (submit_results,                        True),
-            "find_binary":        (self._executor.find_binary,            False),
+            "probe_environment":  (self._executor.probe_environment,       False),
         }
 
         reg = ToolRegistry()

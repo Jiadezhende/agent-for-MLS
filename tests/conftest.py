@@ -3,6 +3,7 @@ conftest.py — Shared pytest fixtures.
 """
 from __future__ import annotations
 
+import shutil
 import uuid
 import pytest
 from pathlib import Path
@@ -16,11 +17,16 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # Markers
 # ---------------------------------------------------------------------------
 
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers",
-        "cuda: marks tests that require a working CUDA toolchain (nvcc + GPU)",
-    )
+def pytest_collection_modifyitems(config, items):
+    """Skip CUDA integration tests unless nvcc and nvidia-smi are available."""
+    has_cuda_toolchain = shutil.which("nvcc") is not None and shutil.which("nvidia-smi") is not None
+    if has_cuda_toolchain:
+        return
+
+    skip_cuda = pytest.mark.skip(reason="requires nvcc and nvidia-smi")
+    for item in items:
+        if "cuda" in item.keywords:
+            item.add_marker(skip_cuda)
 
 
 # ---------------------------------------------------------------------------

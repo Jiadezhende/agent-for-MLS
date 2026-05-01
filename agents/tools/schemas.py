@@ -111,12 +111,13 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "profile_with_ncu",
             "description": (
-                "Run a kernel under NVIDIA Nsight Compute to collect hardware "
-                "performance counters. Use this to cross-verify measurements, "
-                "detect clock throttling, check cache efficiency, or measure "
-                "memory bandwidth from the hardware counter side. "
-                "source_type='cuda_source' compiles internally; "
-                "source_type='binary' runs an existing workspace binary."
+                "Run a kernel under NVIDIA Nsight Compute to collect hardware performance "
+                "counters. Specify exact metric names via the metrics list. "
+                "Compiles with -lineinfo for source-line correlation and saves a "
+                ".ncu-rep report (openable in Nsight Compute GUI). "
+                "source_type='cuda_source' compiles and profiles directly; "
+                "source_type='binary' profiles an existing workspace binary. "
+                "Output is a human-readable table with Metric Name, Metric Unit, Metric Value."
             ),
             "parameters": {
                 "type": "object",
@@ -125,37 +126,44 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "enum": ["cuda_source", "binary"],
                         "description": (
-                            "'cuda_source' to provide CUDA source code (Executor compiles it); "
-                            "'binary' to run a binary already in the workspace."
+                            "'cuda_source': provide CUDA C source — compiled with -lineinfo "
+                            "internally, kernel is NOT pre-run before profiling. "
+                            "'binary': workspace-relative path to an already-compiled binary."
                         ),
                     },
                     "source_or_path": {
                         "type": "string",
                         "description": (
-                            "If source_type='cuda_source': the full CUDA source code. "
-                            "If source_type='binary': workspace-relative path to the binary."
+                            "If source_type='cuda_source': full CUDA C source code. "
+                            "If source_type='binary': workspace-relative binary path "
+                            "(e.g. from a prior run_cuda_probe result's binary_path field)."
                         ),
                     },
                     "kernel_name": {
                         "type": "string",
                         "description": (
-                            "CUDA kernel function name to profile. "
-                            "ncu will only instrument this kernel."
+                            "Kernel function name or regex passed to ncu --kernel-name. "
+                            "ncu will only instrument matching kernels."
                         ),
                     },
                     "metrics": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "List of ncu metric names to collect. "
-                            "Examples: ['l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum', "
-                            "'sm__cycles_elapsed.avg.per_second', "
-                            "'l2__throughput.avg.pct_of_peak_sustained_elapsed']"
+                            "ncu metric names to collect (--metrics). Required. "
+                            "Examples: ['sm__throughput.avg.pct_of_peak_sustained_elapsed', "
+                            "'gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed', "
+                            "'l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum', "
+                            "'sm__cycles_elapsed.avg.per_second']."
                         ),
+                        "default": [],
                     },
                     "compile_flags": {
                         "type": "array",
                         "items": {"type": "string"},
+                        "description": (
+                            "Extra nvcc flags. -lineinfo is always injected automatically."
+                        ),
                         "default": [],
                     },
                     "args": {
@@ -166,10 +174,10 @@ TOOL_SCHEMAS: list[dict] = [
                     "timeout_s": {
                         "type": "integer",
                         "default": 600,
-                        "description": "Total timeout for ncu run in seconds.",
+                        "description": "Total timeout for the ncu run in seconds.",
                     },
                 },
-                "required": ["source_type", "source_or_path", "kernel_name", "metrics"],
+                "required": ["source_type", "source_or_path", "kernel_name"],
             },
         },
     },
@@ -222,49 +230,6 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "profile_with_torch",
-            "description": (
-                "Run Python code under PyTorch Profiler to capture operator-level "
-                "statistics. Use this to identify hotspot operators in a PyTorch "
-                "model or function, measure GPU time per operator, and see memory "
-                "allocation patterns."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "python_code": {
-                        "type": "string",
-                        "description": (
-                            "Python code that defines and calls the operation to profile. "
-                            "The Executor wraps it with torch.profiler automatically. "
-                            "Must import torch and define the operation inline."
-                        ),
-                    },
-                    "op_name": {
-                        "type": "string",
-                        "description": (
-                            "Human-readable name for this operation "
-                            "(used in logs and cache keys)."
-                        ),
-                    },
-                    "num_iters": {
-                        "type": "integer",
-                        "default": 100,
-                        "description": "Number of iterations to run (for warmup + profiling).",
-                    },
-                    "timeout_s": {
-                        "type": "integer",
-                        "default": 300,
-                    },
-                },
-                "required": ["python_code", "op_name"],
-            },
-        },
-    },
-
     # ------------------------------------------------------------------
     # Recording tools (need AgentContext injection)
     # ------------------------------------------------------------------
@@ -389,22 +354,27 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "find_binary",
+            "name": "probe_environment",
             "description": (
-                "Search the filesystem for a required binary (nvcc, ncu, nsys) that "
-                "was not found in PATH. Updates the executor config for this session "
-                "if found. Call this when you receive a binary_not_found infrastructure error."
+                "Scan the filesystem for nvcc, ncu, and nsys binaries without executing them. "
+                "Call this when error_class='infrastructure' and error='binary_not_found'. "
+                "If binaries are found, the Executor is reconfigured automatically so "
+                "subsequent tool calls use the discovered paths. "
+                "Does NOT run any subprocess — only filesystem stat checks."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "binary_name": {
-                        "type": "string",
-                        "enum": ["nvcc", "ncu", "nsys"],
-                        "description": "Name of the binary to locate.",
+                    "force_rescan": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, re-scans even if a binary appears to be on PATH. "
+                            "Use only if you suspect PATH-based resolution is wrong. "
+                            "Default: false."
+                        ),
                     },
                 },
-                "required": ["binary_name"],
+                "required": [],
             },
         },
     },

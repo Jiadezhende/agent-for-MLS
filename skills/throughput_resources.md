@@ -1,3 +1,8 @@
+---
+name: throughput_resources
+description: Measure DRAM/L2 bandwidth, SM count, shared-memory capacity, and register file size via CUDA microbenchmarks.
+---
+
 # Throughput and Resource Probing
 
 ## Purpose

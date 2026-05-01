@@ -1,3 +1,8 @@
+---
+name: clock_environment
+description: Measure actual GPU boost clock and validate environment constraints via CUDA clock64() kernels.
+---
+
 # Clock and Environment Probing
 
 ## Purpose

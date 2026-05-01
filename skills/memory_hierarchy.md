@@ -1,3 +1,8 @@
+---
+name: memory_hierarchy
+description: Measure L1/L2/DRAM latency and L2 cache capacity via pointer-chasing CUDA microbenchmarks.
+---
+
 # Memory Hierarchy Probing
 
 ## Purpose

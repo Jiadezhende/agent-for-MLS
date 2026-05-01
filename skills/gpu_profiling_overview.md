@@ -1,3 +1,8 @@
+---
+name: gpu_profiling_overview
+description: Routing index for the hardware-probe skill library — read first to choose the right measurement skill.
+---
+
 # GPU Profiling Overview
 
 This file is the routing index for the hardware-probe skill library. Read it

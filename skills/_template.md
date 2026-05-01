@@ -1,3 +1,8 @@
+---
+name: <skill_name>
+description: <one-line summary, < 120 chars>
+---
+
 # [Skill Name]
 
 ## Purpose

@@ -199,11 +199,11 @@ class TestListSkills:
         names = {s["name"] for s in resp.data["skills"]}
         assert "README" not in names
 
-    def test_each_skill_has_summary(self):
+    def test_each_skill_has_description(self):
         resp = ListSkillsTool().run({})
         for s in resp.data["skills"]:
-            assert "summary" in s
-            assert len(s["summary"]) > 0
+            assert "description" in s
+            assert len(s["description"]) > 0
 
 
 # ===========================================================================

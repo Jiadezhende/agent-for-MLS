@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,6 +22,7 @@ from agents.agents.planner_agent import PlannerAgent
 from agents.core.llm import LLMClient
 from agents.core.types import (
     CriticDecision,
+    RunContext,
     Step,
     WorkerOutput,
 )
@@ -64,6 +66,10 @@ class Orchestrator:
         self.tool_factory = ToolFactory(executor)
         self.planner = PlannerAgent(llm, self.agent_registry, verbose)
         self.critic  = CriticAgent(llm, self.agent_registry, verbose)
+        self.run_ctx = RunContext(
+            run_id=str(uuid.uuid4()),
+            objective=task.description,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -79,11 +85,16 @@ class Orchestrator:
 
         # Phase 1: Planner
         self._trace("plan", "input", {"targets": targets})
+        self.run_ctx.event_log.append("plan.start", "planner", {"targets": targets})
         plan: list[Step] = self.planner.run(targets)
         state.steps = plan
         self._trace("plan", "output", {"steps": [
             {"id": s.id, "task": s.task, "worker": s.worker} for s in plan
         ]})
+        self.run_ctx.event_log.append("plan.complete", "planner", {
+            "n_steps": len(plan),
+            "steps": [{"id": s.id, "worker": s.worker, "targets": s.targets} for s in plan],
+        })
 
         max_worker_retries: int = self.agent_cfg.max_worker_retries
         max_critic_cycles: int = self.agent_cfg.max_critic_cycles
@@ -129,6 +140,9 @@ class Orchestrator:
 
                 # Critic reviews current outputs
                 self._trace("critic", "start", {})
+                self.run_ctx.event_log.append("critic.start", "critic", {
+                    "n_outputs": len(state.outputs),
+                })
                 decisions: list[CriticDecision] = self.critic.run(state.outputs, retry_counts)
                 self._trace("critic", "output", {
                     "decisions": [
@@ -137,6 +151,14 @@ class Orchestrator:
                         for d in decisions
                     ]
                 })
+                for dec in decisions:
+                    self.run_ctx.event_log.append("critic.decision", "critic", {
+                        "step_id": dec.step_id,
+                        "decision": dec.decision,
+                        "confidence": dec.confidence,
+                        "reason": dec.reason,
+                        "failing_targets": dec.failing_targets,
+                    })
 
                 # Apply decisions: mark retries or accept
                 for dec in decisions:
@@ -172,6 +194,11 @@ class Orchestrator:
                             ]
                             if accepted_results:
                                 state.carry_forward[dec.step_id] = accepted_results
+                                self.run_ctx.event_log.append("retry.carry_forward", "orchestrator", {
+                                    "step_id": dec.step_id,
+                                    "n_carried": len(accepted_results),
+                                    "metrics": [r.get("metric") for r in accepted_results],
+                                })
 
                             # Replace step with narrowed retry step
                             retry_step = Step(
@@ -188,6 +215,13 @@ class Orchestrator:
 
                             state.retry_set.add(dec.step_id)
                             retry_counts[dec.step_id] = n + 1
+                            self.run_ctx.event_log.append("retry.trigger", "orchestrator", {
+                                "step_id": dec.step_id,
+                                "retry_n": n + 1,
+                                "max_retries": max_worker_retries,
+                                "targets": retry_targets,
+                                "reason": dec.reason,
+                            })
                             self._emit(
                                 f"[orchestrator] Retry {n + 1}/{max_worker_retries} "
                                 f"for {dec.step_id} (targets={retry_targets}): {dec.reason}"
@@ -207,6 +241,11 @@ class Orchestrator:
             self._emit("[orchestrator] Interrupted by user. Collecting partial results.")
             state.done = True
 
+        self.run_ctx.event_log.append("pipeline.done", "orchestrator", {
+            "n_steps": len(state.steps),
+            "n_outputs": len(state.outputs),
+            "done": state.done,
+        })
         return state
 
     # ------------------------------------------------------------------
@@ -245,6 +284,9 @@ class Orchestrator:
                         results.append(self._future_output(future, step))
                     elif future.cancel():
                         collected.add(future)
+                        self.run_ctx.event_log.append("worker.timeout", "orchestrator", {
+                            "step_id": step.id,
+                        })
                         results.append(WorkerOutput(
                             step_id=step.id, results=[], success=False,
                             summary="worker_timeout",
@@ -281,6 +323,9 @@ class Orchestrator:
             elif future.done():
                 results.append(self._future_output(future, step))
             else:
+                self.run_ctx.event_log.append("worker.timeout", "orchestrator", {
+                    "step_id": step.id,
+                })
                 results.append(WorkerOutput(
                     step_id=step.id, results=[], success=False, summary="worker_timeout",
                 ))
@@ -296,7 +341,13 @@ class Orchestrator:
 
     def _run_single_step(self, step: Step, worker_id: int) -> WorkerOutput:
         """Instantiate and run the agent for one Step. Runs on a thread."""
-        self._emit(f"[W{worker_id}] Starting step={step.id} task='{step.task}'")
+        agent_id = f"W{worker_id}"
+        self._emit(f"[{agent_id}] Starting step={step.id} task='{step.task}'")
+        self.run_ctx.event_log.append("worker.start", agent_id, {
+            "step_id": step.id,
+            "targets": step.targets,
+            "is_retry": step.retry_context is not None,
+        })
 
         env_notes = getattr(self.executor, "detect_notes", [])
         if env_notes:
@@ -306,7 +357,10 @@ class Orchestrator:
         agent_def = self.agent_registry.get(step.worker)
         if agent_def is None:
             msg = f"Unknown agent_type '{step.worker}'"
-            self._emit(f"[W{worker_id}] Error: {msg}")
+            self._emit(f"[{agent_id}] Error: {msg}")
+            self.run_ctx.event_log.append("worker.error", agent_id, {
+                "step_id": step.id, "error": msg,
+            })
             return WorkerOutput(step_id=step.id, results=[], success=False, summary=msg)
 
         tools = self.tool_factory.build(agent_def.required_tools)
@@ -316,16 +370,29 @@ class Orchestrator:
             verbose=self.verbose,
             worker_id=worker_id,
         )
+        # Inject run-level context onto agent instance for use by future agents
+        agent.run_id = self.run_ctx.run_id
+        agent.agent_id = agent_id
+        agent.shared_store = self.run_ctx.shared_store
 
         try:
             out = agent.run(step, tools)
             self._emit(
-                f"[W{worker_id}] Done step={step.id} "
+                f"[{agent_id}] Done step={step.id} "
                 f"success={out.success} n_results={len(out.results)}"
             )
+            self.run_ctx.event_log.append("worker.complete", agent_id, {
+                "step_id": step.id,
+                "success": out.success,
+                "n_results": len(out.results),
+                "summary": out.summary,
+            })
             return out
         except Exception as exc:
-            self._emit(f"[W{worker_id}] Unhandled exception in step={step.id}: {exc}")
+            self._emit(f"[{agent_id}] Unhandled exception in step={step.id}: {exc}")
+            self.run_ctx.event_log.append("worker.error", agent_id, {
+                "step_id": step.id, "error": str(exc),
+            })
             return WorkerOutput(step_id=step.id, results=[], success=False, summary=str(exc))
 
     # ------------------------------------------------------------------

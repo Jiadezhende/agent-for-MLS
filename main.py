@@ -167,8 +167,9 @@ def main() -> None:
             exit_code = max(exit_code, 3)
 
     # --- Write outputs ----------------------------------------------------
-    output_path = Path(args.output)
-    log_path    = output_path.with_name("reasoning_log.json")
+    output_path  = Path(args.output)
+    log_path     = output_path.with_name("reasoning_log.json")
+    run_log_path = output_path.with_name("run_log.jsonl")
 
     flat_results: dict[str, int | float] = {}
     for r in all_results:
@@ -191,8 +192,12 @@ def main() -> None:
             json.dumps({"workers": worker_logs}, indent=2, default=str),
             encoding="utf-8",
         )
+        orchestrator.run_ctx.event_log.flush(run_log_path)
         if args.verbose or exit_code != 0:
-            print(f"[info] Wrote {output_path} and {log_path}", file=sys.stderr)
+            print(
+                f"[info] Wrote {output_path}, {log_path}, and {run_log_path}",
+                file=sys.stderr,
+            )
 
     except Exception as exc:
         print(f"[error] Failed to write outputs: {exc}", file=sys.stderr)

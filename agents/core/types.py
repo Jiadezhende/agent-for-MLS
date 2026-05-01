@@ -4,15 +4,26 @@ agents/core/types.py — Shared data structures for the multi-agent pipeline.
 Sections:
   1. Internal agent types (Task, Result, MemoryStore, AgentContext)
      — used by AgentLoop and recording tools.
-  2. Pipeline types (Step, WorkerOutput, CriticDecision)
+  2. Run-level context (EventLog, SharedStore, RunContext)
+     — owned by Orchestrator; not exposed to LLMs.
+  3. Pipeline types (Step, WorkerOutput, CriticDecision)
      — used by Orchestrator, Planner, Critic, and Worker agents.
 
 CircuitBreaker has moved to agents/tools/circuit_breaker.py.
+
+Event kind taxonomy for EventLog:
+  plan.start / plan.complete / plan.fallback
+  worker.start / worker.complete / worker.timeout / worker.error
+  critic.start / critic.decision
+  retry.trigger / retry.carry_forward
+  pipeline.done
 """
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -94,9 +105,13 @@ class AgentContext:
     events: list[dict] = field(default_factory=list)
     job_history: list[dict] = field(default_factory=list)
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
+    # Run-level context (optional; injected by Orchestrator for cross-agent coordination)
+    run_id: str | None = None
+    agent_id: str | None = None
+    shared_store: SharedStore | None = None
 
     def serialize(self) -> dict:
-        return {
+        data: dict = {
             "results": [r.to_dict() for r in self.results],
             "reasoning_log": self.reasoning_log,
             "events": self.events,
@@ -104,10 +119,93 @@ class AgentContext:
             "memory": self.memory.dump(),
             "circuit_breaker": self.circuit_breaker.serialize(),
         }
+        if self.run_id is not None:
+            data["run_id"] = self.run_id
+        if self.agent_id is not None:
+            data["agent_id"] = self.agent_id
+        if self.shared_store is not None:
+            data["shared_store"] = self.shared_store.dump()
+        return data
 
 
 # ===========================================================================
-# 2. Pipeline types (new — used by Orchestrator, Planner, Critic, Workers)
+# 2. Run-level context (owned by Orchestrator; not exposed to LLMs)
+# ===========================================================================
+
+class EventLog:
+    """Append-only thread-safe event log for one pipeline run.
+
+    Write via append(); read via records(); persist via flush().
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self._records: list[dict] = []
+        self._lock = threading.RLock()
+
+    def append(self, kind: str, source: str, payload: dict) -> None:
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            "kind": kind,
+            "source": source,
+            "payload": payload,
+        }
+        with self._lock:
+            self._records.append(record)
+
+    def records(self) -> list[dict]:
+        with self._lock:
+            return list(self._records)
+
+    def flush(self, path: Path) -> None:
+        records = self.records()
+        with open(path, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, default=str) + "\n")
+
+
+class SharedStore:
+    """Thread-safe cross-agent namespaced KV store.
+
+    Recommended namespaces: "metrics", "artifacts", "decisions", "facts", "candidates"
+    """
+
+    def __init__(self) -> None:
+        self._data: dict[str, dict[str, dict]] = {}
+        self._lock = threading.RLock()
+
+    def put(self, ns: str, key: str, record: dict) -> None:
+        with self._lock:
+            self._data.setdefault(ns, {})[key] = record
+
+    def get(self, ns: str, key: str) -> dict | None:
+        with self._lock:
+            return self._data.get(ns, {}).get(key)
+
+    def list_ns(self, ns: str) -> list[dict]:
+        with self._lock:
+            return list(self._data.get(ns, {}).values())
+
+    def dump(self) -> dict:
+        with self._lock:
+            return {ns: dict(vals) for ns, vals in self._data.items()}
+
+
+@dataclass
+class RunContext:
+    """Lightweight global run state owned by Orchestrator. Not exposed to LLMs."""
+    run_id: str
+    objective: str
+    shared_store: SharedStore = field(default_factory=SharedStore)
+    event_log: EventLog = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.event_log = EventLog(self.run_id)
+
+
+# ===========================================================================
+# 3. Pipeline types (new — used by Orchestrator, Planner, Critic, Workers)
 # ===========================================================================
 
 @dataclass

@@ -306,6 +306,58 @@ class ProfileWithNsysTool(Tool):
 
 
 # ---------------------------------------------------------------------------
+# profile_with_torch
+# ---------------------------------------------------------------------------
+
+class ProfileWithTorchTool(Tool):
+    def __init__(self, executor: Any) -> None:
+        super().__init__(
+            name="profile_with_torch",
+            description=(
+                "Run a Python script (typically importing torch) and capture its stdout. "
+                "Use this to measure PyTorch baseline performance, generate reference "
+                "output tensors for correctness validation, or run any Python-based "
+                "GPU workload. The script executes with cwd set to the workspace root, "
+                "so files written to relative paths (e.g. 'data/ref.npy') are placed "
+                "inside the sandbox. stdout is returned as the tool result."
+            ),
+        )
+        self._executor = executor
+
+    def get_parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="python_code",
+                type="string",
+                description=(
+                    "Complete Python source code to run. Must be standalone (no external "
+                    "file dependencies unless writing them first). Print measurements to "
+                    "stdout in a parseable format."
+                ),
+            ),
+            ToolParameter(
+                name="op_name",
+                type="string",
+                description=(
+                    "Short identifier for this script (used as filename and cache key). "
+                    "E.g. 'lora_matmul_baseline', 'correctness_oracle'."
+                ),
+            ),
+            ToolParameter(
+                name="timeout_s",
+                type="integer",
+                description="Execution timeout in seconds.",
+                required=False,
+                default=120,
+            ),
+        ]
+
+    def run(self, parameters: Dict[str, Any]) -> ToolResponse:
+        result = self._executor.profile_with_torch(**parameters)
+        return _exec_result_to_response(result, label=f"torch '{parameters.get('op_name', '')}'")
+
+
+# ---------------------------------------------------------------------------
 # probe_environment
 # ---------------------------------------------------------------------------
 

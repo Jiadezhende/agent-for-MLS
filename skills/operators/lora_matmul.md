@@ -60,13 +60,46 @@ These parameters are needed to build a roofline model and choose tile sizes.
 
 When `op_profiler` is available:
 
-Profile the PyTorch baseline `Y = W @ X + A @ (B.T @ X)` using `profile_with_nsys`
-or `profile_with_torch`:
+Profile the PyTorch baseline using `profile_with_torch`. Required output format:
 
-- Measure latency (ms) for d ∈ {3584, 4096, 4608}
-- Measure achieved DRAM bandwidth utilization (% of peak)
-- Measure SM occupancy (% of SMs active)
-- Use at least 5 warm-up runs, then median of 20 timed runs
+```
+shape=3584 torch_ms=<median>
+shape=4096 torch_ms=<median>
+shape=4608 torch_ms=<median>
+```
+
+Template Python script for `profile_with_torch`:
+
+```python
+import torch, statistics
+
+device = torch.device("cuda")
+shapes = [3584, 4096, 4608]
+r = 16
+
+for d in shapes:
+    W = torch.randn(d, d, device=device, dtype=torch.float32)
+    X = torch.randn(d, d, device=device, dtype=torch.float32)
+    A = torch.randn(d, r, device=device, dtype=torch.float32)
+    B = torch.randn(d, r, device=device, dtype=torch.float32)
+    # warm-up
+    for _ in range(10):
+        _ = W @ X + A @ (B.T @ X)
+    torch.cuda.synchronize()
+    # timed runs
+    times = []
+    for _ in range(50):
+        start = torch.cuda.Event(enable_timing=True)
+        end   = torch.cuda.Event(enable_timing=True)
+        start.record()
+        Y = W @ X + A @ (B.T @ X)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    print(f"shape={d} torch_ms={statistics.median(times):.4f}", flush=True)
+```
+
+Record as `torch_baseline_ms_d<d>` (unit: "ms") for each shape.
 
 ## Bottleneck Analysis (bottleneck_analyst)
 

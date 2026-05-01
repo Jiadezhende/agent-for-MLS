@@ -159,6 +159,7 @@ class ToolFactory:
         from agents.tools.executor_tools import (
             ProfileWithNcuTool,
             ProfileWithNsysTool,
+            ProfileWithTorchTool,
             ProbeEnvironmentTool,
             RunCudaProbeTool,
         )
@@ -169,6 +170,7 @@ class ToolFactory:
             "run_cuda_probe":     RunCudaProbeTool(self._executor),
             "profile_with_ncu":   ProfileWithNcuTool(self._executor),
             "profile_with_nsys":  ProfileWithNsysTool(self._executor),
+            "profile_with_torch": ProfileWithTorchTool(self._executor),
             "probe_environment":  ProbeEnvironmentTool(self._executor),
             "record_measurement": RecordMeasurementTool(),
             "flag_event":         FlagEventTool(),

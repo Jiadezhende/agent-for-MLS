@@ -409,6 +409,65 @@ def _execute_nsys(
     return result
 
 
+def _execute_torch(
+    spec: JobSpec,
+    workspace: _Workspace,
+    cfg: ExecutorConfig,
+) -> dict:
+    """Run a Python script (typically using torch) and return its stdout."""
+    p = spec.payload
+    python_code: str = p["python_code"]
+    op_name: str = p.get("op_name", spec.name).replace(" ", "_")
+    timeout_s: int = p.get("timeout_s", cfg.default_run_timeout_s)
+
+    script_path = workspace.write(f"src/{op_name}.py", python_code)
+    python = _check_binary(cfg, cfg.python_bin)
+
+    sub = _run_subprocess(
+        [python, str(script_path)],
+        timeout_s=timeout_s,
+        cwd=workspace.root,
+        truncate_bytes=None,
+    )
+
+    if sub.returncode != 0 or sub.timed_out:
+        if sub.timed_out:
+            raise ExecutorError(
+                "timeout",
+                error_class="timeout",
+                phase="run",
+                hint="Script timed out. Reduce iterations or number of shapes tested.",
+                returncode=sub.returncode,
+                timed_out=True,
+                stderr=sub.stderr[-2000:] if sub.stderr else "",
+                stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
+            )
+        error_class = "infrastructure" if sub.returncode == 127 else "user_code"
+        hint = (
+            "Python binary not found. Set AGENT_PYTHON_BIN env var."
+            if error_class == "infrastructure"
+            else "Script raised an exception. Check stderr for the traceback and fix the script."
+        )
+        raise ExecutorError(
+            "torch_script_failed",
+            error_class=error_class,
+            phase="run",
+            hint=hint,
+            returncode=sub.returncode,
+            timed_out=False,
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+            stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
+        )
+
+    reduced = _reduce_probe_output(sub.stdout)
+    reduced.update({
+        "stderr": sub.stderr[-500:] if sub.stderr else "",
+        "returncode": sub.returncode,
+        "timed_out": sub.timed_out,
+    })
+    return reduced
+
+
 # ===========================================================================
 # 9. Environment auto-detection
 # ===========================================================================
@@ -906,3 +965,25 @@ class Executor:
             },
         )
         return self._run_job(spec, _execute_nsys)
+
+    def profile_with_torch(
+        self,
+        python_code: str,
+        op_name: str,
+        timeout_s: int = 120,
+    ) -> dict:
+        """Run a Python script (with torch) and capture stdout for baseline measurement.
+
+        The script runs with cwd=workspace root, so files written to relative paths
+        (e.g. 'data/ref.npy') are placed inside the workspace sandbox.
+        """
+        spec = JobSpec(
+            backend="torch",
+            name=op_name,
+            payload={
+                "python_code": python_code,
+                "op_name": op_name,
+                "timeout_s": timeout_s,
+            },
+        )
+        return self._run_job(spec, _execute_torch)

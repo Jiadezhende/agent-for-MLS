@@ -1,19 +1,21 @@
 """
-orchestrator.py — Top-level coordinator for the multi-agent pipeline.
+orchestrator.py — State machine driver for the multi-agent optimization pipeline.
 
 State machine:
-  Phase 1  Planner     → list[Step]
-  Phase 2+ Execute loop → workers run pending Steps in parallel
-                        → Critic reviews outputs → accept / retry
-                        → repeat until all steps accepted or retries exhausted
+  planning / revising  → PlannerAgent (ReAct loop, calls subagent tools)
+  ready_for_critic     → CriticAgent (reviews collected outputs)
+  accepted             → done
+  failed               → done (partial results)
+
+Replaces the old fixed Planner → ThreadPoolExecutor → Critic pipeline.
 """
 from __future__ import annotations
 
 import sys
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from agents._registry import all_definitions
@@ -21,29 +23,74 @@ from agents.agents.critic_agent import CriticAgent
 from agents.agents.planner_agent import PlannerAgent
 from agents.core.llm import LLMClient
 from agents.core.types import (
+    AgentContext,
     CriticDecision,
     RunContext,
-    Step,
     WorkerOutput,
 )
-from agents.tools.registry import ToolFactory
 
+
+# ---------------------------------------------------------------------------
+# Task-level Critic prompt template (operator skill content embedded at runtime)
+# ---------------------------------------------------------------------------
+
+_TASK_CRITIC_PROMPT_TEMPLATE = """\
+You are a GPU kernel optimization auditor.
+
+## Target Operator Specification
+{skill_content}
+
+## Your Job
+Review the coordinator's submitted work against the "Success Criteria" section above.
+
+For each step in the output:
+  1. Coverage check (MANDATORY — check first):
+     Are ALL success criteria items present in the output?
+     Any missing item → decision="retry", failing_targets = list of missing criterion names.
+
+  2. Quality check (only if coverage is complete):
+     - Is the bottleneck diagnosis consistent with the measured hardware parameters?
+     - Is the optimization strategy targeting the actual bottleneck?
+     - Are performance numbers plausible (check for suspiciously large speedups)?
+     - Is correctness verification rigorous (≥ 3 distinct input sizes)?
+
+decision="accept"  — ALL criteria met and quality is sound.
+decision="retry"   — any criterion missing, OR strategy contradicts measured hardware.
+
+Call audit_results exactly once with your findings.
+"""
+
+_TASK_CRITIC_PROMPT_NO_SKILL = """\
+You are a GPU kernel optimization auditor.
+
+Review all worker outputs for completeness and physical plausibility:
+  1. Coverage check: are all requested targets measured? Missing targets → retry.
+  2. Quality check: are measured values physically plausible?
+
+Call audit_results exactly once with your findings.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Execution state
+# ---------------------------------------------------------------------------
 
 @dataclass
 class _ExecutionState:
-    steps: list[Step] = field(default_factory=list)
-    outputs: dict[str, WorkerOutput] = field(default_factory=dict)
-    history: dict[str, list[WorkerOutput]] = field(default_factory=dict)  # step_id → all attempts
-    retry_set: set[str] = field(default_factory=set)
-    carry_forward: dict[str, list[dict]] = field(default_factory=dict)  # step_id → accepted results
-    done: bool = False
+    planner_ctx: AgentContext | None = None
+    accepted: bool = False
+    phase: str = "planning"
 
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 class Orchestrator:
-    """Drives Planner → Worker pool (with Critic retry loop) → done.
+    """Drives the PlannerAgent (ReAct loop) ↔ CriticAgent state machine.
 
     The Orchestrator is pure-code scheduling — no LLM calls of its own.
-    LLM reasoning happens inside Planner, Worker agents, and Critic.
+    LLM reasoning happens inside PlannerAgent (coordinator) and CriticAgent.
     """
 
     def __init__(
@@ -63,9 +110,14 @@ class Orchestrator:
         self.verbose = verbose
         self._print_lock = threading.Lock()
 
-        self.tool_factory = ToolFactory(executor)
-        self.planner = PlannerAgent(llm, self.agent_registry, verbose)
-        self.critic  = CriticAgent(llm, self.agent_registry, verbose)
+        self.planner = PlannerAgent(
+            llm=llm,
+            agent_registry=self.agent_registry,
+            executor=executor,
+            agent_cfg=agent_cfg,
+            verbose=verbose,
+        )
+        self.critic = CriticAgent(llm, self.agent_registry, verbose)
         self.run_ctx = RunContext(
             run_id=str(uuid.uuid4()),
             objective=task.description,
@@ -76,81 +128,59 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def run(self) -> _ExecutionState:
-        """Execute the full multi-agent pipeline.
+        """Execute the full optimization pipeline.
 
-        Returns the final _ExecutionState (steps + outputs).
+        Returns the final _ExecutionState (planner_ctx with job_history).
         """
-        targets = self.task.payload.get("targets", [])
+        spec = self.task.payload
         state = _ExecutionState()
-
-        # Phase 1: Planner
-        self._trace("plan", "input", {"targets": targets})
-        self.run_ctx.event_log.append("plan.start", "planner", {"targets": targets})
-        plan: list[Step] = self.planner.run(targets)
-        state.steps = plan
-        self._trace("plan", "output", {"steps": [
-            {"id": s.id, "task": s.task, "worker": s.worker} for s in plan
-        ]})
-        self.run_ctx.event_log.append("plan.complete", "planner", {
-            "n_steps": len(plan),
-            "steps": [{"id": s.id, "worker": s.worker, "targets": s.targets} for s in plan],
-        })
-
-        max_worker_retries: int = self.agent_cfg.max_worker_retries
         max_critic_cycles: int = self.agent_cfg.max_critic_cycles
         retry_counts: dict[str, int] = {}
-        timeout_s: float = self.agent_cfg.worker_timeout_s
+        critic_feedback: dict | None = None
 
-        # Phase 2+: Bounded execute loop with critic feedback
+        # Build the task-level Critic prompt (reads operator skill if available)
+        critic_prompt = self._build_critic_prompt(spec)
+
+        self.run_ctx.event_log.append("plan.start", "orchestrator", {"spec": spec})
+
         try:
-            for _cycle in range(max_critic_cycles):
-                pending = [
-                    s for s in state.steps
-                    if s.id not in state.outputs
-                    or s.id in state.retry_set
-                ]
+            for cycle in range(max_critic_cycles):
+                # --- Planner phase ---
+                self._emit(
+                    f"[orchestrator] Cycle {cycle + 1}/{max_critic_cycles} "
+                    f"phase={state.phase}"
+                )
+                planner_ctx = self._run_planner_loop(spec, critic_feedback)
+                state.planner_ctx = planner_ctx
+                state.phase = "ready_for_critic"
 
-                if not pending:
-                    state.done = True
+                n_subagent_calls = len(planner_ctx.job_history)
+                self.run_ctx.event_log.append("plan.complete", "planner", {
+                    "n_subagent_calls": n_subagent_calls,
+                    "cycle": cycle,
+                })
+                self._emit(
+                    f"[orchestrator] Planner done: {n_subagent_calls} subagent call(s). "
+                    "Running Critic."
+                )
+
+                # --- Critic phase ---
+                worker_outputs = self._collect_outputs(planner_ctx)
+                if not worker_outputs:
+                    self._emit("[orchestrator] No subagent outputs to review; accepting.")
+                    state.accepted = True
+                    state.phase = "accepted"
                     break
 
-                self._trace("workers", "start", {"pending": [s.id for s in pending]})
-                outputs = self._run_workers(pending, timeout_s)
-                for out in outputs:
-                    # Merge carried-forward accepted results with new measurements
-                    if out.step_id in state.carry_forward:
-                        carried = state.carry_forward.pop(out.step_id)
-                        new_metrics = {r.get("metric") for r in out.results}
-                        merged = [r for r in carried if r.get("metric") not in new_metrics] + out.results
-                        out = WorkerOutput(
-                            step_id=out.step_id,
-                            results=merged,
-                            success=out.success,
-                            reasoning_log=out.reasoning_log,
-                            events=out.events,
-                            summary=out.summary,
-                        )
-                    state.outputs[out.step_id] = out
-                    state.history.setdefault(out.step_id, []).append(out)
-                    state.retry_set.discard(out.step_id)
-                self._trace("workers", "output", {
-                    sid: {"success": out.success, "n_results": len(out.results)}
-                    for sid, out in state.outputs.items()
-                })
-
-                # Critic reviews current outputs
-                self._trace("critic", "start", {})
                 self.run_ctx.event_log.append("critic.start", "critic", {
-                    "n_outputs": len(state.outputs),
+                    "n_outputs": len(worker_outputs),
+                    "cycle": cycle,
                 })
-                decisions: list[CriticDecision] = self.critic.run(state.outputs, retry_counts)
-                self._trace("critic", "output", {
-                    "decisions": [
-                        {"step_id": d.step_id, "decision": d.decision,
-                         "confidence": d.confidence, "reason": d.reason}
-                        for d in decisions
-                    ]
-                })
+                decisions: list[CriticDecision] = self.critic.run(
+                    worker_outputs,
+                    retry_counts,
+                    system_prompt_override=critic_prompt,
+                )
                 for dec in decisions:
                     self.run_ctx.event_log.append("critic.decision", "critic", {
                         "step_id": dec.step_id,
@@ -159,253 +189,132 @@ class Orchestrator:
                         "reason": dec.reason,
                         "failing_targets": dec.failing_targets,
                     })
-
-                # Apply decisions: mark retries or accept
-                for dec in decisions:
-                    if dec.step_id not in state.outputs:
-                        continue
+                    # Track retry counts per step
                     if dec.decision == "retry":
-                        n = retry_counts.get(dec.step_id, 0)
-                        if n < max_worker_retries:
-                            original_step = next(s for s in state.steps if s.id == dec.step_id)
-                            prev_output = state.outputs[dec.step_id]
+                        retry_counts[dec.step_id] = retry_counts.get(dec.step_id, 0) + 1
 
-                            # Narrow to only the failing targets if Critic specified them
-                            retry_targets = (
-                                [t for t in dec.failing_targets if t in original_step.targets]
-                                if dec.failing_targets else original_step.targets
-                            ) or original_step.targets
+                self._emit(
+                    f"[orchestrator] Critic decisions: "
+                    + ", ".join(f"{d.step_id}={d.decision}" for d in decisions)
+                )
 
-                            # Extract previous bad values for the failing targets
-                            prev_bad: dict = {}
-                            for r in prev_output.results:
-                                if r.get("metric") in retry_targets:
-                                    prev_bad[r["metric"]] = {
-                                        "value": r.get("value"),
-                                        "unit": r.get("unit"),
-                                        "method": r.get("method"),
-                                    }
+                failing = [d for d in decisions if d.decision == "retry"]
+                if not failing:
+                    state.accepted = True
+                    state.phase = "accepted"
+                    self._emit("[orchestrator] All accepted.")
+                    break
 
-                            # Carry forward accepted results (targets NOT being retried)
-                            retry_target_set = set(retry_targets)
-                            accepted_results = [
-                                r for r in prev_output.results
-                                if r.get("metric") not in retry_target_set
-                            ]
-                            if accepted_results:
-                                state.carry_forward[dec.step_id] = accepted_results
-                                self.run_ctx.event_log.append("retry.carry_forward", "orchestrator", {
-                                    "step_id": dec.step_id,
-                                    "n_carried": len(accepted_results),
-                                    "metrics": [r.get("metric") for r in accepted_results],
-                                })
-
-                            # Replace step with narrowed retry step
-                            retry_step = Step(
-                                id=dec.step_id,
-                                worker=original_step.worker,
-                                targets=retry_targets,
-                                task=", ".join(retry_targets),
-                                retry_context={
-                                    "reason": dec.reason,
-                                    "previous_bad_values": prev_bad,
-                                },
-                            )
-                            state.steps = [retry_step if s.id == dec.step_id else s for s in state.steps]
-
-                            state.retry_set.add(dec.step_id)
-                            retry_counts[dec.step_id] = n + 1
-                            self.run_ctx.event_log.append("retry.trigger", "orchestrator", {
-                                "step_id": dec.step_id,
-                                "retry_n": n + 1,
-                                "max_retries": max_worker_retries,
-                                "targets": retry_targets,
-                                "reason": dec.reason,
-                            })
-                            self._emit(
-                                f"[orchestrator] Retry {n + 1}/{max_worker_retries} "
-                                f"for {dec.step_id} (targets={retry_targets}): {dec.reason}"
-                            )
-                        else:
-                            self._emit(
-                                f"[orchestrator] Max retries reached for {dec.step_id}; accepting."
-                            )
+                # --- Revising phase ---
+                critic_feedback = self._build_feedback(failing, worker_outputs)
+                state.phase = "revising"
+                self._emit(
+                    f"[orchestrator] Retry requested for: "
+                    f"{critic_feedback.get('failing_targets')}. Re-entering Planner."
+                )
+                self.run_ctx.event_log.append("retry.trigger", "orchestrator", {
+                    "cycle": cycle,
+                    "failing_targets": critic_feedback.get("failing_targets"),
+                    "reason": critic_feedback.get("reason"),
+                })
             else:
                 self._emit(
                     f"[orchestrator] Hard limit of {max_critic_cycles} critic cycles reached; "
-                    "terminating with current results."
+                    "accepting current results."
                 )
-                state.done = True
+                state.accepted = True
+                state.phase = "accepted"
 
         except KeyboardInterrupt:
             self._emit("[orchestrator] Interrupted by user. Collecting partial results.")
-            state.done = True
+            state.phase = "failed"
 
         self.run_ctx.event_log.append("pipeline.done", "orchestrator", {
-            "n_steps": len(state.steps),
-            "n_outputs": len(state.outputs),
-            "done": state.done,
+            "phase": state.phase,
+            "accepted": state.accepted,
+            "n_subagent_calls": len(state.planner_ctx.job_history) if state.planner_ctx else 0,
         })
         return state
 
     # ------------------------------------------------------------------
-    # Worker pool
+    # Planner delegation
     # ------------------------------------------------------------------
 
-    def _run_workers(self, steps: list[Step], timeout_s: float) -> list[WorkerOutput]:
-        max_threads = min(len(steps), 8)
-        future_to_step: dict = {}
-        results: list[WorkerOutput] = []
-        collected: set = set()
-        interrupted = False
+    def _run_planner_loop(
+        self, spec: dict, critic_feedback: dict | None
+    ) -> AgentContext:
+        """Run the PlannerAgent ReAct loop and return its AgentContext."""
+        self.planner.run_id = self.run_ctx.run_id
+        self.planner.agent_id = "planner"
+        self.planner.shared_store = self.run_ctx.shared_store
 
-        pool = ThreadPoolExecutor(max_workers=max_threads)
-        try:
-            for i, step in enumerate(steps):
-                future = pool.submit(self._run_single_step, step, i)
-                future_to_step[future] = step
+        ctx = self.planner.run(spec, critic_feedback)
 
-            try:
-                for future in as_completed(future_to_step, timeout=timeout_s):
-                    step = future_to_step[future]
-                    collected.add(future)
-                    results.append(self._future_output(future, step))
-
-            except FuturesTimeout:
-                self._emit(
-                    "[orchestrator] Worker pool timed out. "
-                    "Waiting for running workers to finish."
-                )
-                for future, step in future_to_step.items():
-                    if future in collected:
-                        continue
-                    if future.done():
-                        collected.add(future)
-                        results.append(self._future_output(future, step))
-                    elif future.cancel():
-                        collected.add(future)
-                        self.run_ctx.event_log.append("worker.timeout", "orchestrator", {
-                            "step_id": step.id,
-                        })
-                        results.append(WorkerOutput(
-                            step_id=step.id, results=[], success=False,
-                            summary="worker_timeout",
-                        ))
-
-        except KeyboardInterrupt:
-            interrupted = True
-            self._emit("[orchestrator] Interrupted — cancelling pending workers.")
-            for future, step in future_to_step.items():
-                if future.cancel():
-                    results.append(WorkerOutput(
-                        step_id=step.id, results=[], success=False,
-                        summary="cancelled",
-                    ))
-                elif future.done():
-                    results.append(self._future_output(future, step))
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            if not interrupted:
-                pool.shutdown(wait=True)
-
-        # Running threads cannot be forcibly cancelled. After the soft timeout,
-        # shutdown(wait=True) lets already-started workers finish so their real
-        # outputs are not replaced by stale timeout placeholders.
-        for future, step in future_to_step.items():
-            if future in collected:
-                continue
-            collected.add(future)
-            if future.cancelled():
-                results.append(WorkerOutput(
-                    step_id=step.id, results=[], success=False, summary="worker_timeout",
-                ))
-            elif future.done():
-                results.append(self._future_output(future, step))
-            else:
-                self.run_ctx.event_log.append("worker.timeout", "orchestrator", {
-                    "step_id": step.id,
-                })
-                results.append(WorkerOutput(
-                    step_id=step.id, results=[], success=False, summary="worker_timeout",
-                ))
-
-        return results
-
-    def _future_output(self, future: Any, step: Step) -> WorkerOutput:
-        try:
-            return future.result()
-        except Exception as exc:
-            self._emit(f"[orchestrator] Step {step.id} raised: {exc}")
-            return WorkerOutput(step_id=step.id, results=[], success=False)
-
-    def _run_single_step(self, step: Step, worker_id: int) -> WorkerOutput:
-        """Instantiate and run the agent for one Step. Runs on a thread."""
-        agent_id = f"W{worker_id}"
-        self._emit(f"[{agent_id}] Starting step={step.id} task='{step.task}'")
-        self.run_ctx.event_log.append("worker.start", agent_id, {
-            "step_id": step.id,
-            "targets": step.targets,
-            "is_retry": step.retry_context is not None,
-        })
-
-        env_notes = getattr(self.executor, "detect_notes", [])
-        if env_notes:
-            from dataclasses import replace as _dc_replace
-            step = _dc_replace(step, hints=list(step.hints) + [f"[env] {n}" for n in env_notes])
-
-        agent_def = self.agent_registry.get(step.worker)
-        if agent_def is None:
-            msg = f"Unknown agent_type '{step.worker}'"
-            self._emit(f"[{agent_id}] Error: {msg}")
-            self.run_ctx.event_log.append("worker.error", agent_id, {
-                "step_id": step.id, "error": msg,
-            })
-            return WorkerOutput(step_id=step.id, results=[], success=False, summary=msg)
-
-        tools = self.tool_factory.build(agent_def.required_tools)
-        agent = agent_def.agent_class(
-            llm=self.llm,
-            agent_cfg=self.agent_cfg,
-            verbose=self.verbose,
-            worker_id=worker_id,
-        )
-        # Inject run-level context onto agent instance for use by future agents
-        agent.run_id = self.run_ctx.run_id
-        agent.agent_id = agent_id
-        agent.shared_store = self.run_ctx.shared_store
-
-        try:
-            out = agent.run(step, tools)
-            self._emit(
-                f"[{agent_id}] Done step={step.id} "
-                f"success={out.success} n_results={len(out.results)}"
-            )
-            self.run_ctx.event_log.append("worker.complete", agent_id, {
-                "step_id": step.id,
-                "success": out.success,
-                "n_results": len(out.results),
-                "summary": out.summary,
-            })
-            return out
-        except Exception as exc:
-            self._emit(f"[{agent_id}] Unhandled exception in step={step.id}: {exc}")
-            self.run_ctx.event_log.append("worker.error", agent_id, {
-                "step_id": step.id, "error": str(exc),
-            })
-            return WorkerOutput(step_id=step.id, results=[], success=False, summary=str(exc))
-
-    # ------------------------------------------------------------------
-    # Trace logging
-    # ------------------------------------------------------------------
-
-    def _trace(self, agent: str, phase: str, data: dict) -> None:
-        """Structured trace log: one line per agent / phase transition."""
         if self.verbose:
-            import json as _json
-            line = f"[orchestrator] [{agent}] {phase}: {_json.dumps(data, default=str)}"
-            with self._print_lock:
-                print(line, file=sys.stderr, flush=True)
+            summary = ctx.memory.get("run", "summary") or ""
+            self._emit(
+                f"[orchestrator] Planner summary: {summary[:120]}"
+                f"{'...' if len(summary) > 120 else ''}"
+            )
+        return ctx
+
+    # ------------------------------------------------------------------
+    # Output collection for Critic
+    # ------------------------------------------------------------------
+
+    def _collect_outputs(self, planner_ctx: AgentContext) -> dict[str, WorkerOutput]:
+        """Build dict[step_id → WorkerOutput] from Planner's job_history."""
+        return {out.step_id: out for out in planner_ctx.job_history}
+
+    # ------------------------------------------------------------------
+    # Feedback for REVISING phase
+    # ------------------------------------------------------------------
+
+    def _build_feedback(
+        self, failing_decisions: list[CriticDecision], worker_outputs: dict[str, WorkerOutput]
+    ) -> dict:
+        """Build critic_feedback dict to pass to Planner in revising mode."""
+        all_failing: list[str] = []
+        reasons: list[str] = []
+        for dec in failing_decisions:
+            if dec.failing_targets:
+                all_failing.extend(dec.failing_targets)
+            else:
+                # No specific targets listed → flag the whole step's targets
+                out = worker_outputs.get(dec.step_id)
+                if out:
+                    all_failing.extend(out.targets_requested)
+            if dec.reason:
+                reasons.append(dec.reason)
+        return {
+            "failing_targets": list(dict.fromkeys(all_failing)) or ["all"],
+            "reason": " | ".join(reasons),
+        }
+
+    # ------------------------------------------------------------------
+    # Critic prompt construction
+    # ------------------------------------------------------------------
+
+    def _build_critic_prompt(self, spec: dict) -> str:
+        """Build task-level Critic prompt, embedding operator skill if available."""
+        operator = spec.get("operator")
+        if not operator:
+            return _TASK_CRITIC_PROMPT_NO_SKILL
+
+        skill_path = Path("skills/operators") / f"{operator}.md"
+        if not skill_path.exists():
+            self._emit(
+                f"[orchestrator] Operator skill not found: {skill_path}; "
+                "using generic Critic prompt."
+            )
+            return _TASK_CRITIC_PROMPT_NO_SKILL
+
+        skill_content = skill_path.read_text(encoding="utf-8")
+        return _TASK_CRITIC_PROMPT_TEMPLATE.format(skill_content=skill_content)
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
 
     def _emit(self, msg: str) -> None:
         if self.verbose:

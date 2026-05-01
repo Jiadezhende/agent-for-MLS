@@ -16,6 +16,62 @@ from agents.core.llm import LLMClient
 from agents.core.types import CriticDecision, WorkerOutput
 
 
+# Shared audit tool schema used by all agent types and task-level evaluation.
+# The audit_results format (decisions array with step_id/decision/confidence/reason/
+# failing_targets) is identical regardless of which agent type produced the outputs.
+AUDIT_TOOL_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "audit_results",
+        "description": "Return per-step accept/retry decisions for all worker outputs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "description": "One decision per step_id.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": {
+                                "type": "string",
+                                "description": "The step_id from the worker output.",
+                            },
+                            "decision": {
+                                "type": "string",
+                                "enum": ["accept", "retry"],
+                                "description": "'accept' if results are valid; 'retry' if suspicious.",
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                                "description": "Your confidence in the measurement quality (0–1).",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "1–2 sentences explaining the decision.",
+                            },
+                            "failing_targets": {
+                                "type": "array",
+                                "description": (
+                                    "Names of targets that need re-measurement "
+                                    "(subset of the step's targets). "
+                                    "Leave empty only if ALL targets need retry."
+                                ),
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["step_id", "decision", "confidence", "reason", "failing_targets"],
+                    },
+                },
+            },
+            "required": ["decisions"],
+        },
+    },
+}
+
+
 class CriticAgent(Agent):
     """Wraps per-type critic LLM calls as a standard agent with a run() interface.
 
@@ -38,11 +94,16 @@ class CriticAgent(Agent):
         self,
         outputs: dict[str, WorkerOutput],
         retry_counts: dict[str, int] | None = None,
+        system_prompt_override: str | None = None,
+        critic_tool_schema_override: dict | None = None,
     ) -> list[CriticDecision]:
         """Cross-validate all worker outputs.
 
-        outputs:      step_id → WorkerOutput
-        retry_counts: step_id → number of retries already performed (0 = first attempt)
+        outputs:                  step_id → WorkerOutput
+        retry_counts:             step_id → retries already performed (0 = first attempt)
+        system_prompt_override:   if set, use this prompt instead of per-agent-type prompts
+                                  (used by Orchestrator for task-level evaluation)
+        critic_tool_schema_override: if set, use this tool schema for all types
         Returns list[CriticDecision] with one decision per step.
         """
         if not outputs:
@@ -50,8 +111,20 @@ class CriticAgent(Agent):
 
         counts = retry_counts or {}
         all_decisions: list[CriticDecision] = []
-        by_type = self._group_by_type(outputs)
 
+        if system_prompt_override is not None:
+            # Task-level evaluation: one call for all outputs using the provided prompt
+            schema = critic_tool_schema_override or AUDIT_TOOL_SCHEMA
+            decisions = self._critique_one_type(
+                agent_type="task",
+                outputs=outputs,
+                retry_counts=counts,
+                critic_system_prompt=system_prompt_override,
+                critic_tool_schema=schema,
+            )
+            return decisions
+
+        by_type = self._group_by_type(outputs)
         for agent_type, typed_outputs in by_type.items():
             defn = self.agent_registry.get(agent_type)
             if defn is None:
@@ -65,7 +138,7 @@ class CriticAgent(Agent):
                 outputs=typed_outputs,
                 retry_counts=counts,
                 critic_system_prompt=defn.critic_system_prompt,
-                critic_tool_schema=defn.critic_tool_schema,
+                critic_tool_schema=AUDIT_TOOL_SCHEMA,
             )
             all_decisions.extend(decisions)
 
@@ -74,10 +147,10 @@ class CriticAgent(Agent):
     def _group_by_type(
         self, outputs: dict[str, WorkerOutput]
     ) -> dict[str, dict[str, WorkerOutput]]:
-        default_type = next(iter(self.agent_registry), "hardware_probe")
+        fallback = next(iter(self.agent_registry), "hardware_probe")
         grouped: dict[str, dict[str, WorkerOutput]] = defaultdict(dict)
         for step_id, out in outputs.items():
-            grouped[default_type][step_id] = out
+            grouped[out.agent_type or fallback][step_id] = out
         return dict(grouped)
 
     def _critique_one_type(
@@ -105,13 +178,18 @@ class CriticAgent(Agent):
         )
         tool_name = critic_tool_schema.get("function", {}).get("name", "audit_results")
         step_ids = list(outputs.keys())
+        # Skip targets coverage check in pipeline-level (system_prompt_override) mode.
+        # When agent_type == "task", the system prompt's Success Criteria guide evaluation.
+        coverage_instruction = "" if agent_type == "task" else (
+            "IMPORTANT: For each step, compare 'targets_requested' against "
+            "'targets_measured'. Any target present in 'targets_requested' but "
+            "absent from 'targets_measured' is MISSING and requires retry.\n\n"
+        )
         user_msg = (
             f"Review these {agent_type} worker outputs:\n\n"
             f"```json\n{results_json}\n```\n\n"
             f"Step IDs to evaluate: {step_ids}\n\n"
-            f"IMPORTANT: For each step, compare 'targets_requested' against "
-            f"'targets_measured'. Any target present in 'targets_requested' but "
-            f"absent from 'targets_measured' is MISSING and requires retry.\n\n"
+            f"{coverage_instruction}"
             f"Call {tool_name} with your decisions for each step_id."
         )
         messages = [

@@ -126,31 +126,18 @@ def main() -> None:
     all_results: list[dict] = []
     worker_logs: list[dict] = []
 
-    if state is not None:
+    if state is not None and state.planner_ctx is not None:
         raw_results: list[dict] = []
-        for step in state.steps:
-            out = state.outputs.get(step.id)
-            if out is None:
-                continue
-            raw_results.extend(out.results)
-            attempts = state.history.get(step.id, [out])
+        for entry in state.planner_ctx.job_history:
+            raw_results.extend(entry.results)
             worker_logs.append({
-                "step_id":      step.id,
-                "task":         step.task,
-                "worker":       step.worker,
-                "success":      out.success,
-                "n_results":    len(out.results),
-                "summary":      out.summary,
-                "attempts": [
-                    {
-                        "reasoning_log": a.reasoning_log,
-                        "events":        a.events,
-                        "n_results":     len(a.results),
-                        "success":       a.success,
-                        "summary":       a.summary,
-                    }
-                    for a in attempts
-                ],
+                "step_id":       entry.step_id,
+                "agent_type":    entry.agent_type,
+                "success":       entry.success,
+                "n_results":     len(entry.results),
+                "summary":       entry.summary,
+                "reasoning_log": entry.reasoning_log,
+                "events":        entry.events,
             })
 
         # Deduplicate by metric: keep the entry with the highest confidence
@@ -161,9 +148,7 @@ def main() -> None:
                 seen[metric] = r
         all_results = list(seen.values())
 
-        failed_steps = [s.id for s in state.steps if not state.outputs.get(s.id, None) or
-                        not state.outputs[s.id].success]
-        if failed_steps:
+        if not state.accepted:
             exit_code = max(exit_code, 3)
 
     # --- Write outputs ----------------------------------------------------

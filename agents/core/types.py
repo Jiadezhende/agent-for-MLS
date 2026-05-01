@@ -103,19 +103,21 @@ class AgentContext:
     artifacts: dict[str, Path] = field(default_factory=dict)
     reasoning_log: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
-    job_history: list[dict] = field(default_factory=list)
+    job_history: list["WorkerOutput"] = field(default_factory=list)
     circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     # Run-level context (optional; injected by Orchestrator for cross-agent coordination)
     run_id: str | None = None
     agent_id: str | None = None
     shared_store: SharedStore | None = None
+    # Full conversation history written by AgentLoop; empty until loop starts.
+    messages: list[dict] = field(default_factory=list)
 
-    def serialize(self) -> dict:
+    def serialize(self, include_messages: bool = False) -> dict:
         data: dict = {
             "results": [r.to_dict() for r in self.results],
             "reasoning_log": self.reasoning_log,
             "events": self.events,
-            "job_history": self.job_history,
+            "job_history": [e.to_dict() for e in self.job_history],
             "memory": self.memory.dump(),
             "circuit_breaker": self.circuit_breaker.serialize(),
         }
@@ -125,6 +127,8 @@ class AgentContext:
             data["agent_id"] = self.agent_id
         if self.shared_store is not None:
             data["shared_store"] = self.shared_store.dump()
+        if include_messages:
+            data["messages"] = self.messages
         return data
 
 
@@ -213,9 +217,9 @@ class Step:
     """One unit of work produced by the Planner for one worker agent."""
     id: str
     worker: str                              # agent_type key in the registry
-    targets: list[str] = field(default_factory=list)  # target names assigned to this worker
+    targets: list[str] = field(default_factory=list)  # metric names (measurement agents) or [] (analysis agents)
     task: str = ""                           # auto-generated log label, not sent to Worker LLM
-    hints: list[str] = field(default_factory=list)    # environment/routing hints injected by orchestrator
+    instructions: str = ""                   # Planner-authored task description + upstream context → worker initial prompt
     retry_context: dict | None = None        # set on retry steps; contains reason + previous bad values
 
 
@@ -225,10 +229,23 @@ class WorkerOutput:
     step_id: str
     results: list[dict]     # list of Result.to_dict() entries
     success: bool
+    agent_type: str = ""    # filled by _execute_one(); used by _group_by_type()
     targets_requested: list[str] = field(default_factory=list)  # Step.targets forwarded for Critic coverage check
     reasoning_log: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
     summary: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "step_id": self.step_id,
+            "agent_type": self.agent_type,
+            "results": self.results,
+            "success": self.success,
+            "targets_requested": self.targets_requested,
+            "reasoning_log": self.reasoning_log,
+            "events": self.events,
+            "summary": self.summary,
+        }
 
 
 @dataclass

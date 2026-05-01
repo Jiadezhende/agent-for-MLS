@@ -10,6 +10,7 @@ import uuid
 import pytest
 
 from agents._registry import AgentDefinition
+from agents.core.agent import SubAgent
 from agents.core.config import AgentConfig
 from agents.core.types import AgentContext, MemoryStore, Step, Task, WorkerOutput
 from agents.tools.builtin.subagent import MarkReadyForCriticTool, RunSubagentParallelTool, RunSubagentTool
@@ -35,11 +36,10 @@ def _make_agent_def(agent_class) -> AgentDefinition:
         agent_class=agent_class,
         required_tools=[],
         critic_system_prompt="",
-        critic_tool_schema={},
     )
 
 
-class _FakeSuccessAgent:
+class _FakeSuccessAgent(SubAgent):
     """Stub worker agent: returns a WorkerOutput with one result."""
     def __init__(self, llm, agent_cfg, verbose=False):
         pass
@@ -55,7 +55,7 @@ class _FakeSuccessAgent:
         )
 
 
-class _FakeFailAgent:
+class _FakeFailAgent(SubAgent):
     """Stub worker agent: returns failure."""
     def __init__(self, llm, agent_cfg, verbose=False):
         pass
@@ -67,6 +67,24 @@ class _FakeFailAgent:
             success=False,
             targets_requested=step.targets,
             summary="failed",
+        )
+
+
+class _FakeInstructionCaptureAgent(SubAgent):
+    """Stub that records step.instructions for assertion."""
+    captured: list = []
+
+    def __init__(self, llm, agent_cfg, verbose=False):
+        pass
+
+    def run(self, step: Step, tools):
+        _FakeInstructionCaptureAgent.captured.append(step.instructions)
+        return WorkerOutput(
+            step_id=step.id,
+            results=[],
+            success=True,
+            targets_requested=step.targets,
+            summary="captured",
         )
 
 
@@ -116,9 +134,9 @@ class TestRunSubagentTool:
 
         assert len(ctx.job_history) == 1
         entry = ctx.job_history[0]
-        assert entry["agent_type"] == "fake_probe"
-        assert entry["targets_requested"] == ["boost_clock_mhz"]
-        assert entry["success"] is True
+        assert entry.agent_type == "fake_probe"
+        assert entry.targets_requested == ["boost_clock_mhz"]
+        assert entry.success is True
 
     def test_multiple_calls_accumulate_history(self):
         tool = self._make_tool()
@@ -129,7 +147,7 @@ class TestRunSubagentTool:
         tool.run({"agent_type": "fake_probe", "targets": ["metric_b"]})
 
         assert len(ctx.job_history) == 2
-        metrics = [e["targets_requested"][0] for e in ctx.job_history]
+        metrics = [e.targets_requested[0] for e in ctx.job_history]
         assert "metric_a" in metrics
         assert "metric_b" in metrics
 
@@ -153,7 +171,7 @@ class TestRunSubagentTool:
         assert resp.status == ToolStatus.SUCCESS  # ToolResponse is success (we got a response)
         assert resp.data["success"] is False
         assert len(ctx.job_history) == 1
-        assert ctx.job_history[0]["success"] is False
+        assert ctx.job_history[0].success is False
 
     def test_missing_targets_reported(self):
         tool = self._make_tool(agent_class=_FakeFailAgent)
@@ -170,6 +188,39 @@ class TestRunSubagentTool:
         # No _ctx injection
 
         resp = tool.run({"agent_type": "fake_probe", "targets": ["x"]})
+        assert resp.status == ToolStatus.SUCCESS
+
+    def test_instructions_passed_to_agent(self):
+        """instructions field is threaded through to step.instructions."""
+        _FakeInstructionCaptureAgent.captured = []
+        agent_def = _make_agent_def(_FakeInstructionCaptureAgent)
+        registry = {"capture_probe": agent_def}
+        tool = RunSubagentTool(
+            llm=_FakeLLM(), executor=_FakeExecutor(),
+            agent_registry=registry, agent_cfg=AgentConfig(max_iterations=5),
+        )
+        tool._ctx = _make_ctx()
+
+        tool.run({"agent_type": "capture_probe", "targets": [],
+                  "instructions": "Analyze the bottleneck using upstream data."})
+
+        assert len(_FakeInstructionCaptureAgent.captured) == 1
+        assert _FakeInstructionCaptureAgent.captured[0] == "Analyze the bottleneck using upstream data."
+
+    def test_empty_targets_allowed(self):
+        """targets=[] is valid (for analysis/optimization agents)."""
+        agent_def = _make_agent_def(_FakeInstructionCaptureAgent)
+        registry = {"analysis_agent": agent_def}
+        tool = RunSubagentTool(
+            llm=_FakeLLM(), executor=_FakeExecutor(),
+            agent_registry=registry, agent_cfg=AgentConfig(max_iterations=5),
+        )
+        ctx = _make_ctx()
+        tool._ctx = ctx
+
+        resp = tool.run({"agent_type": "analysis_agent", "targets": [],
+                         "instructions": "Do analysis."})
+
         assert resp.status == ToolStatus.SUCCESS
 
 
@@ -207,7 +258,7 @@ class TestRunSubagentParallelTool:
         measured_all = {
             m
             for entry in ctx.job_history
-            for r in entry["results"]
+            for r in entry.results
             for m in [r.get("metric")]
             if m
         }
@@ -288,6 +339,24 @@ class TestRunSubagentParallelTool:
         assert "agent_type" in items["properties"]
         assert "targets" in items["properties"]
 
+    def test_instructions_in_parallel_calls(self):
+        """Each parallel call threads its own instructions to the agent independently."""
+        _FakeInstructionCaptureAgent.captured = []
+        agent_def = _make_agent_def(_FakeInstructionCaptureAgent)
+        registry = {"capture_a": agent_def, "capture_b": agent_def}
+        tool = RunSubagentParallelTool(
+            llm=_FakeLLM(), executor=_FakeExecutor(),
+            agent_registry=registry, agent_cfg=AgentConfig(max_iterations=5),
+        )
+        tool._ctx = _make_ctx()
+
+        tool.run({"calls": [
+            {"agent_type": "capture_a", "targets": [], "instructions": "context for A"},
+            {"agent_type": "capture_b", "targets": [], "instructions": "context for B"},
+        ]})
+
+        assert set(_FakeInstructionCaptureAgent.captured) == {"context for A", "context for B"}
+
 
 # ---------------------------------------------------------------------------
 # MarkReadyForCriticTool tests
@@ -336,7 +405,8 @@ class TestSubagentToolSchemas:
         assert "targets" in params
         assert params["targets"]["type"] == "array"
         assert "agent_type" in fn["parameters"]["required"]
-        assert "targets" in fn["parameters"]["required"]
+        # targets is optional (omitted for analysis/optimization agents)
+        assert "targets" not in fn["parameters"]["required"]
         # retry_context is optional
         assert "retry_context" not in fn["parameters"]["required"]
 

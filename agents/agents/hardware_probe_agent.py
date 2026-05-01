@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents.core.agent import Agent
+from agents.core.agent import SubAgent
 from agents.core.llm import LLMClient
 from agents.core.loop import AgentLoop
 from agents.core.types import AgentContext, MemoryStore, Step, Task, WorkerOutput
@@ -179,62 +179,11 @@ expectations. If the method is sound and results are consistent, accept.
 Call audit_results exactly once with your findings.\
 """
 
-_AUDIT_SCHEMA: dict = {
-    "type": "function",
-    "function": {
-        "name": "audit_results",
-        "description": "Return per-step accept/retry decisions for all worker outputs.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "decisions": {
-                    "type": "array",
-                    "description": "One decision per step_id.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step_id": {
-                                "type": "string",
-                                "description": "The step_id from the worker output.",
-                            },
-                            "decision": {
-                                "type": "string",
-                                "enum": ["accept", "retry"],
-                                "description": "'accept' if results are valid; 'retry' if suspicious.",
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                                "description": "Your confidence in the measurement quality (0–1).",
-                            },
-                            "reason": {
-                                "type": "string",
-                                "description": "1–2 sentences explaining the decision.",
-                            },
-                            "failing_targets": {
-                                "type": "array",
-                                "description": "Names of targets that need re-measurement "
-                                               "(subset of the step's targets). "
-                                               "Leave empty only if ALL targets need retry.",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": ["step_id", "decision", "confidence", "reason", "failing_targets"],
-                    },
-                },
-            },
-            "required": ["decisions"],
-        },
-    },
-}
-
-
 # ---------------------------------------------------------------------------
 # HardwareProbeAgent
 # ---------------------------------------------------------------------------
 
-class HardwareProbeAgent(Agent):
+class HardwareProbeAgent(SubAgent):
     """Worker agent for GPU hardware parameter measurement.
 
     Instantiated per Step by the Orchestrator. Tools are injected via
@@ -296,6 +245,7 @@ class HardwareProbeAgent(Agent):
                 verbose=self.verbose,
                 worker_id=self.worker_id,
                 system_prompt=SYSTEM_PROMPT,
+                user_message=step.instructions or None,
             )
             loop.run()
             success = True
@@ -334,5 +284,4 @@ register(AgentDefinition(
     agent_class=HardwareProbeAgent,
     required_tools=HardwareProbeAgent.REQUIRED_TOOLS,
     critic_system_prompt=_CRITIC_SYSTEM_PROMPT,
-    critic_tool_schema=_AUDIT_SCHEMA,
 ))

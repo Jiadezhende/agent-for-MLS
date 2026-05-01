@@ -21,14 +21,14 @@ def build_user_message(target_spec: dict) -> str:
 
 def _build_initial_message(targets: list) -> str:
     lines = [
-        "Measure the following GPU hardware parameters. "
+        "Process the following targets. "
         "For each, produce a record_measurement call with confidence ≥ 0.75.\n",
     ]
     for t in targets:
         lines.append(f"  • {t}" if isinstance(t, str) else f"  • {t.get('name', str(t))}")
     lines.append(
-        "\nStart by calling list_skills to discover available measurement "
-        "strategies, then proceed metric by metric."
+        "\nStart by calling list_skills to discover available strategies, "
+        "then proceed target by target."
     )
     return "\n".join(lines)
 

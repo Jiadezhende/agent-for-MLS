@@ -56,6 +56,7 @@ class AgentLoop:
         verbose: bool = False,
         worker_id: int | str | None = None,
         system_prompt: str | None = None,
+        user_message: str | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -64,6 +65,7 @@ class AgentLoop:
         self.verbose = verbose
         self._prefix = f"[W{worker_id}] " if worker_id is not None else ""
         self._system_prompt = system_prompt or ""
+        self._initial_user_message = user_message
 
     def _emit(self, *args: object) -> None:
         if self.verbose:
@@ -78,10 +80,12 @@ class AgentLoop:
         return [t for t in self.ctx.task.payload.get("targets", []) if t not in recorded]
 
     def run(self) -> AgentContext:
-        messages: list[dict] = [
-            {"role": "system", "content": self._system_prompt},
-            {"role": "user",   "content": build_user_message(self.ctx.task.payload)},
-        ]
+        if not self.ctx.messages:
+            self.ctx.messages = [
+                {"role": "system", "content": self._system_prompt},
+                {"role": "user",   "content": self._initial_user_message or build_user_message(self.ctx.task.payload)},
+            ]
+        messages = self.ctx.messages
         nudged = False
 
         for i in range(self.max_iterations):

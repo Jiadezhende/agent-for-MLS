@@ -8,26 +8,28 @@ definitions here at runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agents.core.agent import SubAgent
 
 
 @dataclass
 class AgentDefinition:
     """Everything the framework needs to run one agent type.
 
-    agent_type         — unique string key (matches Step.worker)
-    description        — capability + routing/grouping rules shown to the Planner LLM
-    agent_class        — concrete class instantiated per worker by the Orchestrator
-    required_tools     — tool names this agent needs; ToolFactory injects them
-    critic_system_prompt — system prompt for the Critic LLM call
-    critic_tool_schema   — forced-tool JSON schema for the Critic call
+    agent_type           — unique string key (matches Step.worker)
+    description          — capability + routing/grouping rules shown to the Planner LLM
+    agent_class          — concrete SubAgent class instantiated per worker by _execute_one()
+    required_tools       — tool names this agent needs; ToolFactory injects them
+    critic_system_prompt — per-type system prompt for the Critic LLM call (fallback when
+                           no task-level system_prompt_override is provided)
     """
     agent_type: str
     description: str
-    agent_class: type
+    agent_class: "type[SubAgent]"
     required_tools: list[str]
     critic_system_prompt: str
-    critic_tool_schema: dict
 
 
 _REGISTRY: dict[str, AgentDefinition] = {}

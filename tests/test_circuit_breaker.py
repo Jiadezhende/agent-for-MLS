@@ -8,7 +8,9 @@ import uuid
 import pytest
 
 from agents.core.types import AgentContext, CircuitBreaker, MemoryStore, Task
+from agents.tools.base import Tool, ToolParameter
 from agents.tools.registry import ToolRegistry
+from agents.tools.response import ToolErrorCode, ToolResponse, ToolStatus
 
 
 # ---------------------------------------------------------------------------
@@ -30,17 +32,33 @@ def _make_ctx(threshold: int = 3) -> AgentContext:
     )
 
 
+class _MockTool(Tool):
+    """Minimal Tool that always returns a fixed ToolResponse — for testing only."""
+
+    def __init__(self, name: str, response: ToolResponse) -> None:
+        super().__init__(name=name, description="mock")
+        self._response = response
+
+    def get_parameters(self):
+        return []
+
+    def run(self, parameters):
+        return self._response
+
+
 def _make_registry_with_tool(tool_name: str, return_value: dict) -> ToolRegistry:
-    """Build a registry with a single tool that always returns return_value."""
+    """Build a registry with a single tool that always returns a ToolResponse derived
+    from the given return_value dict (mirrors the old executor status convention)."""
+    status = return_value.get("status", "error")
+    if status == "done":
+        resp = ToolResponse.success(text="done", data=return_value)
+    elif status == "timed_out":
+        resp = ToolResponse.partial(text="timed_out", data=return_value)
+    else:
+        code = return_value.get("error", return_value.get("error_class", "unknown"))
+        resp = ToolResponse.error(code=code, message=f"error: {code}")
     reg = ToolRegistry()
-    schema = {
-        "type": "function",
-        "function": {
-            "name": tool_name,
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    }
-    reg.register(tool_name, lambda: return_value, schema)
+    reg.register(_MockTool(tool_name, resp))
     return reg
 
 
@@ -144,11 +162,12 @@ class TestDispatchCircuitBreaker:
         )
         reg.dispatch("run_cuda_probe", {}, ctx)
         reg.dispatch("run_cuda_probe", {}, ctx)
-        # Third call — circuit should be open, returns circuit_open
+        # Third call — circuit should be open
         result = reg.dispatch("run_cuda_probe", {}, ctx)
-        assert result["status"] == "circuit_open"
-        assert result["tool"] == "run_cuda_probe"
-        assert "compile_failed" in result["open_error_kinds"]
+        assert result.status == ToolStatus.ERROR
+        assert result.error_info["code"] == ToolErrorCode.CIRCUIT_OPEN
+        assert result.stats["tool"] == "run_cuda_probe"
+        assert "compile_failed" in result.stats["open_error_kinds"]
 
     def test_circuit_open_message_is_informative(self):
         ctx = _make_ctx(threshold=1)
@@ -158,8 +177,8 @@ class TestDispatchCircuitBreaker:
         )
         reg.dispatch("run_cuda_probe", {}, ctx)   # opens circuit
         result = reg.dispatch("run_cuda_probe", {}, ctx)
-        assert "message" in result
-        assert len(result["message"]) > 20
+        assert result.status == ToolStatus.ERROR
+        assert len(result.text) > 20
 
     def test_circuit_open_persists_on_subsequent_calls(self):
         ctx = _make_ctx(threshold=1)
@@ -170,8 +189,8 @@ class TestDispatchCircuitBreaker:
         reg.dispatch("run_cuda_probe", {}, ctx)   # opens circuit
         r1 = reg.dispatch("run_cuda_probe", {}, ctx)
         r2 = reg.dispatch("run_cuda_probe", {}, ctx)
-        assert r1["status"] == "circuit_open"
-        assert r2["status"] == "circuit_open"
+        assert r1.error_info["code"] == ToolErrorCode.CIRCUIT_OPEN
+        assert r2.error_info["code"] == ToolErrorCode.CIRCUIT_OPEN
 
     def test_success_resets_circuit(self):
         # Once open, the pre-call check blocks all dispatches.
@@ -192,7 +211,8 @@ class TestDispatchCircuitBreaker:
 
         # Now dispatch goes through again (not circuit_open)
         result = failing_reg.dispatch("run_cuda_probe", {}, ctx)
-        assert result["status"] == "error"   # real error, not circuit_open
+        assert result.status == ToolStatus.ERROR
+        assert result.error_info["code"] != ToolErrorCode.CIRCUIT_OPEN
 
     def test_all_tools_subject_to_circuit_breaking(self):
         """Circuit breaker now applies universally to every registered tool."""
@@ -203,11 +223,11 @@ class TestDispatchCircuitBreaker:
         )
         reg.dispatch("flag_event", {}, ctx)   # failure recorded → circuit opens
         result = reg.dispatch("flag_event", {}, ctx)
-        assert result["status"] == "circuit_open"
-        assert result["tool"] == "flag_event"
+        assert result.error_info["code"] == ToolErrorCode.CIRCUIT_OPEN
+        assert result.stats["tool"] == "flag_event"
 
     def test_timed_out_does_not_count_toward_circuit(self):
-        """timed_out results should not open the circuit (kernel just slow)."""
+        """timed_out (PARTIAL) results should not open the circuit."""
         ctx = _make_ctx(threshold=1)
         reg = _make_registry_with_tool(
             "run_cuda_probe",
@@ -215,7 +235,10 @@ class TestDispatchCircuitBreaker:
         )
         reg.dispatch("run_cuda_probe", {}, ctx)
         result = reg.dispatch("run_cuda_probe", {}, ctx)
-        assert result.get("status") != "circuit_open"
+        assert not (
+            result.status == ToolStatus.ERROR
+            and (result.error_info or {}).get("code") == ToolErrorCode.CIRCUIT_OPEN
+        )
 
     def test_different_tools_have_independent_circuits(self):
         ctx = _make_ctx(threshold=1)
@@ -229,7 +252,7 @@ class TestDispatchCircuitBreaker:
         )
         cuda_reg.dispatch("run_cuda_probe", {}, ctx)   # opens run_cuda_probe circuit
         result = ncu_reg.dispatch("profile_with_ncu", {}, ctx)
-        assert result["status"] == "done"   # not affected
+        assert result.status == ToolStatus.SUCCESS
 
 
 # ---------------------------------------------------------------------------

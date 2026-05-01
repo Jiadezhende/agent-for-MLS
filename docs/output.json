@@ -1,0 +1,9 @@
+{
+  "actual_boost_clock_mhz": 1020.2,
+  "dram_latency_cycles": 874,
+  "max_shmem_per_block_kb": 96,
+  "l2_cache_capacity_bytes": 16777216,
+  "peak_dram_bandwidth_GBps": 272.72,
+  "peak_shmem_bandwidth_TBps": 9.125,
+  "bank_conflict_penalty_cycles": 2.13
+}

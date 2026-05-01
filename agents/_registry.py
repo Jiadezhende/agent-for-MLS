@@ -16,10 +16,9 @@ class AgentDefinition:
     """Everything the framework needs to run one agent type.
 
     agent_type         — unique string key (matches Step.worker)
-    description        — one-line description shown to the Planner LLM
+    description        — capability + routing/grouping rules shown to the Planner LLM
     agent_class        — concrete class instantiated per worker by the Orchestrator
     required_tools     — tool names this agent needs; ToolFactory injects them
-    planner_hints      — grouping/routing rules shown to the Planner LLM
     critic_system_prompt — system prompt for the Critic LLM call
     critic_tool_schema   — forced-tool JSON schema for the Critic call
     """
@@ -27,7 +26,6 @@ class AgentDefinition:
     description: str
     agent_class: type
     required_tools: list[str]
-    planner_hints: str
     critic_system_prompt: str
     critic_tool_schema: dict
 

@@ -101,11 +101,10 @@ When you receive `"status": "circuit_open"` from a tool:
 Never call a tool again after seeing circuit_open for that tool.
 """
 
-_PLANNER_HINTS = """\
-Agent type: hardware_probe
-Capability: Measures any GPU hardware parameter (latency, bandwidth, clock, cache, shared memory)
-            by writing and running CUDA C microbenchmarks. Measures multiple targets sequentially
-            in a single worker.
+_DESCRIPTION = """\
+Measures any GPU hardware parameter (latency, bandwidth, clock, cache, shared memory)
+by writing and running CUDA C microbenchmarks. Measures multiple targets sequentially
+in a single worker.
 Targets belonging here: any metric measuring latency (_cycles, _ns), bandwidth (_GBps, _TBps),
   clock (_mhz), cache/shmem size (_bytes, _mb, _kb), utilization (_pct), or conflict penalties
   (_x). Any unrecognised low-level hardware metric also belongs here.
@@ -331,10 +330,9 @@ class HardwareProbeAgent(Agent):
 
 register(AgentDefinition(
     agent_type="hardware_probe",
-    description="Measure GPU hardware parameters (latency, bandwidth, clock) via CUDA microbenchmarks.",
+    description=_DESCRIPTION,
     agent_class=HardwareProbeAgent,
     required_tools=HardwareProbeAgent.REQUIRED_TOOLS,
-    planner_hints=_PLANNER_HINTS,
     critic_system_prompt=_CRITIC_SYSTEM_PROMPT,
     critic_tool_schema=_AUDIT_SCHEMA,
 ))

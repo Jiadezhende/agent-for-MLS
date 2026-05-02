@@ -74,6 +74,11 @@ class StageToolFactory:
             GenerateBaselineTool,
             SubmitBaselineTool,
         )
+        from .tools.finalize_tools import (
+            SubmitHardwareProfileTool,
+            SubmitProfileAnalysisTool,
+            SubmitSummaryTool,
+        )
 
         catalogue: dict[str, Tool] = {
             # Reused — read-only knowledge access.
@@ -89,6 +94,10 @@ class StageToolFactory:
             "submit_candidate_result": SubmitCandidateResultTool(layout=self._layout, stage=current_stage),
             # New — Baseline stage finalize.
             "submit_baseline":         SubmitBaselineTool(self._layout),
+            # New — Other stage finalizers.
+            "submit_hardware_profile": SubmitHardwareProfileTool(self._layout),
+            "submit_profile_analysis": SubmitProfileAnalysisTool(self._layout),
+            "submit_summary":          SubmitSummaryTool(self._layout),
         }
 
         # Optional reused tools that need the executor; only register when

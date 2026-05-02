@@ -24,8 +24,7 @@ def _build_initial_message(targets: list) -> str:
     for t in targets:
         lines.append(f"  • {t}" if isinstance(t, str) else f"  • {t.get('name', str(t))}")
     lines.append(
-        "\nStart by calling list_skills to discover available strategies, "
-        "then proceed target by target."
+        "\nProceed target by target. Use read_skill if you need a specific measurement strategy."
     )
     return "\n".join(lines)
 

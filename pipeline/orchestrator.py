@@ -365,12 +365,43 @@ class PipelineOrchestrator:
     # ---- finalize -------------------------------------------------------
 
     def _finalize(self) -> None:
-        """Make sure ``optimized_lora.cu`` exists at the root, then mark done.
+        """Run SummaryAgent (if registered), make sure ``optimized_lora.cu``
+        exists at the root, then mark FINALIZE done.
 
-        SummaryAgent (Step 5) will fill in final/final_report.json + summary.md;
-        the orchestrator only guarantees the submission contract here.
+        SummaryAgent failures are non-blocking — the orchestrator's
+        contractual guarantee is the root-level optimized_lora.cu file.
         """
         self.run_state.set_current_stage(Stage.FINALIZE.value)
+        self._save_state()
+
+        # Run SummaryAgent if available (skip if FINALIZE already completed,
+        # to avoid double-running SummaryAgent on a resumed FINALIZE).
+        if not self.run_state.stage_completed(Stage.FINALIZE):
+            agent = self.stage_agents.get(Stage.FINALIZE)
+            if agent is not None:
+                budget = self._stage_budget(Stage.FINALIZE)
+                stage_for_closure = Stage.FINALIZE
+                single_arg_builder = lambda allowed, _s=stage_for_closure: self.build_tools(allowed, _s)
+                result = run_stage(
+                    agent,
+                    run_state=self.run_state,
+                    layout=self.layout,
+                    build_tools=single_arg_builder,
+                    stage_budget_s=budget,
+                    log_manager=self.log_manager,
+                    verbose=self.verbose,
+                )
+                self._tick()
+                self._append_event(
+                    Stage.FINALIZE,
+                    status=result.status,
+                    confidence=result.confidence,
+                    artifacts=dict(result.artifacts),
+                    caveats=list(result.caveats),
+                )
+
+        # Always perform the contractual submission sync regardless of whether
+        # SummaryAgent succeeded — best/best.cu is what the harness reads.
         self._sync_output()
         if not self.output_path.is_file():
             self._append_event(

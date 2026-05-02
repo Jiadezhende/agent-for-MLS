@@ -1,11 +1,10 @@
 {
+  "operator": "lora_matmul",
   "targets": [
-    "dram_latency_cycles",
-    "actual_boost_clock_mhz",
-    "max_shmem_per_block_kb",
-    "l2_cache_capacity_bytes",
-    "peak_dram_bandwidth_GBps",
-    "peak_shmem_bandwidth_TBps",
-    "bank_conflict_penalty_cycles"
+    "latency_ms_d3584",
+    "latency_ms_d4096",
+    "speedup_vs_baseline_d3584",
+    "speedup_vs_baseline_d4096"
   ]
 }
+

@@ -158,6 +158,7 @@ class PlannerAgent(Agent):
             shared_store=self.shared_store,
             log_manager=self.log_manager,
         )
+        self._last_ctx = ctx  # always up-to-date; read by orchestrator on interrupt
 
         registry = ToolRegistry()
         _subagent_kwargs = dict(

@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
                    help="Retain workspace/run_* directory after completion")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print iteration progress to stderr")
+    p.add_argument("--log-dir", default="logs",
+                   help="Directory for structured per-cycle audit logs (default: ./logs)")
     return p.parse_args()
 
 
@@ -95,6 +97,7 @@ def main() -> None:
         agent_cfg=agent_cfg,
         agent_registry=all_definitions(),
         verbose=args.verbose,
+        log_dir=Path(args.log_dir),
     )
 
     # --- Run --------------------------------------------------------------

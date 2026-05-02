@@ -372,7 +372,8 @@ class RunSubagentParallelTool(Tool):
         ctx = self._ctx
         call_results: List[dict] = [{}] * len(calls)  # preserve order
 
-        with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        pool = ThreadPoolExecutor(max_workers=len(calls))
+        try:
             future_to_idx = {
                 pool.submit(
                     _execute_one,
@@ -414,6 +415,16 @@ class RunSubagentParallelTool(Tool):
                         "summary": "",
                         "error": str(exc),
                     }
+        except BaseException:
+            # Don't block on shutdown — let KeyboardInterrupt propagate immediately.
+            # Worker threads are abandoned; os._exit() in main.py will clean up.
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
+            raise
+        else:
+            pool.shutdown(wait=True)
 
         all_success = all(r.get("success") for r in call_results)
         summary_lines = []

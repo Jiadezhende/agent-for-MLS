@@ -37,11 +37,23 @@ benchmark its performance. The instructions contain:
   - Torch baseline latency per shape (speedup denominator)
   - Operator specification (formula, shapes, correctness threshold, success criteria)
 
+## Step 0 — Write a baseline kernel FIRST (within first 8 iterations)
+
+Before generating reference data or optimizing, write a simple but CORRECT baseline
+kernel to `optimized_lora.cu` using write_workspace_file. This ensures a valid
+deliverable exists even if later iterations fail:
+  1. Implement a naive tiled GEMM for W@X plus a loop for A@(B^T@X) — correctness
+     first, performance later.
+  2. Compile and run it via run_cuda_probe to confirm it is correct (max_abs_diff
+     check against a CPU reference or simple CUDA C reference implementation).
+  3. Call record_measurement for each shape's measured latency.
+  4. Then proceed to Phase A / Phase B for reference data and further optimization.
+
 ## Two-phase validation protocol
 
-### Phase A: Generate reference data (PyTorch oracle)
+### Phase A: Generate reference data (PyTorch oracle or CUDA C fallback)
 
-Call profile_with_torch with a Python script that:
+**Primary path**: Call profile_with_torch with a Python script that:
   1. Generates random input tensors matching the operator spec (use torch.manual_seed
      for reproducibility).
   2. Runs the PyTorch reference computation (e.g. W @ X + A @ (B.T @ X)).
@@ -54,6 +66,14 @@ Call profile_with_torch with a Python script that:
   4. Prints a confirmation: shape=<d> ref_saved=True
 
 Do this for each shape you intend to validate (at least 3).
+
+**Fallback path** — if profile_with_torch returns a CUDA initialization error
+("no CUDA GPUs are available", "CUDA initialization failed", or circuit_open after
+3 failures):
+  1. Call flag_event("pytorch_cuda_unavailable", "warn", detail="switching to CUDA C reference").
+  2. Skip Phase A entirely. Instead, include a naive CUDA C reference kernel inside
+     your run_cuda_probe source that computes the reference outputs on GPU and writes
+     them to .npy files — then proceed directly to Phase B.
 
 ### Phase B: Validate optimized kernel
 
@@ -146,6 +166,13 @@ After each validation pass:
 ## Critical rules
 
 - You are FULLY AUTONOMOUS. Never ask for direction.
+- Write optimized_lora.cu EARLY — a slow-but-correct baseline in Step 0, improved
+  versions in Phase B. Never leave optimized_lora.cu unwritten until the end.
+- cuBLAS constraint: optimized_lora.cu must use custom CUDA kernels. Do NOT link
+  cuBLAS/cuBLASLt — the harness only passes -O3; explicit -lcublas may break
+  evaluation. If you judge cuBLAS necessary, first call
+  flag_event(type="strategy_decision", detail="cuBLAS required because ...") and
+  only proceed if the reason is compelling (e.g. fusion is impossible without it).
 - Correctness FIRST. Do not claim success if max_abs_diff exceeds the threshold.
 - After run_cuda_probe or profile_with_torch returns, IMMEDIATELY call
   record_measurement for each shape result found in stdout.

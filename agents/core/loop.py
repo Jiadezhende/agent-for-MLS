@@ -15,7 +15,7 @@ from agents.tools.registry import ToolRegistry, _Terminated
 from agents.tools.response import ToolResponse, ToolStatus
 
 
-_LARGE_TEXT_ARGS: frozenset[str] = frozenset({"source", "source_or_path", "python_code"})
+_LARGE_TEXT_ARGS: frozenset[str] = frozenset({"source", "source_or_path", "python_code", "content"})
 _ARG_TRUNCATE_AT: int = 120
 
 

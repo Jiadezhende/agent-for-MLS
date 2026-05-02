@@ -25,9 +25,12 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agents.tools.circuit_breaker import CircuitBreaker  # noqa: F401 (re-exported for imports)
+
+if TYPE_CHECKING:
+    from agents.core.log_manager import LogManager
 
 
 # ===========================================================================
@@ -96,6 +99,8 @@ class AgentContext:
     run_id: str | None = None
     agent_id: str | None = None
     shared_store: SharedStore | None = None
+    # Structured log writer; injected by Orchestrator when --log-dir is set.
+    log_manager: "LogManager | None" = None
     # Full conversation history written by AgentLoop; empty until loop starts.
     messages: list[dict] = field(default_factory=list)
 

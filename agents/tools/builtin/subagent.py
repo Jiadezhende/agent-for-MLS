@@ -72,7 +72,10 @@ def _execute_one(
     out.agent_type = agent_type
 
     # Write per-agent log immediately so it's available even if the pipeline crashes.
-    if ctx is not None and ctx.run_id:
+    if ctx is not None and ctx.log_manager is not None:
+        ctx.log_manager.write_worker_log(out)
+    elif ctx is not None and ctx.run_id:
+        # Fallback: legacy step_logs/ path when no LogManager is configured.
         log_dir = Path("step_logs") / ctx.run_id
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{agent_type}_{step_id}.json"

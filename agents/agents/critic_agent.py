@@ -39,6 +39,8 @@ class CriticAgent(Agent):
         self.llm = llm
         self.agent_registry = agent_registry
         self.verbose = verbose
+        # Populated by run(); read by Orchestrator to pass to LogManager.
+        self.last_reasoning_traces: list[dict] = []
 
     def run(
         self,
@@ -55,17 +57,22 @@ class CriticAgent(Agent):
                                 (used by Orchestrator for task-level evaluation)
         """
         if not outputs:
+            self.last_reasoning_traces = []
             return _accept_decisions({})
 
         counts = retry_counts or {}
 
+        self.last_reasoning_traces = []
+
         if system_prompt_override is not None:
-            return self._critique_one_type(
+            decisions, traces = self._critique_one_type(
                 agent_type="task",
                 outputs=outputs,
                 retry_counts=counts,
                 critic_system_prompt=system_prompt_override,
             )
+            self.last_reasoning_traces = traces
+            return decisions
 
         by_type = self._group_by_type(outputs)
         all_decisions: list[CriticDecision] = []
@@ -80,13 +87,14 @@ class CriticAgent(Agent):
                 all_decisions.extend(_accept_decisions(typed_outputs))
                 continue
 
-            decisions = self._critique_one_type(
+            decisions, traces = self._critique_one_type(
                 agent_type=agent_type,
                 outputs=typed_outputs,
                 retry_counts=counts,
                 critic_system_prompt=defn.critic_system_prompt,
             )
             all_decisions.extend(decisions)
+            self.last_reasoning_traces.extend(traces)
 
         return all_decisions
 
@@ -109,7 +117,7 @@ class CriticAgent(Agent):
         outputs: dict[str, WorkerOutput],
         retry_counts: dict[str, int],
         critic_system_prompt: str,
-    ) -> list[CriticDecision]:
+    ) -> tuple[list[CriticDecision], list[dict]]:
         results_json = json.dumps(
             {
                 sid: {
@@ -161,7 +169,7 @@ class CriticAgent(Agent):
                     file=sys.stderr,
                     flush=True,
                 )
-            return _accept_decisions(outputs)
+            return _accept_decisions(outputs), ctx.reasoning_log
 
         raw = ctx.memory.get("audit", "decisions", [])
         if not raw:
@@ -171,7 +179,7 @@ class CriticAgent(Agent):
                     file=sys.stderr,
                     flush=True,
                 )
-            return _accept_decisions(outputs)
+            return _accept_decisions(outputs), ctx.reasoning_log
 
         decisions = [CriticDecision(**d) for d in raw]
 
@@ -183,7 +191,7 @@ class CriticAgent(Agent):
                 flush=True,
             )
 
-        return decisions
+        return decisions, ctx.reasoning_log
 
 
 def _accept_decisions(outputs: dict[str, WorkerOutput]) -> list[CriticDecision]:

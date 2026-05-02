@@ -138,6 +138,7 @@ class PlannerAgent(Agent):
         self.run_id: str | None = None
         self.agent_id: str | None = None
         self.shared_store: Any = None
+        self.log_manager: Any = None  # LogManager | None
 
     def run(self, spec: dict, critic_feedback: dict | None = None) -> AgentContext:  # type: ignore[override]
         """Run the coordinator loop.
@@ -155,6 +156,7 @@ class PlannerAgent(Agent):
             run_id=self.run_id,
             agent_id=self.agent_id or "planner",
             shared_store=self.shared_store,
+            log_manager=self.log_manager,
         )
 
         registry = ToolRegistry()

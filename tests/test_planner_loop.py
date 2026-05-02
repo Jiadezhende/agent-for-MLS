@@ -5,14 +5,12 @@ All tests run without a GPU.
 """
 from __future__ import annotations
 
-import uuid
-
 import pytest
 
 from agents._registry import AgentDefinition
 from agents.core.agent import SubAgent
 from agents.core.config import AgentConfig
-from agents.core.types import AgentContext, MemoryStore, Step, Task, WorkerOutput
+from agents.core.types import AgentContext, MemoryStore, Step, WorkerOutput
 from agents.tools.builtin.subagent import MarkReadyForCriticTool, RunSubagentParallelTool, RunSubagentTool
 from agents.tools.circuit_breaker import CircuitBreaker
 from agents.tools.registry import ToolRegistry, _Terminated
@@ -24,9 +22,7 @@ from agents.tools.response import ToolStatus
 # ---------------------------------------------------------------------------
 
 def _make_ctx() -> AgentContext:
-    task = Task(id=str(uuid.uuid4()), type="coordination",
-                description="test", payload={}, constraints={})
-    return AgentContext(task=task, memory=MemoryStore(), circuit_breaker=CircuitBreaker())
+    return AgentContext(memory=MemoryStore(), circuit_breaker=CircuitBreaker())
 
 
 def _make_agent_def(agent_class) -> AgentDefinition:

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from agents._registry import AgentDefinition
 from agents.core.config import AgentConfig
-from agents.core.types import Task, WorkerOutput
+from agents.core.types import WorkerOutput
 from orchestrator import Orchestrator
 
 # ---------------------------------------------------------------------------
@@ -53,15 +53,11 @@ class _FakePlannerAgent:
         self.shared_store = None
 
     def run(self, spec, critic_feedback=None):
-        from agents.core.types import AgentContext, MemoryStore, Task
+        from agents.core.types import AgentContext, MemoryStore
         from agents.tools.circuit_breaker import CircuitBreaker
-        import uuid
 
         self._calls.append({"spec": spec, "critic_feedback": critic_feedback})
-        task = Task(id=str(uuid.uuid4()), type="coordination",
-                    description="test", payload=spec, constraints={})
-        ctx = AgentContext(task=task, memory=MemoryStore(),
-                           circuit_breaker=CircuitBreaker())
+        ctx = AgentContext(memory=MemoryStore(), circuit_breaker=CircuitBreaker())
         ctx.job_history = list(self._history)
         ctx.memory.set("run", "summary", "stub summary")
         return ctx
@@ -100,13 +96,6 @@ class _FakeCriticAgent:
 
 def _make_orchestrator(job_history, critic_decisions, agent_cfg_kwargs=None):
     """Build an Orchestrator with stubbed Planner and Critic."""
-    task = Task(
-        id="task_0",
-        type="coordination",
-        description="test optimization",
-        payload={"operator": "lora_matmul", "targets": []},
-        constraints={},
-    )
     cfg_kwargs = {"max_iterations": 5, "max_critic_cycles": 3}
     if agent_cfg_kwargs:
         cfg_kwargs.update(agent_cfg_kwargs)
@@ -115,7 +104,7 @@ def _make_orchestrator(job_history, critic_decisions, agent_cfg_kwargs=None):
     orch = Orchestrator(
         llm=_FakeLLM(),
         executor=_FakeExecutor(),
-        task=task,
+        spec={"operator": "lora_matmul", "targets": []},
         agent_cfg=agent_cfg,
         agent_registry={},
     )
@@ -208,17 +197,14 @@ def test_orchestrator_no_outputs_accepts_immediately():
 
 def test_collect_outputs_reconstruction():
     """_collect_outputs returns the WorkerOutput objects from job_history directly."""
-    task = Task(id="t", type="c", description="d", payload={}, constraints={})
     agent_cfg = AgentConfig(max_iterations=5, max_critic_cycles=3)
     orch = Orchestrator(
         llm=_FakeLLM(), executor=_FakeExecutor(),
-        task=task, agent_cfg=agent_cfg, agent_registry={},
+        spec={}, agent_cfg=agent_cfg, agent_registry={},
     )
     from agents.core.types import AgentContext, MemoryStore
     from agents.tools.circuit_breaker import CircuitBreaker
-    ctx = AgentContext(
-        task=task, memory=MemoryStore(), circuit_breaker=CircuitBreaker()
-    )
+    ctx = AgentContext(memory=MemoryStore(), circuit_breaker=CircuitBreaker())
     ctx.job_history = [
         _make_worker_output(
             "s1",

@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import sys
-import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,7 +41,6 @@ def main() -> None:
     from agents._registry import all_definitions
     from agents.core.config import AgentConfig, ExecutorConfig, LLMConfig
     from agents.core.llm import LLMClient
-    from agents.core.types import Task
     from agents.tools.cuda_executor import Executor
     from orchestrator import Orchestrator
 
@@ -76,14 +74,6 @@ def main() -> None:
         print("[warn] Spec file has no 'targets' key.", file=sys.stderr)
 
     # --- Build components -------------------------------------------------
-    task = Task(
-        id=str(uuid.uuid4()),
-        type="hardware_probe",
-        description="Measure requested GPU hardware parameters",
-        payload=target_spec,
-        constraints={},
-    )
-
     executor = Executor(exec_cfg)
     for note in executor.detect_notes:
         print(note, file=sys.stderr)
@@ -101,7 +91,7 @@ def main() -> None:
     orchestrator = Orchestrator(
         llm=llm,
         executor=executor,
-        task=task,
+        spec=target_spec,
         agent_cfg=agent_cfg,
         agent_registry=all_definitions(),
         verbose=args.verbose,

@@ -12,13 +12,12 @@ Instance attributes run_id, agent_id, shared_store are injected by Orchestrator 
 from __future__ import annotations
 
 import sys
-import uuid
 from typing import Any
 
 from agents.core.agent import Agent
 from agents.core.llm import LLMClient
 from agents.core.loop import AgentLoop
-from agents.core.types import AgentContext, MemoryStore, Task
+from agents.core.types import AgentContext, MemoryStore
 from agents.tools.builtin.recording import FlagEventTool
 from agents.tools.builtin.skills import ListSkillsTool, ReadSkillTool
 from agents.tools.builtin.subagent import MarkReadyForCriticTool, RunSubagentParallelTool, RunSubagentTool
@@ -147,15 +146,7 @@ class PlannerAgent(Agent):
         critic_feedback: set when in REVISING mode; contains 'failing_targets' and 'reason'.
         Returns the AgentContext with ctx.job_history populated by run_subagent calls.
         """
-        task = Task(
-            id=str(uuid.uuid4()),
-            type="coordination",
-            description=f"Optimize {spec.get('operator', 'operator')}",
-            payload=spec,
-            constraints={},
-        )
         ctx = AgentContext(
-            task=task,
             memory=MemoryStore(),
             circuit_breaker=CircuitBreaker(
                 threshold=getattr(self.agent_cfg, "circuit_breaker_threshold", 3),

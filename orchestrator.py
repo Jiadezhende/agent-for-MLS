@@ -97,14 +97,14 @@ class Orchestrator:
         self,
         llm: LLMClient,
         executor: Any,
-        task: Any,            # agents.core.types.Task
+        spec: dict,
         agent_cfg: Any,       # config.AgentConfig
         agent_registry: dict | None = None,
         verbose: bool = False,
     ) -> None:
         self.llm = llm
         self.executor = executor
-        self.task = task
+        self.spec = spec
         self.agent_cfg = agent_cfg
         self.agent_registry = agent_registry or all_definitions()
         self.verbose = verbose
@@ -118,10 +118,7 @@ class Orchestrator:
             verbose=verbose,
         )
         self.critic = CriticAgent(llm, self.agent_registry, verbose)
-        self.run_ctx = RunContext(
-            run_id=str(uuid.uuid4()),
-            objective=task.description,
-        )
+        self.run_ctx = RunContext(run_id=str(uuid.uuid4()))
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -132,7 +129,7 @@ class Orchestrator:
 
         Returns the final _ExecutionState (planner_ctx with job_history).
         """
-        spec = self.task.payload
+        spec = self.spec
         state = _ExecutionState()
         max_critic_cycles: int = self.agent_cfg.max_critic_cycles
         retry_counts: dict[str, int] = {}

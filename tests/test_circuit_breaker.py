@@ -3,11 +3,9 @@ tests/test_circuit_breaker.py — Unit tests for CircuitBreaker and dispatch() i
 """
 from __future__ import annotations
 
-import uuid
-
 import pytest
 
-from agents.core.types import AgentContext, CircuitBreaker, MemoryStore, Task
+from agents.core.types import AgentContext, CircuitBreaker, MemoryStore
 from agents.tools.base import Tool, ToolParameter
 from agents.tools.registry import ToolRegistry
 from agents.tools.response import ToolErrorCode, ToolResponse, ToolStatus
@@ -18,15 +16,7 @@ from agents.tools.response import ToolErrorCode, ToolResponse, ToolStatus
 # ---------------------------------------------------------------------------
 
 def _make_ctx(threshold: int = 3) -> AgentContext:
-    task = Task(
-        id=str(uuid.uuid4()),
-        type="hardware_probe",
-        description="test",
-        payload={"targets": []},
-        constraints={},
-    )
     return AgentContext(
-        task=task,
         memory=MemoryStore(),
         circuit_breaker=CircuitBreaker(threshold=threshold),
     )

@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import json
 import sys
-import uuid
 from collections import defaultdict
 
 from agents.core.agent import Agent
 from agents.core.llm import LLMClient
 from agents.core.loop import AgentLoop
-from agents.core.types import AgentContext, CriticDecision, MemoryStore, Task, WorkerOutput
+from agents.core.types import AgentContext, CriticDecision, MemoryStore, WorkerOutput
 from agents.tools.builtin.audit import AUDIT_TOOL_SCHEMA, AuditResultsTool  # noqa: F401 (AUDIT_TOOL_SCHEMA re-exported)
 from agents.tools.registry import ToolRegistry
 
@@ -140,14 +139,7 @@ class CriticAgent(Agent):
             f"Call audit_results with your decisions for each step_id."
         )
 
-        task = Task(
-            id=str(uuid.uuid4()),
-            type="audit",
-            description=f"Audit {agent_type} worker outputs",
-            payload={},
-            constraints={},
-        )
-        ctx = AgentContext(task=task, memory=MemoryStore())
+        ctx = AgentContext(memory=MemoryStore())
         registry = ToolRegistry()
         registry.register(AuditResultsTool(outputs))
 

@@ -6,11 +6,8 @@ Task-specific system prompts live in each agent plugin's prompt.py.
 from __future__ import annotations
 
 
-def build_user_message(target_spec: dict) -> str:
-    """Render the target spec into the first user message for a worker agent."""
-    targets = target_spec.get("targets", [])
-    retry_context = target_spec.get("retry_context")
-
+def build_user_message(targets: list[str], retry_context: dict | None = None) -> str:
+    """Render targets into the first user message for a worker agent."""
     if not targets:
         return "No targets specified. Call submit_results with an empty summary."
 

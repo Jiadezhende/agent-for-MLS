@@ -4,7 +4,6 @@ conftest.py — Shared pytest fixtures.
 from __future__ import annotations
 
 import shutil
-import uuid
 import pytest
 from pathlib import Path
 from dotenv import load_dotenv
@@ -61,12 +60,5 @@ def executor(exec_cfg):
 @pytest.fixture()
 def agent_ctx():
     """A minimal AgentContext for recording-tool tests."""
-    from agents.core.types import AgentContext, MemoryStore, Task
-    task = Task(
-        id=str(uuid.uuid4()),
-        type="hardware_probe",
-        description="test task",
-        payload={"targets": []},
-        constraints={},
-    )
-    return AgentContext(task=task, memory=MemoryStore())
+    from agents.core.types import AgentContext, MemoryStore
+    return AgentContext(memory=MemoryStore())

@@ -34,16 +34,6 @@ from agents.tools.circuit_breaker import CircuitBreaker  # noqa: F401 (re-export
 # 1. Internal agent types
 # ===========================================================================
 
-@dataclass(frozen=True)
-class Task:
-    """Immutable description of one unit of work passed to an AgentLoop."""
-    id: str
-    type: str
-    description: str
-    payload: dict
-    constraints: dict
-
-
 @dataclass
 class Result:
     """A single measured or inferred metric value produced by a worker."""
@@ -53,7 +43,6 @@ class Result:
     confidence: float
     method: str
     evidence: list[str]
-    task_type: str = "hardware_probe"
 
     def to_dict(self) -> dict:
         return {
@@ -63,7 +52,6 @@ class Result:
             "confidence": self.confidence,
             "method": self.method,
             "evidence": self.evidence,
-            "task_type": self.task_type,
         }
 
 
@@ -96,7 +84,6 @@ class MemoryStore:
 @dataclass
 class AgentContext:
     """Mutable blackboard shared across the agent loop, tool dispatch, and callbacks."""
-    task: Task
     memory: MemoryStore
     iteration: int = 0
     results: list[Result] = field(default_factory=list)
@@ -200,7 +187,6 @@ class SharedStore:
 class RunContext:
     """Lightweight global run state owned by Orchestrator. Not exposed to LLMs."""
     run_id: str
-    objective: str
     shared_store: SharedStore = field(default_factory=SharedStore)
     event_log: EventLog = field(init=False)
 

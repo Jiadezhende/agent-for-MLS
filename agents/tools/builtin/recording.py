@@ -123,7 +123,6 @@ class RecordMeasurementTool(Tool):
             confidence=confidence,
             method=method,
             evidence=list(evidence),
-            task_type=ctx.task.type,
         )
         ctx.results.append(result)
         count = len(ctx.results)

@@ -13,7 +13,8 @@ from typing import Any
 from agents.core.agent import SubAgent
 from agents.core.llm import LLMClient
 from agents.core.loop import AgentLoop
-from agents.core.types import AgentContext, MemoryStore, Step, Task, WorkerOutput
+from agents.core.prompts import build_user_message
+from agents.core.types import AgentContext, MemoryStore, Step, WorkerOutput
 from agents.tools.circuit_breaker import CircuitBreaker
 from agents.tools.registry import ToolRegistry
 from agents._registry import AgentDefinition, register
@@ -159,19 +160,7 @@ class BottleneckAnalystAgent(SubAgent):
         self.worker_id = worker_id
 
     def run(self, step: Step, tools: ToolRegistry) -> WorkerOutput:
-        payload: dict = {"targets": step.targets}
-        if step.retry_context:
-            payload["retry_context"] = step.retry_context
-
-        task = Task(
-            id=step.id,
-            type="bottleneck_analyst",
-            description=step.task,
-            payload=payload,
-            constraints={},
-        )
         ctx = AgentContext(
-            task=task,
             memory=MemoryStore(),
             circuit_breaker=CircuitBreaker(
                 threshold=self.agent_cfg.circuit_breaker_threshold,
@@ -189,7 +178,7 @@ class BottleneckAnalystAgent(SubAgent):
                 verbose=self.verbose,
                 worker_id=self.worker_id,
                 system_prompt=SYSTEM_PROMPT,
-                user_message=step.instructions or None,
+                user_message=step.instructions or build_user_message(step.targets, step.retry_context),
             )
             loop.run()
             success = True

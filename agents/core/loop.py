@@ -10,7 +10,6 @@ import json
 import sys
 
 from agents.core.llm import LLMClient
-from agents.core.prompts import build_user_message
 from agents.core.types import AgentContext
 from agents.tools.registry import ToolRegistry, _Terminated
 from agents.tools.response import ToolResponse, ToolStatus
@@ -56,7 +55,7 @@ class AgentLoop:
         verbose: bool = False,
         worker_id: int | str | None = None,
         system_prompt: str | None = None,
-        user_message: str | None = None,
+        user_message: str = "",
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -74,16 +73,11 @@ class AgentLoop:
             else:
                 print(self._prefix, *args, file=sys.stderr, flush=True)
 
-    def _missing_targets(self) -> list[str]:
-        """Return targets not yet recorded in ctx.results."""
-        recorded = {r.metric for r in self.ctx.results}
-        return [t for t in self.ctx.task.payload.get("targets", []) if t not in recorded]
-
     def run(self) -> AgentContext:
         if not self.ctx.messages:
             self.ctx.messages = [
                 {"role": "system", "content": self._system_prompt},
-                {"role": "user",   "content": self._initial_user_message or build_user_message(self.ctx.task.payload)},
+                {"role": "user",   "content": self._initial_user_message},
             ]
         messages = self.ctx.messages
         nudged = False
@@ -114,15 +108,7 @@ class AgentLoop:
                     raise RuntimeError(
                         "LLM replied without a tool call twice in a row. Aborting."
                     )
-                missing = self._missing_targets()
-                if missing:
-                    nudge_content = (
-                        f"You must call a tool. Still unrecorded: {missing}. "
-                        "Call record_measurement for each measured target, "
-                        "then call submit_results when all are done."
-                    )
-                else:
-                    nudge_content = "All targets recorded. Call submit_results now."
+                nudge_content = "You must call a tool. Review your task and continue, or call submit_results if done."
                 messages.append({"role": "user", "content": nudge_content})
                 nudged = True
                 continue

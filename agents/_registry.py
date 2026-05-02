@@ -24,12 +24,14 @@ class AgentDefinition:
     required_tools       — tool names this agent needs; ToolFactory injects them
     critic_system_prompt — per-type system prompt for the Critic LLM call (fallback when
                            no task-level system_prompt_override is provided)
+    max_tokens           — per-agent LLM output token budget; None = inherit global config
     """
     agent_type: str
     description: str
     agent_class: "type[SubAgent]"
     required_tools: list[str]
     critic_system_prompt: str
+    max_tokens: int | None = None
 
 
 _REGISTRY: dict[str, AgentDefinition] = {}

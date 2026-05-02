@@ -17,7 +17,7 @@ class LLMConfig:
     api_key: str
     model: str
     base_url: str | None = None
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.2
     request_timeout_s: float = 120.0
     max_retries: int = 3
@@ -35,7 +35,7 @@ class LLMConfig:
             api_key=api_key,
             model=model,
             base_url=raw_base_url if raw_base_url else None,
-            max_tokens=int(os.getenv("AGENT_LLM_MAX_TOKENS") or "4096"),
+            max_tokens=int(os.getenv("AGENT_LLM_MAX_TOKENS") or "8192"),
             temperature=float(os.getenv("AGENT_LLM_TEMPERATURE") or "0.2"),
             request_timeout_s=float(os.getenv("AGENT_LLM_TIMEOUT_S") or "120"),
             max_retries=int(os.getenv("AGENT_LLM_MAX_RETRIES") or "3"),

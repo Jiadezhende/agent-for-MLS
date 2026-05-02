@@ -162,19 +162,21 @@ class ToolFactory:
             ProfileWithTorchTool,
             ProbeEnvironmentTool,
             RunCudaProbeTool,
+            WriteWorkspaceFileTool,
         )
 
         all_tools: dict[str, Tool] = {
-            "list_skills":        ListSkillsTool(),
-            "read_skill":         ReadSkillTool(),
-            "run_cuda_probe":     RunCudaProbeTool(self._executor),
-            "profile_with_ncu":   ProfileWithNcuTool(self._executor),
-            "profile_with_nsys":  ProfileWithNsysTool(self._executor),
-            "profile_with_torch": ProfileWithTorchTool(self._executor),
-            "probe_environment":  ProbeEnvironmentTool(self._executor),
-            "record_measurement": RecordMeasurementTool(),
-            "flag_event":         FlagEventTool(),
-            "submit_results":     SubmitResultsTool(),
+            "list_skills":           ListSkillsTool(),
+            "read_skill":            ReadSkillTool(),
+            "write_workspace_file":  WriteWorkspaceFileTool(self._executor),
+            "run_cuda_probe":        RunCudaProbeTool(self._executor),
+            "profile_with_ncu":      ProfileWithNcuTool(self._executor),
+            "profile_with_nsys":     ProfileWithNsysTool(self._executor),
+            "profile_with_torch":    ProfileWithTorchTool(self._executor),
+            "probe_environment":     ProbeEnvironmentTool(self._executor),
+            "record_measurement":    RecordMeasurementTool(),
+            "flag_event":            FlagEventTool(),
+            "submit_results":        SubmitResultsTool(),
         }
 
         reg = ToolRegistry()

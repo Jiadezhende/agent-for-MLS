@@ -216,6 +216,16 @@ class LLMClient:
         self._skip_temperature: bool = False   # learned: provider rejects temperature
         self._force_max_tokens: bool = False   # learned: provider rejects max_completion_tokens
 
+    def with_max_tokens(self, n: int) -> "LLMClient":
+        """Return a new LLMClient with the same connection but a different max_tokens."""
+        import dataclasses
+        new_cfg = dataclasses.replace(self._cfg, max_tokens=n)
+        child = LLMClient(new_cfg)
+        # Carry over runtime-learned param overrides so the child doesn't re-learn them.
+        child._skip_temperature = self._skip_temperature
+        child._force_max_tokens = self._force_max_tokens
+        return child
+
     def _try_param_fallback(self, exc: openai.APIStatusError) -> bool:
         """Inspect a 400 error body and update sticky param overrides.
 

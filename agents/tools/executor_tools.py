@@ -63,6 +63,56 @@ def _exec_result_to_response(result: dict, label: str) -> ToolResponse:
 # run_cuda_probe
 # ---------------------------------------------------------------------------
 
+class WriteWorkspaceFileTool(Tool):
+    """Write a source file to the workspace sandbox and return its path.
+
+    Use this to stage large CUDA source files (8-12 KB kernels) before calling
+    run_cuda_probe or profile_with_ncu with source_path. This way subsequent
+    tool calls only need the short path string, keeping tool call JSON small and
+    well within the LLM output token budget.
+    """
+
+    def __init__(self, executor: Any) -> None:
+        super().__init__(
+            name="write_workspace_file",
+            description=(
+                "Write content to a workspace file and return its path. "
+                "Use before run_cuda_probe or profile_with_ncu to stage large "
+                "CUDA source files. After writing, pass the returned 'path' as "
+                "source_path to run_cuda_probe (saves output tokens on re-runs). "
+                "Overwrites any existing file at the same path."
+            ),
+        )
+        self._executor = executor
+
+    def get_parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="content",
+                type="string",
+                description="Full file content to write (e.g. CUDA C++ source).",
+            ),
+            ToolParameter(
+                name="filename",
+                type="string",
+                description=(
+                    "Workspace-relative path for the file. "
+                    "Use 'src/' prefix for source files (e.g. 'src/kernel_v1.cu'). "
+                    "Directories are created automatically."
+                ),
+            ),
+        ]
+
+    def run(self, parameters: Dict[str, Any]) -> ToolResponse:
+        result = self._executor.write_workspace_file(**parameters)
+        path = result.get("path", "")
+        size = result.get("size_bytes", 0)
+        return ToolResponse.success(
+            text=f"Written {size} bytes to '{path}'.",
+            data=result,
+        )
+
+
 class RunCudaProbeTool(Tool):
     def __init__(self, executor: Any) -> None:
         super().__init__(
@@ -72,7 +122,9 @@ class RunCudaProbeTool(Tool):
                 "kernel measures hardware properties via self-timing (clock64) "
                 "and you need the stdout output as your primary measurement. "
                 "The Executor handles compilation, sandboxing, and stdout capture. "
-                "Do NOT use this for profiling — use profile_with_ncu instead."
+                "Do NOT use this for profiling — use profile_with_ncu instead. "
+                "For large kernels (>3 KB), first write the source with "
+                "write_workspace_file and pass the returned path as source_path."
             ),
         )
         self._executor = executor
@@ -85,8 +137,20 @@ class RunCudaProbeTool(Tool):
                 description=(
                     "Complete CUDA C++ source code (.cu content). "
                     "MUST be actual code starting with #include or __global__. "
-                    "NEVER pass a skill name, filename, or description here."
+                    "NEVER pass a skill name, filename, or description here. "
+                    "Mutually exclusive with source_path."
                 ),
+                required=False,
+            ),
+            ToolParameter(
+                name="source_path",
+                type="string",
+                description=(
+                    "Workspace-relative path to a .cu file written by write_workspace_file. "
+                    "Use this instead of source for large kernels to keep tool call JSON small. "
+                    "Mutually exclusive with source."
+                ),
+                required=False,
             ),
             ToolParameter(
                 name="probe_name",
@@ -118,6 +182,59 @@ class RunCudaProbeTool(Tool):
                 default=60,
             ),
         ]
+
+    def to_openai_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": "run_cuda_probe",
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": (
+                                "Complete CUDA C++ source code. "
+                                "Use for short snippets only. "
+                                "For kernels >3 KB, prefer write_workspace_file + source_path. "
+                                "Mutually exclusive with source_path."
+                            ),
+                        },
+                        "source_path": {
+                            "type": "string",
+                            "description": (
+                                "Workspace-relative path to a .cu file from write_workspace_file. "
+                                "Preferred for large kernels — keeps this call JSON tiny. "
+                                "Mutually exclusive with source."
+                            ),
+                        },
+                        "probe_name": {
+                            "type": "string",
+                            "description": "Short identifier used in cache key and logs.",
+                        },
+                        "compile_flags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "default": [],
+                            "description": "Extra nvcc flags.",
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "default": [],
+                            "description": "Command-line arguments for the compiled binary.",
+                        },
+                        "timeout_s": {
+                            "type": "integer",
+                            "default": 60,
+                            "description": "Execution timeout in seconds.",
+                        },
+                    },
+                    "required": ["probe_name"],
+                },
+            },
+        }
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         result = self._executor.run_cuda_probe(**parameters)

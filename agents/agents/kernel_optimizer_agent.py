@@ -57,6 +57,15 @@ Do this for each shape you intend to validate (at least 3).
 
 ### Phase B: Validate optimized kernel
 
+IMPORTANT: For kernels > 3 KB, use the two-step pattern to stay within token budget:
+  1. write_workspace_file(content="<full .cu source>", filename="src/kernel_vN.cu")
+     → returns {"path": "src/kernel_vN.cu"}
+  2. run_cuda_probe(source_path="src/kernel_vN.cu", probe_name="kernel_vN")
+     → tiny tool call, no source in JSON
+
+For bug fixes, write to a new versioned filename (e.g. kernel_v2.cu, kernel_v3.cu)
+and reference the new path. This keeps each iteration's tool calls small.
+
 Call run_cuda_probe with a CUDA C source that:
   1. Loads the saved .npy files from Phase A (use a minimal npy reader — see below).
   2. Copies inputs to GPU.
@@ -199,6 +208,7 @@ class KernelOptimizerAgent(SubAgent):
     REQUIRED_TOOLS: list[str] = [
         "list_skills",
         "read_skill",
+        "write_workspace_file",
         "profile_with_torch",
         "run_cuda_probe",
         "profile_with_ncu",
@@ -272,4 +282,5 @@ register(AgentDefinition(
     agent_class=KernelOptimizerAgent,
     required_tools=KernelOptimizerAgent.REQUIRED_TOOLS,
     critic_system_prompt=_CRITIC_SYSTEM_PROMPT,
+    max_tokens=16384,
 ))

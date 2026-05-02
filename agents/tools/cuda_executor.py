@@ -860,15 +860,44 @@ class Executor:
     # Public API (registered as LLM tools)
     # ------------------------------------------------------------------
 
+    def write_workspace_file(self, content: str, filename: str) -> dict:
+        """Write content to a workspace-relative path; return the path and byte size.
+
+        Use this to stage large CUDA source files before calling run_cuda_probe
+        with source_path so subsequent tool calls only need the short path string.
+        """
+        path = self.workspace.write(filename, content)
+        return {
+            "ok": True,
+            "path": self.workspace.rel(path),
+            "size_bytes": len(content.encode()),
+        }
+
     def run_cuda_probe(
         self,
-        source: str,
-        probe_name: str,
+        source: str | None = None,
+        probe_name: str = "",
         compile_flags: list[str] | None = None,
         args: list[str] | None = None,
         timeout_s: int = 60,
+        source_path: str | None = None,
     ) -> dict:
-        """Compile and run a CUDA kernel. Primary tool for hardware probing."""
+        """Compile and run a CUDA kernel. Primary tool for hardware probing.
+
+        Provide either `source` (inline CUDA C++ code) or `source_path`
+        (workspace-relative path written by write_workspace_file). Exactly one
+        of the two must be non-empty.
+        """
+        if source_path:
+            file_path = _safe_join(self.workspace.root, source_path)
+            source = file_path.read_text(encoding="utf-8")
+        if not source:
+            return {
+                "status": "error",
+                "error": "missing_source",
+                "error_class": "user_code",
+                "hint": "Provide either 'source' (inline CUDA C++) or 'source_path' (workspace path from write_workspace_file).",
+            }
         spec = JobSpec(
             backend="cuda_probe",
             name=probe_name,

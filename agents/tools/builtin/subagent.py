@@ -51,7 +51,8 @@ def _execute_one(
     """
     agent_def = agent_registry[agent_type]
     tools = tool_factory.build(agent_def.required_tools)
-    agent: SubAgent = agent_def.agent_class(llm=llm, agent_cfg=agent_cfg, verbose=verbose)
+    effective_llm = llm.with_max_tokens(agent_def.max_tokens) if agent_def.max_tokens else llm
+    agent: SubAgent = agent_def.agent_class(llm=effective_llm, agent_cfg=agent_cfg, verbose=verbose)
 
     if ctx is not None:
         agent.run_id = ctx.run_id

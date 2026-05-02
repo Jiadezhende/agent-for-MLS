@@ -16,8 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from typing import Callable, Sequence
+
 from .stage_agent import StageAgent
-from .stage_runner import ToolBuilder, run_stage
+from .stage_runner import run_stage
 from .state import (
     CandidateRecord,
     RunState,
@@ -65,7 +67,10 @@ class PipelineOrchestrator:
       workspace_root: directory under which ``runs/<run_id>/`` lives
       output_path: ``./optimized_lora.cu`` (synced from best/best.cu)
       stage_agents: dict[Stage, StageAgent] — concrete agents per stage
-      build_tools: callable that turns ``allowed_tools`` into a ToolRegistry
+      build_tools: callable ``(allowed_tools, current_stage) → ToolRegistry``;
+        the stage parameter lets tools like submit_candidate_result tag the
+        StageResult with the right Stage enum value (INITIAL_CANDIDATE vs
+        TUNING_LOOP). Production code passes a closure over StageToolFactory.
       run_id: pass an existing run_id to resume; ``None`` mints a fresh one
       stage_budgets_s: optional override for per-stage budgets
     """
@@ -78,7 +83,7 @@ class PipelineOrchestrator:
         workspace_root: str | Path,
         output_path: str | Path,
         stage_agents: dict[Stage, StageAgent],
-        build_tools: ToolBuilder,
+        build_tools: Callable[[Sequence[str], Stage], object],
         run_id: str | None = None,
         log_manager: Any = None,
         verbose: bool = False,
@@ -143,11 +148,14 @@ class PipelineOrchestrator:
 
             budget = self._stage_budget(stage)
             self._vprint(f"[orch] stage={stage.value} budget={budget:.1f}s elapsed={self._tick():.1f}s")
+            # Wrap the stage-aware build_tools into the unary form run_stage expects.
+            stage_for_closure = stage  # avoid late-binding gotcha
+            single_arg_builder = lambda allowed, _s=stage_for_closure: self.build_tools(allowed, _s)
             result = run_stage(
                 agent,
                 run_state=self.run_state,
                 layout=self.layout,
-                build_tools=self.build_tools,
+                build_tools=single_arg_builder,
                 stage_budget_s=budget,
                 log_manager=self.log_manager,
                 verbose=self.verbose,

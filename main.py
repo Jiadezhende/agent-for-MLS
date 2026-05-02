@@ -1,8 +1,15 @@
 """
-main.py — CLI entry point for the GPU profiling agent.
+main.py — CLI entry point for the LoRA-kernel optimization pipeline.
 
-Usage:
-    python main.py --spec target_spec.json --output results.json
+Constructs PipelineOrchestrator with a stage-state-machine driver, six
+StageAgents, and an Executor that runs CUDA / PyTorch subprocess work. The
+orchestrator owns ``./optimized_lora.cu``: every time best updates (and once
+INITIAL_CANDIDATE produces something compileable + correct) the file is
+mirrored from workspace/runs/<run_id>/best/best.cu to the path passed via
+--output.
+
+Typical use:
+    python main.py --spec target_spec.json --time-budget 1800 --output ./optimized_lora.cu
 """
 from __future__ import annotations
 
@@ -17,175 +24,135 @@ from dotenv import load_dotenv
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Autonomous GPU hardware profiling agent",
+        description="LoRA-kernel optimization pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--spec",   required=True,  help="Path to target_spec.json")
-    p.add_argument("--output", default="results.json", help="Output path for results.json")
-    p.add_argument("--max-iterations", type=int, default=None,
-                   help="Override AGENT_MAX_ITERATIONS from env")
-    p.add_argument("--keep-workspace", action="store_true",
-                   help="Retain workspace/run_* directory after completion")
-    p.add_argument("--verbose", "-v", action="store_true",
-                   help="Print iteration progress to stderr")
-    p.add_argument("--log-dir", default="logs",
-                   help="Directory for structured per-cycle audit logs (default: ./logs)")
+    p.add_argument("--spec", required=True, help="Path to operator spec JSON (must contain 'operator').")
+    p.add_argument("--time-budget", type=int, default=1800, help="Total wall-clock budget in seconds.")
+    p.add_argument("--output", default="./optimized_lora.cu", help="Final candidate file path the official harness reads.")
+    p.add_argument("--workspace", default="./workspace", help="Workspace root containing runs/<run_id>/.")
+    p.add_argument("--run-id", default=None, help="Resume an existing run by id (matches workspace/runs/<run_id>/state.json).")
+    p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
 
 
 def main() -> None:
     load_dotenv()
-
     args = parse_args()
 
-    # Import after load_dotenv so env vars are available
-    import agents  # noqa: F401  triggers registration of all agent plugins
-    from agents._registry import all_definitions
+    # Imports after load_dotenv so env vars are observed.
     from agents.core.config import AgentConfig, ExecutorConfig, LLMConfig
     from agents.core.llm import LLMClient
     from agents.tools.cuda_executor import Executor
-    from orchestrator import Orchestrator
 
-    # --- Config -----------------------------------------------------------
+    from pipeline.agents import (
+        BaselineAgent,
+        BenchmarkSpecAgent,
+        HardwareProfilerAgent,
+        KernelTuningAgent,
+        ProfileAnalysisAgent,
+        SummaryAgent,
+    )
+    from pipeline.orchestrator import PipelineOrchestrator
+    from pipeline.state import Stage
+    from pipeline.tool_factory import StageToolFactory
+    from pipeline.workspace_layout import RunLayout, make_run_id
+
+    # ---- config ---------------------------------------------------------
     try:
-        llm_cfg   = LLMConfig.from_env()
+        llm_cfg = LLMConfig.from_env()
         agent_cfg = AgentConfig.from_env()
-        exec_cfg  = ExecutorConfig.from_env()
-    except EnvironmentError as exc:
-        print(f"[error] Configuration error: {exc}", file=sys.stderr)
+        exec_cfg = ExecutorConfig.from_env()
+    except EnvironmentError as e:
+        print(f"[error] config: {e}", file=sys.stderr)
         sys.exit(2)
 
-    if args.max_iterations is not None:
-        agent_cfg.max_iterations = args.max_iterations
-    if args.keep_workspace:
-        agent_cfg.keep_workspace = True
-
-    # --- Load spec --------------------------------------------------------
+    # ---- spec ----------------------------------------------------------
     spec_path = Path(args.spec)
-    if not spec_path.exists():
-        print(f"[error] Spec file not found: {spec_path}", file=sys.stderr)
+    if not spec_path.is_file():
+        print(f"[error] spec not found: {spec_path}", file=sys.stderr)
         sys.exit(2)
-
     try:
-        target_spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(f"[error] Invalid JSON in spec file: {exc}", file=sys.stderr)
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"[error] spec is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(2)
+    if "operator" not in spec:
+        print("[error] spec is missing 'operator' field", file=sys.stderr)
         sys.exit(2)
 
-    if "targets" not in target_spec:
-        print("[warn] Spec file has no 'targets' key.", file=sys.stderr)
-
-    # --- Build components -------------------------------------------------
+    # ---- services ------------------------------------------------------
     executor = Executor(exec_cfg)
     for note in executor.detect_notes:
         print(note, file=sys.stderr)
 
     llm = LLMClient(llm_cfg)
 
+    # Mint the run_id up front so layout, tool_factory, and orchestrator all
+    # share the same identity. PipelineOrchestrator will resume if state.json
+    # already exists for this id.
+    run_id = args.run_id or make_run_id()
+    layout = RunLayout(args.workspace, run_id)
+    layout.mkdir()
+
+    tool_factory = StageToolFactory(executor=executor, layout=layout)
+
+    def build_tools(allowed, current_stage):
+        return tool_factory.build(allowed, current_stage=current_stage)
+
+    # ---- agents --------------------------------------------------------
+    common = {"llm": llm, "agent_cfg": agent_cfg, "verbose": args.verbose}
+    stage_agents = {
+        Stage.BENCHMARK_SPEC:    BenchmarkSpecAgent(**common),
+        Stage.HARDWARE_PROFILE:  HardwareProfilerAgent(**common),
+        Stage.BASELINE_PROFILE:  BaselineAgent(**common),
+        # Same class instance is fine; orchestrator passes current_stage to
+        # tool_factory.build so SubmitCandidateResultTool tags correctly.
+        Stage.INITIAL_CANDIDATE: KernelTuningAgent(**common, stage=Stage.INITIAL_CANDIDATE),
+        Stage.TUNING_LOOP:       KernelTuningAgent(**common, stage=Stage.TUNING_LOOP),
+        Stage.OPTIONAL_PROFILE:  ProfileAnalysisAgent(**common),
+        Stage.FINALIZE:          SummaryAgent(**common),
+    }
+
+    # ---- orchestrator --------------------------------------------------
     if args.verbose:
         print(
-            f"[info] Starting orchestrator: model={llm_cfg.model} "
-            f"max_iterations={agent_cfg.max_iterations} "
-            f"workspace={executor.workspace.root}",
+            f"[main] run_id={run_id} budget={args.time_budget}s "
+            f"workspace={layout.root} output={args.output}",
             file=sys.stderr,
         )
 
-    orchestrator = Orchestrator(
-        llm=llm,
-        executor=executor,
-        spec=target_spec,
-        agent_cfg=agent_cfg,
-        agent_registry=all_definitions(),
+    orchestrator = PipelineOrchestrator(
+        spec=spec,
+        time_budget_s=args.time_budget,
+        workspace_root=args.workspace,
+        output_path=args.output,
+        stage_agents=stage_agents,
+        build_tools=build_tools,
+        run_id=run_id,
         verbose=args.verbose,
-        log_dir=Path(args.log_dir),
     )
 
-    # --- Run --------------------------------------------------------------
+    # ---- run -----------------------------------------------------------
     exit_code = 0
-    state = None
-
     try:
-        state = orchestrator.run()
-        if args.verbose:
-            print("[info] Orchestrator completed successfully.", file=sys.stderr)
-    except RuntimeError as exc:
-        print(f"[warn] {exc}", file=sys.stderr)
-        exit_code = 3
-    except Exception as exc:
-        print(f"[error] Unexpected error: {exc}", file=sys.stderr)
-        exit_code = 1
+        summary = orchestrator.run()
+    except KeyboardInterrupt:
+        print("[main] interrupted; state.json + workspace preserved for resume", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:  # noqa: BLE001 — entrypoint catches all
+        print(f"[error] orchestrator crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # --- Collect results --------------------------------------------------
-    all_results: list[dict] = []
-    worker_logs: list[dict] = []
-
-    if state is not None and state.planner_ctx is not None:
-        raw_results: list[dict] = []
-        for entry in state.planner_ctx.job_history:
-            raw_results.extend(entry.results)
-            worker_logs.append({
-                "step_id":       entry.step_id,
-                "agent_type":    entry.agent_type,
-                "success":       entry.success,
-                "n_results":     len(entry.results),
-                "summary":       entry.summary,
-                "reasoning_log": entry.reasoning_log,
-                "events":        entry.events,
-            })
-
-        # Deduplicate by metric: keep the entry with the highest confidence
-        seen: dict[str, dict] = {}
-        for r in raw_results:
-            metric = r.get("metric", "")
-            if metric not in seen or r.get("confidence", 0) > seen[metric].get("confidence", 0):
-                seen[metric] = r
-        all_results = list(seen.values())
-
-        if not state.accepted:
-            exit_code = max(exit_code, 3)
-
-    # --- Write outputs ----------------------------------------------------
-    output_path  = Path(args.output)
-    log_path     = output_path.with_name("reasoning_log.json")
-    run_log_path = output_path.with_name("run_log.jsonl")
-
-    flat_results: dict[str, int | float] = {}
-    for r in all_results:
-        raw = r.get("value")
-        if raw is None:
-            continue
-        try:
-            fval = float(raw)
-            val: int | float = int(fval) if fval == int(fval) else fval
-        except (TypeError, ValueError):
-            continue
-        flat_results[r["metric"]] = val
-
-    try:
-        output_path.write_text(
-            json.dumps(flat_results, indent=2),
-            encoding="utf-8",
+    # ---- summary -------------------------------------------------------
+    print(json.dumps(summary, indent=2))
+    if not Path(args.output).is_file():
+        print(
+            f"[warn] {args.output} does not exist — official harness will fail "
+            "(no compileable best candidate produced).",
+            file=sys.stderr,
         )
-        log_path.write_text(
-            json.dumps({"workers": worker_logs}, indent=2, default=str),
-            encoding="utf-8",
-        )
-        orchestrator.run_ctx.event_log.flush(run_log_path)
-        if args.verbose or exit_code != 0:
-            print(
-                f"[info] Wrote {output_path}, {log_path}, and {run_log_path}",
-                file=sys.stderr,
-            )
-
-    except Exception as exc:
-        print(f"[error] Failed to write outputs: {exc}", file=sys.stderr)
-        exit_code = max(exit_code, 1)
-
-    # --- Workspace cleanup ------------------------------------------------
-    if exit_code == 0 and not agent_cfg.keep_workspace:
-        executor.workspace.cleanup()
-    else:
-        print(f"[info] Workspace retained at: {executor.workspace.root}", file=sys.stderr)
+        exit_code = max(exit_code, 3)
 
     os._exit(exit_code)
 

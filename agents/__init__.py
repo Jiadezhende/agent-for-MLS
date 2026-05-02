@@ -1,10 +1,10 @@
-"""
-agents — Multi-agent pipeline package.
+"""agents — shared executor / LLM / tool layer.
 
-Importing this package triggers registration of all built-in agent types.
-Add new agent types by creating a subpackage and importing it here.
+The legacy planner/critic + per-agent plugin registry was removed when the
+pipeline architecture replaced them; concrete agents now live in
+``pipeline/agents/`` and are wired up explicitly in ``main.py``.
+
+This package still owns:
+  - ``agents.core``: Config, LLMClient, AgentLoop, Memory/Event types.
+  - ``agents.tools``: Executor, ToolRegistry, builtin tools (recording, skills).
 """
-import agents.agents.hardware_probe_agent    # noqa: F401  registers 'hardware_probe'
-import agents.agents.op_profiler_agent       # noqa: F401  registers 'op_profiler'
-import agents.agents.bottleneck_analyst_agent  # noqa: F401  registers 'bottleneck_analyst'
-import agents.agents.kernel_optimizer_agent  # noqa: F401  registers 'kernel_optimizer'

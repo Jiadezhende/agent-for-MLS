@@ -55,7 +55,7 @@ class TestLLMConfig:
                    "AGENT_LLM_TIMEOUT_S", "AGENT_LLM_MAX_RETRIES"]:
             monkeypatch.delenv(k, raising=False)
         cfg = LLMConfig.from_env()
-        assert cfg.max_tokens == 4096
+        assert cfg.max_tokens == 8192
         assert cfg.temperature == 0.2
         assert cfg.request_timeout_s == 120.0
         assert cfg.max_retries == 3

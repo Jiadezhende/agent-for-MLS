@@ -216,4 +216,6 @@ results.json
 reasoning_log.json
 *.exe
 .tmp/
-/claude/
+.claude/
+workspace/
+logs/

@@ -164,7 +164,7 @@ def _make_agents(*, with_tuning: bool = True, with_profile: bool = True) -> dict
     return agents
 
 
-def _no_tools(_names):
+def _no_tools(_names, _stage):
     """build_tools stub — none of the fake agents call tools."""
     return None
 

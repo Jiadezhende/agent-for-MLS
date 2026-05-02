@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
+from pathlib import Path
 
 import pytest
 
@@ -32,11 +33,16 @@ from pipeline.agents import (
     ProfileAnalysisAgent,
     SummaryAgent,
 )
+from pipeline.operator_spec import OperatorSpec
 from pipeline.orchestrator import PipelineOrchestrator
 from pipeline.state import BENCHMARK_SPEC_SLOTS, Stage
 from pipeline.tool_factory import StageToolFactory
 from pipeline.tools.baseline_tools import _BASELINE_MARKER
 from pipeline.tools.candidate_tools import _EVAL_MARKER
+
+
+_SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+LORA_SPEC = OperatorSpec.load_from_skill(_SKILLS_ROOT, "lora_matmul")
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +298,7 @@ class TestEndToEndPipeline:
         run_id = "smoke_run"
         layout = RunLayout(layout_root, run_id)
         layout.mkdir()
-        factory = StageToolFactory(executor=executor, layout=layout)
+        factory = StageToolFactory(executor=executor, layout=layout, op_spec=LORA_SPEC)
 
         def build_tools(allowed, current_stage):
             return factory.build(allowed, current_stage=current_stage)
@@ -304,6 +310,7 @@ class TestEndToEndPipeline:
             output_path=out_path,
             stage_agents=agents,
             build_tools=build_tools,
+            op_spec=LORA_SPEC,
             run_id=run_id,
             stage_budgets_s={s: 30.0 for s in Stage},
         )
@@ -359,7 +366,7 @@ class TestEndToEndPipeline:
         from pipeline.workspace_layout import RunLayout
         layout = RunLayout(layout_root, run_id)
         layout.mkdir()
-        factory = StageToolFactory(executor=executor, layout=layout)
+        factory = StageToolFactory(executor=executor, layout=layout, op_spec=LORA_SPEC)
 
         # ---- run 1: only feed setup + INITIAL_CANDIDATE scripts, then we
         # let SummaryAgent's script also be present so finalize works.
@@ -383,6 +390,7 @@ class TestEndToEndPipeline:
             output_path=out_path,
             stage_agents=_build_agents(scripted_run1),
             build_tools=build_tools,
+            op_spec=LORA_SPEC,
             run_id=run_id,
             stage_budgets_s={s: 30.0 for s in Stage},
         )
@@ -409,6 +417,7 @@ class TestEndToEndPipeline:
             output_path=out_path,
             stage_agents=_build_agents(scripted_run2),
             build_tools=build_tools,
+            op_spec=LORA_SPEC,
             run_id=run_id,
             stage_budgets_s={s: 30.0 for s in Stage},
         )

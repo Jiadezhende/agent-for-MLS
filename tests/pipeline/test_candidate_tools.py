@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from agents.tools.circuit_breaker import CircuitBreaker
 from agents.tools.registry import _Terminated
 
 from pipeline.agent_loop_signal import pop_stage_result
+from pipeline.operator_spec import OperatorSpec
 from pipeline.state import Stage, StageResult
 from pipeline.tools.candidate_tools import (
     EvaluateCandidateTool,
@@ -20,6 +22,10 @@ from pipeline.tools.candidate_tools import (
     _next_candidate_index,
 )
 from pipeline.workspace_layout import RunLayout
+
+
+_SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+LORA_SPEC = OperatorSpec.load_from_skill(_SKILLS_ROOT, "lora_matmul")
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +60,7 @@ def _seed_baseline(layout: RunLayout, d_list):
         layout.baseline_input_path("X", d).write_bytes(b"x")
         layout.baseline_input_path("A", d).write_bytes(b"x")
         layout.baseline_input_path("B", d).write_bytes(b"x")
-        layout.baseline_reference_path(d).write_bytes(b"x")
+        layout.baseline_reference_path("Y", d).write_bytes(b"x")
 
 
 class _MockExecutor:
@@ -78,7 +84,7 @@ def _eval_stdout(parsed: dict) -> str:
 class TestWriteCandidateTool:
     def test_first_write_allocates_candidate_000(self, tmp_path):
         layout = _layout(tmp_path)
-        tool = WriteCandidateTool(layout)
+        tool = WriteCandidateTool(layout, LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"source": VALID_SOURCE})
         assert resp.status.value == "success"
@@ -89,7 +95,7 @@ class TestWriteCandidateTool:
 
     def test_second_write_increments_index(self, tmp_path):
         layout = _layout(tmp_path)
-        tool = WriteCandidateTool(layout)
+        tool = WriteCandidateTool(layout, LORA_SPEC)
         tool._ctx = _ctx()
         tool.run({"source": VALID_SOURCE})
         resp2 = tool.run({"source": VALID_SOURCE})
@@ -103,7 +109,7 @@ class TestWriteCandidateTool:
         assert _next_candidate_index(layout) == 5
 
     def test_rejects_source_without_pybind(self, tmp_path):
-        tool = WriteCandidateTool(_layout(tmp_path))
+        tool = WriteCandidateTool(_layout(tmp_path), LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"source": "// no pybind here\n" * 10})
         assert resp.status.value == "error"
@@ -121,6 +127,7 @@ class TestEvalScriptGen:
         cu.write_text(VALID_SOURCE)
 
         code = _build_eval_script(
+            op_spec=LORA_SPEC,
             candidate_id="candidate_007",
             candidate_cu=cu,
             inputs_dir=layout.baseline_inputs_dir,
@@ -149,7 +156,7 @@ class TestEvaluateCandidateTool:
         # And BaselineAgent ran.
         _seed_baseline(layout, d_list)
         exec_ = _MockExecutor(output={"stdout": _eval_stdout(parsed_output)})
-        tool = EvaluateCandidateTool(executor=exec_, layout=layout)
+        tool = EvaluateCandidateTool(executor=exec_, layout=layout, op_spec=LORA_SPEC)
         tool._ctx = _ctx()
         return layout, tool, exec_
 
@@ -230,7 +237,7 @@ class TestEvaluateCandidateTool:
         layout = _layout(tmp_path)
         _seed_baseline(layout, [4096])
         exec_ = _MockExecutor(output={"stdout": ""})
-        tool = EvaluateCandidateTool(executor=exec_, layout=layout)
+        tool = EvaluateCandidateTool(executor=exec_, layout=layout, op_spec=LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"candidate_id": "candidate_999", "d_list": [4096]})
         assert resp.status.value == "error"
@@ -242,7 +249,7 @@ class TestEvaluateCandidateTool:
         layout.candidate_file("candidate_000", "candidate.cu").write_text(VALID_SOURCE)
         # don't seed baseline
         exec_ = _MockExecutor(output={"stdout": ""})
-        tool = EvaluateCandidateTool(executor=exec_, layout=layout)
+        tool = EvaluateCandidateTool(executor=exec_, layout=layout, op_spec=LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"candidate_id": "candidate_000", "d_list": [4096]})
         assert resp.status.value == "error"

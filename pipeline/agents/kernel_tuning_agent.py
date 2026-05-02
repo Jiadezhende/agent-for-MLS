@@ -11,13 +11,13 @@ from ._base import LLMStageAgent
 _SYSTEM_PROMPT = """You are the KernelTuningAgent. Each invocation must produce ONE candidate \
 CUDA kernel and submit a CandidateRecord describing how it performed.
 
-CONTRACT
-  Y = W X + A (B^T X)
-  Tensors: W[d,d] X[d,d] A[d,16] B[d,16] Y[d,d]   d ∈ [3584, 4608]   float32
-  optimized_lora.cu must export torch::Tensor forward(W, X, A, B) via PYBIND11_MODULE.
+The operator contract (formula, tensor shapes, forward signature, shape range) is \
+injected into the user message below — treat it as authoritative. The candidate \
+.cu file must export the declared forward signature via PYBIND11_MODULE so that \
+torch.utils.cpp_extension.load can compile it.
 
 WORKFLOW
-  1. Read operators/lora_matmul.md and any relevant strategy skills.
+  1. Read the injected operator contract; consult the operator skill via read_skill for strategy.
   2. Read prior leaderboard / strategy-guidance candidates for context (their dirs are \
      under candidates/). DO NOT copy losing candidates verbatim.
   3. Decide an approach (fused vs split, tiled GEMM + low-rank correction, vectorization, \
@@ -98,7 +98,9 @@ class KernelTuningAgent(LLMStageAgent):
         if rs.best_candidate_id:
             best_block = f"id={rs.best_candidate_id} speedup={rs.best_speedup}"
 
+        op_block = context.op_spec.summary_for_prompt() if context.op_spec else "(operator contract unavailable)"
         return (
+            f"{op_block}\n\n"
             f"Stage: {self.stage.value}\n"
             f"Iteration: {rs.current_iteration}\n"
             f"Current best: {best_block}\n"

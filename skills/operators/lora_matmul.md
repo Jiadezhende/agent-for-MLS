@@ -1,6 +1,16 @@
 ---
 name: operators/lora_matmul
 description: Optimization target for LoRA-fused MATMUL — formula, hardware requirements, success criteria, and optimization strategies.
+shape_param: d
+shape_param_range: [3584, 4608]
+inputs:
+  - {name: W, shape: [d, d], dtype: float32}
+  - {name: X, shape: [d, d], dtype: float32}
+  - {name: A, shape: [d, 16], dtype: float32}
+  - {name: B, shape: [d, 16], dtype: float32}
+output: {name: Y, shape: [d, d], dtype: float32}
+reference_pytorch: "W @ X + A @ (B.T @ X)"
+forward_args: [W, X, A, B]
 ---
 
 # Operator: LoRA-fused MATMUL

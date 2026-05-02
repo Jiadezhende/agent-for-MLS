@@ -18,6 +18,7 @@ from typing import Any, Sequence
 
 from typing import Callable, Sequence
 
+from .operator_spec import OperatorSpec
 from .stage_agent import StageAgent
 from .stage_runner import run_stage
 from .state import (
@@ -84,6 +85,7 @@ class PipelineOrchestrator:
         output_path: str | Path,
         stage_agents: dict[Stage, StageAgent],
         build_tools: Callable[[Sequence[str], Stage], object],
+        op_spec: OperatorSpec | None = None,
         run_id: str | None = None,
         log_manager: Any = None,
         verbose: bool = False,
@@ -95,6 +97,7 @@ class PipelineOrchestrator:
         self.output_path = Path(output_path).resolve()
         self.stage_agents = stage_agents
         self.build_tools = build_tools
+        self.op_spec = op_spec
         self.log_manager = log_manager
         self.verbose = verbose
         self.stage_budgets_s = {**DEFAULT_STAGE_BUDGETS_S, **(stage_budgets_s or {})}
@@ -157,6 +160,7 @@ class PipelineOrchestrator:
                 layout=self.layout,
                 build_tools=single_arg_builder,
                 stage_budget_s=budget,
+                op_spec=self.op_spec,
                 log_manager=self.log_manager,
                 verbose=self.verbose,
             )
@@ -388,6 +392,7 @@ class PipelineOrchestrator:
                     layout=self.layout,
                     build_tools=single_arg_builder,
                     stage_budget_s=budget,
+                    op_spec=self.op_spec,
                     log_manager=self.log_manager,
                     verbose=self.verbose,
                 )

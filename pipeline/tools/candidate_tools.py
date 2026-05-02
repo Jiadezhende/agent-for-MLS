@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
+import textwrap
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,6 +31,7 @@ from agents.tools.registry import _Terminated
 from agents.tools.response import ToolErrorCode, ToolResponse
 
 from ..agent_loop_signal import stash_stage_result
+from ..operator_spec import OperatorSpec
 from ..state import (
     ACCEPTED_FOR_VALUES,
     CandidateRecord,
@@ -78,17 +80,18 @@ class WriteCandidateTool(Tool):
 
     _ctx: Any = None
 
-    def __init__(self, layout: RunLayout):
+    def __init__(self, layout: RunLayout, op_spec: OperatorSpec):
         super().__init__(
             name="write_candidate",
             description=(
                 "Write a new candidate CUDA implementation to candidates/<id>/candidate.cu "
                 "and return the allocated candidate_id + absolute path. The file must export "
-                "torch::Tensor forward(W, X, A, B) via PYBIND11_MODULE so that "
+                f"torch::Tensor {op_spec.forward_signature_text()} via PYBIND11_MODULE so that "
                 "torch.utils.cpp_extension.load can compile it."
             ),
         )
         self._layout = layout
+        self._op_spec = op_spec
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -108,8 +111,8 @@ class WriteCandidateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Full CUDA source for candidate.cu. Must include "
-                                "<torch/extension.h>, define forward(W,X,A,B), and "
-                                "expose it via PYBIND11_MODULE."
+                                f"<torch/extension.h>, define {self._op_spec.forward_signature_text()}, "
+                                "and expose it via PYBIND11_MODULE."
                             ),
                             "minLength": 100,
                         },
@@ -153,6 +156,7 @@ class WriteCandidateTool(Tool):
 
 def _build_eval_script(
     *,
+    op_spec: OperatorSpec,
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
@@ -169,10 +173,10 @@ def _build_eval_script(
     doesn't depend on candidate compileability).
 
     For each d the script:
-      - loads W,X,A,B from inputs_dir and Y_ref from refs_dir
-      - calls mod.forward(W,X,A,B), checks allclose vs Y_ref
+      - loads operator inputs from inputs_dir and the reference output from refs_dir
+      - calls ``mod.<forward_call>``, checks allclose vs reference
       - if correct: warmup + ``samples`` cudaEvent timings for candidate AND
-        for PyTorch reference (W@X + A@(B.T@X)); records median + min + max
+        for PyTorch reference (``op_spec.reference_pytorch``); records median + min + max
     Final JSON includes per_d list, all_correct flag, overall median speedup.
     """
     cu_path_s = str(candidate_cu.resolve()).replace("\\", "/")
@@ -180,6 +184,16 @@ def _build_eval_script(
     ref_dir_s = refs_dir.resolve().as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
     d_list_repr = json.dumps(list(d_list))
+
+    load_inputs = textwrap.indent(
+        op_spec.render_load_inputs(dir_var="INPUT_DIR", d_var="d"), "        "
+    )
+    load_ref = textwrap.indent(
+        op_spec.render_load_reference(dir_var="REF_DIR", d_var="d", var_name="Y_ref"),
+        "        ",
+    )
+    forward_call = op_spec.render_forward_call("mod")
+    ref_expr = op_spec.reference_pytorch
 
     return f'''import json
 import os
@@ -247,11 +261,8 @@ for d in D_LIST:
         "error": None,
     }}
     try:
-        W = torch.load(os.path.join(INPUT_DIR, f"W_d{{d}}.pt"), map_location=device)
-        X = torch.load(os.path.join(INPUT_DIR, f"X_d{{d}}.pt"), map_location=device)
-        A = torch.load(os.path.join(INPUT_DIR, f"A_d{{d}}.pt"), map_location=device)
-        B = torch.load(os.path.join(INPUT_DIR, f"B_d{{d}}.pt"), map_location=device)
-        Y_ref = torch.load(os.path.join(REF_DIR, f"Y_d{{d}}.pt"), map_location=device)
+{load_inputs}
+{load_ref}
     except Exception as e:
         entry["error"] = f"input_load_failed: {{e}}"[-500:]
         result["per_d"].append(entry)
@@ -259,7 +270,7 @@ for d in D_LIST:
 
     # Correctness
     try:
-        Y_cand = mod.forward(W, X, A, B)
+        Y_cand = {forward_call}
         torch.cuda.synchronize()
         diff = (Y_cand - Y_ref).abs().max().item()
         entry["max_abs_diff"] = float(diff)
@@ -279,7 +290,7 @@ for d in D_LIST:
     try:
         # warmup
         for _ in range(3):
-            _ = mod.forward(W, X, A, B)
+            _ = {forward_call}
         torch.cuda.synchronize()
 
         cand_times = []
@@ -287,14 +298,14 @@ for d in D_LIST:
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
-            _ = mod.forward(W, X, A, B)
+            _ = {forward_call}
             e.record()
             torch.cuda.synchronize()
             cand_times.append(s.elapsed_time(e))
 
         # warmup ref
         for _ in range(3):
-            _ = W @ X + A @ (B.T @ X)
+            _ = {ref_expr}
         torch.cuda.synchronize()
 
         ref_times = []
@@ -302,7 +313,7 @@ for d in D_LIST:
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
-            _ = W @ X + A @ (B.T @ X)
+            _ = {ref_expr}
             e.record()
             torch.cuda.synchronize()
             ref_times.append(s.elapsed_time(e))
@@ -356,7 +367,7 @@ class EvaluateCandidateTool(Tool):
 
     _ctx: Any = None
 
-    def __init__(self, *, executor: Any, layout: RunLayout):
+    def __init__(self, *, executor: Any, layout: RunLayout, op_spec: OperatorSpec):
         super().__init__(
             name="evaluate_candidate",
             description=(
@@ -370,6 +381,7 @@ class EvaluateCandidateTool(Tool):
         )
         self._executor = executor
         self._layout = layout
+        self._op_spec = op_spec
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -418,9 +430,10 @@ class EvaluateCandidateTool(Tool):
             )
 
         # Sanity check: baseline references must exist.
+        ref_name = self._op_spec.output.name
         missing_refs = []
         for d in d_list:
-            if not self._layout.baseline_reference_path(d).is_file():
+            if not self._layout.baseline_reference_path(ref_name, d).is_file():
                 missing_refs.append(d)
         if missing_refs:
             return ToolResponse.error(
@@ -432,6 +445,7 @@ class EvaluateCandidateTool(Tool):
             )
 
         code = _build_eval_script(
+            op_spec=self._op_spec,
             candidate_id=cid,
             candidate_cu=cu_path,
             inputs_dir=self._layout.baseline_inputs_dir,

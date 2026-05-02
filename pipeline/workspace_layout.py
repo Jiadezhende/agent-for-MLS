@@ -125,8 +125,8 @@ class RunLayout:
     def baseline_inputs_dir(self) -> Path:
         return self.baseline_dir / DIR_BASELINE_INPUTS
 
-    def baseline_reference_path(self, d: int) -> Path:
-        return self.baseline_references_dir / f"Y_d{d}.pt"
+    def baseline_reference_path(self, name: str, d: int) -> Path:
+        return self.baseline_references_dir / f"{name}_d{d}.pt"
 
     def baseline_input_path(self, name: str, d: int) -> Path:
         return self.baseline_inputs_dir / f"{name}_d{d}.pt"

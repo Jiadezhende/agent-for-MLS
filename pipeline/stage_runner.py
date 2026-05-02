@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from .operator_spec import OperatorSpec
 from .stage_agent import StageAgent
 from .state import Stage, StageResult, validate_stage_result
 from .workspace_layout import RunLayout
@@ -44,6 +45,7 @@ class StageContext:
     layout: RunLayout
     tools: Any                # ToolRegistry-shaped object
     stage_budget_s: float
+    op_spec: OperatorSpec | None = None
     log_manager: Any = None
     verbose: bool = False
 
@@ -58,6 +60,7 @@ def run_stage(
     layout: RunLayout,
     build_tools: ToolBuilder,
     stage_budget_s: float,
+    op_spec: OperatorSpec | None = None,
     log_manager: Any = None,
     verbose: bool = False,
 ) -> StageResult:
@@ -81,6 +84,7 @@ def run_stage(
         layout=layout,
         tools=tools,
         stage_budget_s=stage_budget_s,
+        op_spec=op_spec,
         log_manager=log_manager,
         verbose=verbose,
     )

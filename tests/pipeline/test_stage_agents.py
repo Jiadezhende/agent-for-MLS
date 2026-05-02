@@ -7,6 +7,7 @@ ending in a valid StageResult.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,7 @@ from pipeline.agents import (
     ProfileAnalysisAgent,
     SummaryAgent,
 )
+from pipeline.operator_spec import OperatorSpec
 from pipeline.stage_runner import StageContext
 from pipeline.state import (
     BENCHMARK_SPEC_SLOTS,
@@ -28,6 +30,10 @@ from pipeline.state import (
 )
 from pipeline.tool_factory import StageToolFactory
 from pipeline.workspace_layout import RunLayout
+
+
+_SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+LORA_SPEC = OperatorSpec.load_from_skill(_SKILLS_ROOT, "lora_matmul")
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +100,7 @@ def _ctx_factory(layout, tools, *, run_state=None):
         layout=layout,
         tools=tools,
         stage_budget_s=60.0,
+        op_spec=LORA_SPEC,
         verbose=False,
     )
 
@@ -156,7 +163,7 @@ class TestBaselineAgent:
             def profile_with_torch(self, code, op_name, timeout_s=120):
                 return {"stdout": f"{_BASELINE_MARKER}\n{json.dumps(records)}\n"}
 
-        factory = StageToolFactory(executor=_MockExec(), layout=layout)
+        factory = StageToolFactory(executor=_MockExec(), layout=layout, op_spec=LORA_SPEC)
         tools = factory.build(BaselineAgent.allowed_tools, current_stage=Stage.BASELINE_PROFILE)
 
         llm = _FakeLLM([
@@ -192,7 +199,7 @@ class TestKernelTuningAgent:
             layout.baseline_input_path("X", d).write_bytes(b"x")
             layout.baseline_input_path("A", d).write_bytes(b"x")
             layout.baseline_input_path("B", d).write_bytes(b"x")
-            layout.baseline_reference_path(d).write_bytes(b"x")
+            layout.baseline_reference_path("Y", d).write_bytes(b"x")
 
         # Successful evaluation result the mock executor will hand back.
         eval_payload = {
@@ -215,7 +222,7 @@ class TestKernelTuningAgent:
             def profile_with_torch(self, code, op_name, timeout_s=120):
                 return {"stdout": f"{_EVAL_MARKER}\n{json.dumps(eval_payload)}\n"}
 
-        factory = StageToolFactory(executor=_MockExec(), layout=layout)
+        factory = StageToolFactory(executor=_MockExec(), layout=layout, op_spec=LORA_SPEC)
         tools = factory.build(KernelTuningAgent.allowed_tools, current_stage=Stage.INITIAL_CANDIDATE)
 
         record = {

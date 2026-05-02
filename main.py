@@ -53,6 +53,7 @@ def main() -> None:
         ProfileAnalysisAgent,
         SummaryAgent,
     )
+    from pipeline.operator_spec import OperatorSpec
     from pipeline.orchestrator import PipelineOrchestrator
     from pipeline.state import Stage
     from pipeline.tool_factory import StageToolFactory
@@ -81,6 +82,14 @@ def main() -> None:
         print("[error] spec is missing 'operator' field", file=sys.stderr)
         sys.exit(2)
 
+    # ---- operator schema ------------------------------------------------
+    skills_root = Path(__file__).resolve().parent / "skills"
+    try:
+        op_spec = OperatorSpec.load_from_skill(skills_root, spec["operator"])
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[error] operator schema: {e}", file=sys.stderr)
+        sys.exit(2)
+
     # ---- services ------------------------------------------------------
     executor = Executor(exec_cfg)
     for note in executor.detect_notes:
@@ -95,7 +104,7 @@ def main() -> None:
     layout = RunLayout(args.workspace, run_id)
     layout.mkdir()
 
-    tool_factory = StageToolFactory(executor=executor, layout=layout)
+    tool_factory = StageToolFactory(executor=executor, layout=layout, op_spec=op_spec)
 
     def build_tools(allowed, current_stage):
         return tool_factory.build(allowed, current_stage=current_stage)
@@ -129,6 +138,7 @@ def main() -> None:
         output_path=args.output,
         stage_agents=stage_agents,
         build_tools=build_tools,
+        op_spec=op_spec,
         run_id=run_id,
         verbose=args.verbose,
     )

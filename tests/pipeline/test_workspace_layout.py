@@ -58,7 +58,7 @@ class TestRunLayoutPaths:
 
     def test_baseline_per_d_paths(self, tmp_path):
         layout = RunLayout(tmp_path, "run_xyz")
-        assert layout.baseline_reference_path(4096).name == "Y_d4096.pt"
+        assert layout.baseline_reference_path("Y", 4096).name == "Y_d4096.pt"
         assert layout.baseline_input_path("W", 4096).name == "W_d4096.pt"
 
 

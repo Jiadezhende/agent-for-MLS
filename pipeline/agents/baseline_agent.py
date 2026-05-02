@@ -8,15 +8,20 @@ from ..state import Stage
 from ._base import LLMStageAgent
 
 
-_SYSTEM_PROMPT = """You are the BaselineAgent. Generate the inputs and reference outputs that \
-KernelTuningAgent needs for correctness checks, and benchmark the PyTorch \
-reference latency that defines the speedup denominator.
+_SYSTEM_PROMPT = """You are the BaselineAgent. Generate the operator's input tensors and the \
+reference output that KernelTuningAgent needs for correctness checks, and \
+benchmark the PyTorch reference latency that defines the speedup denominator.
+
+The operator contract (formula, tensor list, forward signature, shape range) is \
+injected into the user message below. Read the corresponding operator skill for \
+strategy context if needed.
 
 WORKFLOW
-  1. Read skills/operators/lora_matmul.md to understand the math (Y = WX + A(B^T X)).
+  1. Read the injected operator contract (and optionally the operator skill via read_skill).
   2. Read the baseline benchmark spec at the path given below for d_list + samples.
-  3. Call generate_baseline(d_list, samples) — the tool generates W/X/A/B/Y_ref \
-and benchmarks the PyTorch reference for each d in one subprocess.
+  3. Call generate_baseline(d_list, samples) — the tool generates the operator \
+inputs + reference output and benchmarks the PyTorch reference for each d \
+in one subprocess.
   4. Inspect the per-d torch_ms_median values. If any are missing or 0, flag \
 and retry once.
   5. Call submit_baseline(per_d, notes) to finalize.
@@ -47,7 +52,9 @@ class BaselineAgent(LLMStageAgent):
                 )
             except json.JSONDecodeError:
                 spec_blob = spec_path.read_text(encoding="utf-8")
+        op_block = context.op_spec.summary_for_prompt() if context.op_spec else "(operator contract unavailable)"
         return (
+            f"{op_block}\n\n"
             "Generate inputs + references and benchmark the PyTorch reference. "
             "Inputs go to baseline/inputs/, references to baseline/references/.\n\n"
             f"=== baseline spec ===\n{spec_blob or '(spec not found)'}\n"

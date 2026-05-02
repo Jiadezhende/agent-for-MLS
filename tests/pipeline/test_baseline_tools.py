@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from agents.tools.circuit_breaker import CircuitBreaker
 from agents.tools.registry import _Terminated
 
 from pipeline.agent_loop_signal import pop_stage_result
+from pipeline.operator_spec import OperatorSpec
 from pipeline.state import Stage
 from pipeline.tools.baseline_tools import (
     GenerateBaselineTool,
@@ -18,6 +20,10 @@ from pipeline.tools.baseline_tools import (
     _build_baseline_script,
 )
 from pipeline.workspace_layout import RunLayout
+
+
+_SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+LORA_SPEC = OperatorSpec.load_from_skill(_SKILLS_ROOT, "lora_matmul")
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +64,7 @@ class TestBaselineScriptGen:
     def test_script_embeds_paths_and_d_list(self, tmp_path):
         layout = _layout(tmp_path)
         code = _build_baseline_script(
+            op_spec=LORA_SPEC,
             inputs_dir=layout.baseline_inputs_dir,
             refs_dir=layout.baseline_references_dir,
             d_list=[3584, 4096],
@@ -87,7 +94,7 @@ class TestGenerateBaselineTool:
             {"d": 4096, "torch_ms_median": 14.1, "samples": 30},
         ]
         exec_ = _MockExecutor(output={"stdout": _baseline_stdout(records), "stdout_tail": _baseline_stdout(records)})
-        tool = GenerateBaselineTool(executor=exec_, layout=layout)
+        tool = GenerateBaselineTool(executor=exec_, layout=layout, op_spec=LORA_SPEC)
         tool._ctx = _ctx()
 
         resp = tool.run({"d_list": [3584, 4096], "samples": 30})
@@ -107,7 +114,7 @@ class TestGenerateBaselineTool:
                 raise RuntimeError("ncu_permission_denied")
 
         layout = _layout(tmp_path)
-        tool = GenerateBaselineTool(executor=_BoomExecutor(), layout=layout)
+        tool = GenerateBaselineTool(executor=_BoomExecutor(), layout=layout, op_spec=LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"d_list": [4096]})
         assert resp.status.value == "error"
@@ -115,7 +122,7 @@ class TestGenerateBaselineTool:
 
     def test_no_marker_in_stdout_returns_error(self, tmp_path):
         exec_ = _MockExecutor(output={"stdout": "just gibberish\nno marker here\n"})
-        tool = GenerateBaselineTool(executor=exec_, layout=_layout(tmp_path))
+        tool = GenerateBaselineTool(executor=exec_, layout=_layout(tmp_path), op_spec=LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"d_list": [4096]})
         assert resp.status.value == "error"
@@ -125,7 +132,7 @@ class TestGenerateBaselineTool:
         # The script itself emits {"error": "cuda_unavailable"} when GPU absent.
         bad = {"stdout": f"{_BASELINE_MARKER}\n{json.dumps({'error': 'cuda_unavailable'})}\n"}
         exec_ = _MockExecutor(output=bad)
-        tool = GenerateBaselineTool(executor=exec_, layout=_layout(tmp_path))
+        tool = GenerateBaselineTool(executor=exec_, layout=_layout(tmp_path), op_spec=LORA_SPEC)
         tool._ctx = _ctx()
         resp = tool.run({"d_list": [4096]})
         assert resp.status.value == "error"

@@ -101,6 +101,8 @@ class AgentLoop:
             self._emit(f"\n── iter {i + 1}/{self.max_iterations} {'─' * 40}")
             if resp.content:
                 self._emit(f"  {resp.content}")
+            if resp.finish_reason and resp.finish_reason != "stop" and resp.finish_reason != "tool_calls":
+                self._emit(f"  finish_reason={resp.finish_reason}")
 
             if not resp.tool_calls:
                 self._emit("  (no tool calls — sending nudge)")

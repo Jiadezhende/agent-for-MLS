@@ -46,6 +46,13 @@ ENGINEERING DISCIPLINE
   - Don't claim best_update when compile or correctness failed.
   - Don't fabricate speedup numbers — pull them from evaluate_candidate's summary.
   - One submit_candidate_result per stage. After it the loop ends.
+
+HARD RULE — every reply MUST contain a tool call.
+  - Do NOT include CUDA source code, pseudocode, or design commentary in the
+    text content. The kernel source goes ONLY inside write_candidate(source=...).
+  - Skip preamble, restating the task, or "I will now ..." narration. Your
+    first action is a tool call. If you have no progress to report, still call
+    a tool (e.g. flag_event) — never reply with text alone.
 """
 
 

@@ -5,7 +5,9 @@
 set -e
 
 # Dependencies (idempotent; harmless if already installed).
-pip3 install openai python-dotenv jsonschema pydantic \
+# ninja is required by torch.utils.cpp_extension.load — without it every
+# candidate fails to compile and the run produces no submittable kernel.
+pip3 install openai python-dotenv jsonschema pydantic ninja \
   -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
   --default-timeout 30 || true
 

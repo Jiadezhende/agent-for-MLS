@@ -158,7 +158,7 @@ class TestAutodetectEnvToolPaths:
         cfg = _make_cfg()
         with patch("agents.tools.cuda_executor._run_subprocess", return_value=_mock_subprocess_ok("12.0\n")), \
              patch("shutil.which", return_value=None), \
-             patch("agents.tools.cuda_executor._NCU_SEARCH_PATHS_WIN", [fake_ncu]):
+             patch("agents.tools.cuda_executor._NCU_SEARCH_GLOBS_WIN", [fake_ncu]):
             updated, notes = _autodetect_env(cfg)
         assert updated.ncu_bin == fake_ncu
 
@@ -171,17 +171,23 @@ class TestAutodetectEnvToolPaths:
         cfg = _make_cfg()
         with patch("agents.tools.cuda_executor._run_subprocess", return_value=_mock_subprocess_ok("12.0\n")), \
              patch("shutil.which", return_value=None), \
-             patch("agents.tools.cuda_executor._NSYS_SEARCH_PATHS_WIN", [fake_nsys]):
+             patch("agents.tools.cuda_executor._NSYS_SEARCH_GLOBS_WIN", [fake_nsys]):
             updated, notes = _autodetect_env(cfg)
         assert updated.nsys_bin == fake_nsys
 
     def test_no_override_when_tool_not_found_anywhere(self):
         from agents.tools.cuda_executor import _autodetect_env
         cfg = _make_cfg()
+        empty_globs_attr_ncu = (
+            "_NCU_SEARCH_GLOBS_WIN" if sys.platform == "win32" else "_NCU_SEARCH_GLOBS_LIN"
+        )
+        empty_globs_attr_nsys = (
+            "_NSYS_SEARCH_GLOBS_WIN" if sys.platform == "win32" else "_NSYS_SEARCH_GLOBS_LIN"
+        )
         with patch("agents.tools.cuda_executor._run_subprocess", return_value=_mock_subprocess_ok("12.0\n")), \
              patch("shutil.which", return_value=None), \
-             patch("agents.tools.cuda_executor._NCU_SEARCH_PATHS_WIN", []), \
-             patch("agents.tools.cuda_executor._NSYS_SEARCH_PATHS_WIN", []):
+             patch(f"agents.tools.cuda_executor.{empty_globs_attr_ncu}", []), \
+             patch(f"agents.tools.cuda_executor.{empty_globs_attr_nsys}", []):
             updated, notes = _autodetect_env(cfg)
         assert updated.ncu_bin == "ncu"    # unchanged default
         assert updated.nsys_bin == "nsys"  # unchanged default

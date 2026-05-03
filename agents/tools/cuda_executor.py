@@ -225,6 +225,9 @@ def _execute_ncu(
         )
 
     report_base = workspace.allocate("ncu", "")  # ncu appends .ncu-rep automatically
+    # Stage 1: profile to .ncu-rep file. ncu 2026+ with `-o` does NOT print metric
+    # values to stdout regardless of --csv / --print-summary, so stage 2 below
+    # extracts metrics via --import (mirrors how _execute_nsys does profile + stats).
     cmd = [
         ncu,
         "--replay-mode", "kernel",
@@ -291,26 +294,86 @@ def _execute_ncu(
             stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
         )
 
-    if "Metric Value" not in sub.stdout:
+    rep_file = report_base.with_suffix(".ncu-rep")
+    if not rep_file.exists():
+        raise ExecutorError(
+            "ncu_no_report",
+            error_class="infrastructure",
+            phase="profile",
+            hint=(
+                "ncu returned 0 but no .ncu-rep file was written. "
+                "Possible workspace permission issue or ncu silent failure."
+            ),
+            returncode=sub.returncode,
+            stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
+            stderr=sub.stderr[-2000:] if sub.stderr else "",
+        )
+
+    rep_path_rel = workspace.rel(rep_file)
+
+    # Stage 2: extract metric table from .ncu-rep via --import. CSV header layout
+    # (Metric Name / Average / Minimum / Maximum etc) varies across ncu versions,
+    # so we don't pattern-match column names — we just check it looks like CSV
+    # with at least one data row.
+    import_sub = _run_subprocess(
+        [
+            ncu,
+            "--import", str(rep_file),
+            "--csv",
+            "--print-summary", "per-kernel",
+        ],
+        timeout_s=60,
+        cwd=workspace.root,
+        truncate_bytes=None,
+        encoding="utf-8",
+    )
+
+    if import_sub.returncode != 0:
+        raise ExecutorError(
+            "ncu_import_failed",
+            error_class="infrastructure",
+            phase="profile",
+            hint=(
+                "ncu --import could not decode the .ncu-rep file. "
+                "Report file exists but metric extraction failed; "
+                "check ncu version compatibility."
+            ),
+            returncode=import_sub.returncode,
+            report_path=rep_path_rel,
+            stdout_tail=import_sub.stdout[-2000:] if import_sub.stdout else "",
+            stderr=import_sub.stderr[-2000:] if import_sub.stderr else "",
+        )
+
+    non_empty_lines = [ln for ln in import_sub.stdout.splitlines() if ln.strip()]
+    looks_like_csv = bool(non_empty_lines) and "," in non_empty_lines[0]
+    has_data_row = len(non_empty_lines) >= 2
+
+    if not (looks_like_csv and has_data_row):
         raise ExecutorError(
             "ncu_no_kernel_found",
             error_class="data_quality",
             phase="profile",
-            hint="Check kernel_name spelling or whether the binary launches the kernel.",
+            hint=(
+                "ncu profiled successfully but the report contains no kernel data. "
+                "Check kernel_name spelling, that the binary actually launches the kernel, "
+                "or that the requested metrics exist on this GPU architecture."
+            ),
             kernel_name=kernel_name,
-            stdout_tail=sub.stdout[-2000:] if sub.stdout else "",
-            stderr=sub.stderr[-2000:] if sub.stderr else "",
-            returncode=sub.returncode,
+            metrics=metrics,
+            report_path=rep_path_rel,
+            stdout_tail=import_sub.stdout[-2000:] if import_sub.stdout else "",
+            stderr=import_sub.stderr[-2000:] if import_sub.stderr else "",
+            returncode=import_sub.returncode,
         )
 
-    rep_file = report_base.with_suffix(".ncu-rep")
     result: dict = {
-        "output": sub.stdout,
+        "output": import_sub.stdout,
         "returncode": sub.returncode,
-        "report_path": workspace.rel(rep_file) if rep_file.exists() else None,
+        "report_path": rep_path_rel,
     }
-    if sub.stderr:
-        result["stderr"] = sub.stderr[-2000:]
+    profile_stderr = sub.stderr[-2000:] if sub.stderr else ""
+    if profile_stderr:
+        result["stderr"] = profile_stderr
     # ncu_version injected by profile_with_ncu from cached value
     return result
 
@@ -472,18 +535,17 @@ def _execute_torch(
 # 9. Environment auto-detection
 # ===========================================================================
 
-_NCU_SEARCH_PATHS_WIN: list[str] = [
-    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.1\ncu.exe",
-    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2024.3\ncu.exe",
-    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2024.1\ncu.exe",
-    r"C:\Program Files\NVIDIA Corporation\Nsight Compute 2023.3\ncu.exe",
+_NCU_SEARCH_GLOBS_WIN: list[str] = [
+    r"C:\Program Files\NVIDIA Corporation\Nsight Compute *\ncu.exe",
+    r"C:\Program Files\NVIDIA Corporation\Nsight Compute *\ncu.bat",
+    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\ncu.exe",
 ]
-
-_NSYS_SEARCH_PATHS_WIN: list[str] = [
-    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.1.1\target-windows-x64\nsys.exe",
-    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.6.1\target-windows-x64\nsys.exe",
-    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2024.3.1\target-windows-x64\nsys.exe",
-    r"C:\Program Files\NVIDIA Corporation\Nsight Systems 2023.4.1\target-windows-x64\nsys.exe",
+_NSYS_SEARCH_GLOBS_WIN: list[str] = [
+    r"C:\Program Files\NVIDIA Corporation\Nsight Systems *\target-windows-x64\nsys.exe",
+    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\nsys.exe",
+]
+_NVCC_SEARCH_GLOBS_WIN: list[str] = [
+    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*\bin\nvcc.exe",
 ]
 
 _NVCC_SEARCH_GLOBS_LIN: list[str] = [
@@ -501,6 +563,21 @@ _NSYS_SEARCH_GLOBS_LIN: list[str] = [
     "/opt/nvidia/nsight-systems-*/target-linux-x64/nsys",
     "/opt/nvidia/nsight-systems-*/bin/nsys",
 ]
+
+
+def _platform_globs(name: str) -> list[str]:
+    """Return the built-in glob patterns for `name` on the current platform."""
+    if sys.platform == "win32":
+        return {
+            "ncu": _NCU_SEARCH_GLOBS_WIN,
+            "nsys": _NSYS_SEARCH_GLOBS_WIN,
+            "nvcc": _NVCC_SEARCH_GLOBS_WIN,
+        }.get(name, [])
+    return {
+        "ncu": _NCU_SEARCH_GLOBS_LIN,
+        "nsys": _NSYS_SEARCH_GLOBS_LIN,
+        "nvcc": _NVCC_SEARCH_GLOBS_LIN,
+    }.get(name, [])
 
 
 def _detect_arch_flags() -> str | None:
@@ -553,28 +630,26 @@ def _detect_msvc_ccbin() -> str | None:
     return None
 
 
-def _detect_tool_path(on_path_name: str, search_list: list[str]) -> str | None:
-    """Return the first existing path in search_list if the tool is not on PATH."""
-    if shutil.which(on_path_name) is not None:
-        return None
-    for candidate in search_list:
-        if Path(candidate).exists():
-            return candidate
-    return None
-
-
-def _detect_tool_path_linux(on_path_name: str, glob_patterns: list[str]) -> str | None:
-    """Search Linux CUDA install paths via glob; pick newest version by lexicographic sort."""
+def _glob_candidates(glob_patterns: list[str]) -> list[str]:
+    """Expand glob patterns and return existing files, newest first by lex sort."""
     import glob as _glob
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for pattern in glob_patterns:
+        for hit in _glob.glob(pattern):
+            if hit not in seen and Path(hit).is_file():
+                seen.add(hit)
+                ordered.append(hit)
+    ordered.sort(reverse=True)
+    return ordered
+
+
+def _detect_tool_path_glob(on_path_name: str, glob_patterns: list[str]) -> str | None:
+    """Search install paths via glob; pick newest version by lex sort."""
     if shutil.which(on_path_name) is not None:
         return None
-    candidates: list[str] = []
-    for pattern in glob_patterns:
-        candidates.extend(_glob.glob(pattern))
-    for candidate in sorted(candidates, reverse=True):
-        if Path(candidate).is_file():
-            return candidate
-    return None
+    candidates = _glob_candidates(glob_patterns)
+    return candidates[0] if candidates else None
 
 
 def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]:
@@ -606,31 +681,25 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
                 "set AGENT_NVCC_CCBIN if compilation fails on Windows"
             )
 
-    if cfg.nvcc_bin == "nvcc" and sys.platform != "win32":
-        detected = _detect_tool_path_linux("nvcc", _NVCC_SEARCH_GLOBS_LIN)
+    if cfg.nvcc_bin == "nvcc":
+        detected = _detect_tool_path_glob("nvcc", _platform_globs("nvcc"))
         if detected:
             changes["nvcc_bin"] = detected
             notes.append(f"[auto-detect] nvcc: {detected}")
         elif shutil.which("nvcc") is None:
             notes.append(
-                "[auto-detect] nvcc: not found on PATH or known Linux paths. "
+                "[auto-detect] nvcc: not found on PATH or known install paths. "
                 "Set AGENT_NVCC_BIN or call probe_environment tool at runtime."
             )
 
     if cfg.ncu_bin == "ncu":
-        detected = (
-            _detect_tool_path("ncu", _NCU_SEARCH_PATHS_WIN) if sys.platform == "win32"
-            else _detect_tool_path_linux("ncu", _NCU_SEARCH_GLOBS_LIN)
-        )
+        detected = _detect_tool_path_glob("ncu", _platform_globs("ncu"))
         if detected:
             changes["ncu_bin"] = detected
             notes.append(f"[auto-detect] ncu: {detected}")
 
     if cfg.nsys_bin == "nsys":
-        detected = (
-            _detect_tool_path("nsys", _NSYS_SEARCH_PATHS_WIN) if sys.platform == "win32"
-            else _detect_tool_path_linux("nsys", _NSYS_SEARCH_GLOBS_LIN)
-        )
+        detected = _detect_tool_path_glob("nsys", _platform_globs("nsys"))
         if detected:
             changes["nsys_bin"] = detected
             notes.append(f"[auto-detect] nsys: {detected}")
@@ -696,24 +765,14 @@ class Executor:
         Safe to call at any point during agent execution.
         """
         import dataclasses
-        import glob as _glob
 
         with self._cfg_lock:
             cfg = self._cfg
 
-        def _first_glob(patterns: list[str]) -> str | None:
-            candidates: list[str] = []
-            for p in patterns:
-                candidates.extend(_glob.glob(p))
-            for c in sorted(candidates, reverse=True):
-                if Path(c).is_file():
-                    return c
-            return None
-
         scan = [
-            ("nvcc", cfg.nvcc_bin, _NVCC_SEARCH_GLOBS_LIN if sys.platform != "win32" else []),
-            ("ncu",  cfg.ncu_bin,  _NCU_SEARCH_GLOBS_LIN  if sys.platform != "win32" else _NCU_SEARCH_PATHS_WIN),
-            ("nsys", cfg.nsys_bin, _NSYS_SEARCH_GLOBS_LIN if sys.platform != "win32" else _NSYS_SEARCH_PATHS_WIN),
+            ("nvcc", cfg.nvcc_bin, _platform_globs("nvcc")),
+            ("ncu",  cfg.ncu_bin,  _platform_globs("ncu")),
+            ("nsys", cfg.nsys_bin, _platform_globs("nsys")),
         ]
 
         found: dict[str, str] = {}
@@ -729,10 +788,8 @@ class Executor:
             if hit and not force_rescan:
                 already[name] = hit
                 continue
-            if sys.platform == "win32":
-                hit = next((p for p in patterns if Path(p).is_file()), None)
-            else:
-                hit = _first_glob(patterns)
+            candidates = _glob_candidates(patterns)
+            hit = candidates[0] if candidates else None
             if hit:
                 found[name] = hit
                 changes[f"{name}_bin"] = hit
@@ -753,6 +810,60 @@ class Executor:
                 f"Not found: {not_found}. "
                 "Set AGENT_NVCC_BIN / AGENT_NCU_BIN / AGENT_NSYS_BIN env vars."
                 if not_found else "All CUDA tools resolved."
+            ),
+        }
+
+    def find_binary(
+        self,
+        name: str,
+        extra_globs: list[str] | None = None,
+        reconfigure: bool = True,
+    ) -> dict:
+        """Search for one binary using built-in glob patterns plus agent-supplied ones.
+
+        Use this when probe_environment came back empty because the install path
+        doesn't match the built-in patterns. Returns every candidate found,
+        picks the lex-newest, and (if reconfigure=True) updates the Executor
+        config so subsequent ncu/nsys/nvcc calls use it.
+
+        Does NOT execute any binary — only Path.is_file() checks.
+        """
+        import dataclasses
+
+        if name not in {"ncu", "nsys", "nvcc"}:
+            return {
+                "ok": False,
+                "error": "invalid_name",
+                "error_class": "user_code",
+                "message": f"name must be one of 'ncu', 'nsys', 'nvcc'; got {name!r}",
+            }
+
+        patterns = list(_platform_globs(name))
+        if extra_globs:
+            patterns.extend(extra_globs)
+
+        candidates = _glob_candidates(patterns)
+        on_path = shutil.which(name)
+        if on_path and on_path not in candidates:
+            candidates.insert(0, on_path)
+
+        chosen = candidates[0] if candidates else None
+        reconfigured = False
+        if chosen and reconfigure:
+            with self._cfg_lock:
+                self._cfg = dataclasses.replace(self._cfg, **{f"{name}_bin": chosen})
+            reconfigured = True
+
+        return {
+            "ok": True,
+            "name": name,
+            "candidates": candidates,
+            "chosen": chosen,
+            "reconfigured": reconfigured,
+            "patterns_searched": patterns,
+            "hint": (
+                f"No '{name}' binary matched. Pass extra_globs with the install path."
+                if not candidates else None
             ),
         }
 

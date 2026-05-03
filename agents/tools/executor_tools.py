@@ -48,13 +48,23 @@ def _exec_result_to_response(result: dict, label: str) -> ToolResponse:
             stats={"elapsed_s": elapsed},
         )
 
-    # error path
+    # error path — keep the full result dict reachable via .data so the LLM can
+    # inspect hint / stdout_tail / report_path / kernel_name / returncode etc.
     error_class = result.get("error_class", "unknown")
-    detail      = result.get("stderr") or result.get("detail") or result.get("message") or ""
+    error_kind  = result.get("error", "unknown_error")
+    hint        = result.get("hint") or ""
+    detail      = result.get("stderr") or result.get("stdout_tail") or result.get("detail") or result.get("message") or ""
     snippet     = str(detail)[:300] if detail else ""
+
+    parts = [f"{label} failed ({error_class}/{error_kind})"]
+    if hint:
+        parts.append(f"hint: {hint}")
+    if snippet:
+        parts.append(f"detail: {snippet}")
     return ToolResponse.error(
         code=error_class,
-        message=f"{label} failed ({error_class}): {snippet}",
+        message=" | ".join(parts),
+        data=result,
         stats={"elapsed_s": result.get("elapsed_s")},
     )
 
@@ -515,9 +525,87 @@ class ProbeEnvironmentTool(Tool):
                 code=result.get("error_class", "probe_error"),
                 message=str(result.get("error", "probe_environment failed")),
             )
-        found = result.get("found", {})
-        summary = "; ".join(f"{k}={v}" for k, v in found.items()) if found else "no binaries found"
+        already = result.get("already_configured", {})
+        newly = result.get("newly_found", {})
+        not_found = result.get("not_found", [])
+        parts: List[str] = []
+        if already:
+            parts.append("already: " + ", ".join(f"{k}={v}" for k, v in already.items()))
+        if newly:
+            parts.append("newly: " + ", ".join(f"{k}={v}" for k, v in newly.items()))
+        if not_found:
+            parts.append("missing: " + ", ".join(not_found))
+        summary = "; ".join(parts) if parts else "no binaries known"
         return ToolResponse.success(
             text=f"Environment scan complete: {summary}",
             data=result,
         )
+
+
+# ---------------------------------------------------------------------------
+# find_binary
+# ---------------------------------------------------------------------------
+
+class FindBinaryTool(Tool):
+    def __init__(self, executor: Any) -> None:
+        super().__init__(
+            name="find_binary",
+            description=(
+                "Search for a single CUDA tool binary (ncu, nsys, or nvcc) using built-in "
+                "glob patterns plus optional caller-supplied globs. Use this if "
+                "probe_environment came back empty and you know the install path "
+                "(e.g. a non-standard drive or a fresh Nsight version not yet in the "
+                "built-in list). Returns every candidate found and reconfigures the "
+                "Executor to the lex-newest one. Does NOT run any subprocess."
+            ),
+        )
+        self._executor = executor
+
+    def get_parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="name",
+                type="string",
+                description="Binary name: 'ncu', 'nsys', or 'nvcc'.",
+                required=True,
+            ),
+            ToolParameter(
+                name="extra_globs",
+                type="array",
+                description=(
+                    "Optional list of glob patterns to add to the search, e.g. "
+                    "['D:/Nsight/**/ncu.bat']. Patterns are merged with built-in ones."
+                ),
+                required=False,
+                default=[],
+            ),
+            ToolParameter(
+                name="reconfigure",
+                type="boolean",
+                description="If true (default), update Executor config with the chosen path.",
+                required=False,
+                default=True,
+            ),
+        ]
+
+    def run(self, parameters: Dict[str, Any]) -> ToolResponse:
+        result = self._executor.find_binary(**parameters)
+        if not result.get("ok", False):
+            return ToolResponse.error(
+                code=result.get("error_class", "find_binary_error"),
+                message=str(result.get("message") or result.get("error") or "find_binary failed"),
+            )
+        chosen = result.get("chosen")
+        candidates = result.get("candidates", [])
+        if chosen:
+            text = (
+                f"find_binary({result.get('name')}): chose {chosen}"
+                + (f" (out of {len(candidates)} candidates)" if len(candidates) > 1 else "")
+                + (" [reconfigured]" if result.get("reconfigured") else "")
+            )
+        else:
+            text = (
+                f"find_binary({result.get('name')}): no candidates matched. "
+                f"Searched {len(result.get('patterns_searched', []))} patterns."
+            )
+        return ToolResponse.success(text=text, data=result)

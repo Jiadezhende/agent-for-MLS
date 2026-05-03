@@ -34,6 +34,8 @@ class ProfileAnalysisAgent(LLMStageAgent):
         "profile_with_nsys",
         "submit_profile_analysis",
         "flag_event",
+        "probe_environment",
+        "find_binary",
     )
     max_iterations = 12
     SYSTEM_PROMPT = _SYSTEM_PROMPT

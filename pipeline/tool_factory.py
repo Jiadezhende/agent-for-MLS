@@ -117,6 +117,7 @@ class StageToolFactory:
         # an executor is available so unit tests without GPU still work.
         if self._executor is not None:
             from agents.tools.executor_tools import (
+                FindBinaryTool,
                 ProbeEnvironmentTool,
                 ProfileWithNcuTool,
                 ProfileWithNsysTool,
@@ -131,6 +132,7 @@ class StageToolFactory:
                 "profile_with_nsys":    ProfileWithNsysTool(self._executor),
                 "profile_with_torch":   ProfileWithTorchTool(self._executor),
                 "probe_environment":    ProbeEnvironmentTool(self._executor),
+                "find_binary":          FindBinaryTool(self._executor),
             })
             if self._op_spec is not None:
                 catalogue["generate_baseline"] = GenerateBaselineTool(

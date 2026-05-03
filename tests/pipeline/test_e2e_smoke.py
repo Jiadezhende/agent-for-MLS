@@ -143,6 +143,9 @@ class _ScriptedExecutor:
     def probe_environment(self, *_a, **_kw):
         return {"stdout": ""}
 
+    def find_binary(self, *_a, **_kw):
+        return {"ok": True, "candidates": [], "chosen": None, "reconfigured": False}
+
 
 # ---------------------------------------------------------------------------
 # Stage scripts

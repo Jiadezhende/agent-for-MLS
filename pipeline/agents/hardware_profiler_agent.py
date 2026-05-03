@@ -47,6 +47,7 @@ class HardwareProfilerAgent(LLMStageAgent):
         "submit_hardware_profile",
         "write_workspace_file",
         "probe_environment",
+        "find_binary",
     )
     max_iterations = 30
     SYSTEM_PROMPT = _SYSTEM_PROMPT

@@ -81,11 +81,12 @@ class ToolResponse:
         code: str,
         message: str,
         stats: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> ToolResponse:
         return cls(
             status=ToolStatus.ERROR,
             text=message,
-            data={},
+            data=data or {},
             error_info={"code": code, "message": message},
             stats=stats,
         )

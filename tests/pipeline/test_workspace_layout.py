@@ -33,7 +33,7 @@ class TestRunIdAndCandidateId:
 class TestRunLayoutPaths:
     def test_all_top_level_paths_under_root(self, tmp_path):
         layout = RunLayout(tmp_path, "run_xyz")
-        # Every advertised path should be inside runs/run_xyz
+        # Every advertised path should be inside run_xyz
         for p in (
             layout.state_path,
             layout.events_path,
@@ -123,7 +123,7 @@ class TestRelpath:
     def test_relpath_under_workspace(self, tmp_path):
         layout = RunLayout(tmp_path, "run_xyz")
         rel = layout.relpath(layout.best_cu_path)
-        assert rel == "runs/run_xyz/best/best.cu"
+        assert rel == "run_xyz/best/best.cu"
 
     def test_relpath_outside_workspace_returns_absolute(self, tmp_path):
         layout = RunLayout(tmp_path, "run_xyz")

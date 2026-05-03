@@ -1,4 +1,4 @@
-"""pipeline/workspace_layout.py — runs/<run_id>/ directory layout helpers.
+"""pipeline/workspace_layout.py — <run_id>/ directory layout helpers.
 
 Owns all path construction so other modules never hand-build relative paths.
 Pure path math + a tiny set of artifact-existence helpers; no schema logic
@@ -57,11 +57,11 @@ def candidate_id(index: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# RunLayout — owns one runs/<run_id>/ directory.
+# RunLayout — owns one <run_id>/ directory.
 # ---------------------------------------------------------------------------
 
 class RunLayout:
-    """All paths are absolute Path objects, rooted at workspace_root/runs/<run_id>.
+    """All paths are absolute Path objects, rooted at workspace_root/<run_id>.
 
     Use `mkdir()` once at INIT to create the skeleton; all other path methods
     just return paths without creating them. Artifact-existence helpers
@@ -72,7 +72,7 @@ class RunLayout:
     def __init__(self, workspace_root: str | Path, run_id: str):
         self.workspace_root = Path(workspace_root).resolve()
         self.run_id = run_id
-        self.root: Path = self.workspace_root / "runs" / run_id
+        self.root: Path = self.workspace_root / run_id
 
     # ---- top-level files -------------------------------------------------
 

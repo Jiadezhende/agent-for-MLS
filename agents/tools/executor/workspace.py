@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shutil
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 from agents.core.exceptions import ExecutorError
@@ -37,9 +36,7 @@ class _Workspace:
     SUBDIRS = ("src", "bin", "ncu", "nsys", "logs")
 
     def __init__(self, root: str) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        uid = uuid.uuid4().hex[:8]
-        self.root = Path(root).resolve() / f"run_{ts}_{uid}"
+        self.root = Path(root).resolve() / "exec"
         self.root.mkdir(parents=True, exist_ok=True)
         for sub in self.SUBDIRS:
             (self.root / sub).mkdir(exist_ok=True)

@@ -90,19 +90,20 @@ def main() -> None:
         print(f"[error] operator schema: {e}", file=sys.stderr)
         sys.exit(2)
 
+    # ---- run identity (before executor so workspace lands inside run dir) --
+    # Mint the run_id up front so layout, executor workspace, tool_factory,
+    # and orchestrator all share the same root directory.
+    run_id = args.run_id or make_run_id()
+    layout = RunLayout(args.workspace, run_id)
+    layout.mkdir()
+
     # ---- services ------------------------------------------------------
+    exec_cfg.workspace_root = str(layout.root)
     executor = Executor(exec_cfg)
     for note in executor.detect_notes:
         print(note, file=sys.stderr)
 
     llm = LLMClient(llm_cfg)
-
-    # Mint the run_id up front so layout, tool_factory, and orchestrator all
-    # share the same identity. PipelineOrchestrator will resume if state.json
-    # already exists for this id.
-    run_id = args.run_id or make_run_id()
-    layout = RunLayout(args.workspace, run_id)
-    layout.mkdir()
 
     tool_factory = StageToolFactory(executor=executor, layout=layout, op_spec=op_spec)
 

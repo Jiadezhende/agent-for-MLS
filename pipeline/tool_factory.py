@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from agents.tools.base import Tool
-from agents.tools.registry import ToolRegistry
+from agent.tools.base import Tool
+from agent.tools.registry import ToolRegistry
 
 from .operator_spec import OperatorSpec
 from .state import Stage
@@ -65,11 +65,11 @@ class StageToolFactory:
 
     def _build_all_tools(self, current_stage: Stage) -> dict[str, Tool]:
         # Reused builtin tools (no behavioural changes).
-        from agents.tools.builtin.recording import (
+        from agent.tools.builtin.recording import (
             FlagEventTool,
             RecordMeasurementTool,
         )
-        from agents.tools.builtin.skills import ListSkillsTool, ReadSkillTool
+        from agent.tools.builtin.skills import ListSkillsTool, ReadSkillTool
 
         # New stage-specific tools.
         from .tools.spec_tools import SubmitBenchmarkSpecsTool
@@ -116,7 +116,7 @@ class StageToolFactory:
         # Optional reused tools that need the executor; only register when
         # an executor is available so unit tests without GPU still work.
         if self._executor is not None:
-            from agents.tools.executor_tools import (
+            from agent.tools.executor_tools import (
                 FindBinaryTool,
                 ProbeEnvironmentTool,
                 ProfileWithNcuTool,

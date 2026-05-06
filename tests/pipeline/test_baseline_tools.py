@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from agents.core.types import AgentContext, MemoryStore
-from agents.tools.circuit_breaker import CircuitBreaker
-from agents.tools.registry import _Terminated
+from agent.core.types import AgentContext, MemoryStore
+from agent.tools.circuit_breaker import CircuitBreaker
+from agent.tools.registry import _Terminated
 
 from pipeline.agent_loop_signal import pop_stage_result
 from pipeline.operator_spec import OperatorSpec

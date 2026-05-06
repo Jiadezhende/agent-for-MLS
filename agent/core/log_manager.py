@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from agents.core.types import CriticDecision, WorkerOutput
+    from agent.core.types import CriticDecision, WorkerOutput
 
 
 @dataclass

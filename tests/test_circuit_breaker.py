@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import pytest
 
-from agents.core.types import AgentContext, CircuitBreaker, MemoryStore
-from agents.tools.base import Tool, ToolParameter
-from agents.tools.registry import ToolRegistry
-from agents.tools.response import ToolErrorCode, ToolResponse, ToolStatus
+from agent.core.types import AgentContext, CircuitBreaker, MemoryStore
+from agent.tools.base import Tool, ToolParameter
+from agent.tools.registry import ToolRegistry
+from agent.tools.response import ToolErrorCode, ToolResponse, ToolStatus
 
 
 # ---------------------------------------------------------------------------

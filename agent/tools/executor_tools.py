@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from agents.tools.base import Tool, ToolParameter
-from agents.tools.response import ToolResponse
+from agent.tools.base import Tool, ToolParameter
+from agent.tools.response import ToolResponse
 
 
 # ---------------------------------------------------------------------------

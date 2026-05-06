@@ -7,8 +7,8 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from agents.core.types import Step, WorkerOutput
-    from agents.tools.registry import ToolRegistry
+    from agent.core.types import Step, WorkerOutput
+    from agent.tools.registry import ToolRegistry
 
 
 class Agent(ABC):

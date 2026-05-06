@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from agents.core.types import AgentContext, Result
-from agents.tools.base import Tool, ToolParameter
-from agents.tools.registry import _Terminated
-from agents.tools.response import ToolErrorCode, ToolResponse
+from agent.core.types import AgentContext, Result
+from agent.tools.base import Tool, ToolParameter
+from agent.tools.registry import _Terminated
+from agent.tools.response import ToolErrorCode, ToolResponse
 
 
 class RecordMeasurementTool(Tool):

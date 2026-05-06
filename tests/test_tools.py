@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import pytest
 
-from agents.tools.registry import _Terminated
-from agents.tools.builtin.recording import (
+from agent.tools.registry import _Terminated
+from agent.tools.builtin.recording import (
     FlagEventTool,
     RecordMeasurementTool,
     SubmitResultsTool,
 )
-from agents.tools.builtin.skills import ListSkillsTool, ReadSkillTool
-from agents.tools.response import ToolErrorCode, ToolStatus
+from agent.tools.builtin.skills import ListSkillsTool, ReadSkillTool
+from agent.tools.response import ToolErrorCode, ToolStatus
 
 
 # ---------------------------------------------------------------------------

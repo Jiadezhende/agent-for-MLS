@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agents.core.llm import ChatResponse, ToolCall
+from agent.core.llm import ChatResponse, ToolCall
 
 from pipeline.agents import (
     BaselineAgent,

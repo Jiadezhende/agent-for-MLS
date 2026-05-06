@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-from agents.tools.base import Tool, ToolParameter
-from agents.tools.response import ToolErrorCode, ToolResponse
+from agent.tools.base import Tool, ToolParameter
+from agent.tools.response import ToolErrorCode, ToolResponse
 
 _SKILLS_DIR = Path(__file__).parent.parent.parent.parent / "skills"
 _MAX_BYTES   = 32 * 1024

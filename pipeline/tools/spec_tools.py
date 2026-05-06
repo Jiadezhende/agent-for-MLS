@@ -8,9 +8,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from agents.tools.base import Tool, ToolParameter
-from agents.tools.registry import _Terminated
-from agents.tools.response import ToolErrorCode, ToolResponse
+from agent.tools.base import Tool, ToolParameter
+from agent.tools.registry import _Terminated
+from agent.tools.response import ToolErrorCode, ToolResponse
 
 from ..agent_loop_signal import stash_stage_result
 from ..state import BENCHMARK_SPEC_SLOTS, Stage, StageResult

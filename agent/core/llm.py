@@ -14,7 +14,7 @@ from typing import Any
 
 import openai
 
-from agents.core.config import LLMConfig
+from agent.core.config import LLMConfig
 
 
 def _is_reasoning_model(model: str) -> bool:

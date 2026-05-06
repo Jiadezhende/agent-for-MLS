@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 from pydantic import BaseModel
 
-from agents.tools.response import ToolErrorCode, ToolResponse
+from agent.tools.response import ToolErrorCode, ToolResponse
 
 
 class ToolParameter(BaseModel):

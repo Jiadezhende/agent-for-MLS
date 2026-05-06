@@ -16,6 +16,7 @@ class Message:
     tool_call_id: str | None = None
     name: str | None = None
 
+    # 字典<-->Message互转，方便序列化
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"role": self.role, "content": self.content}
         if self.tool_calls is not None:

@@ -4,15 +4,15 @@ import sys
 import uuid
 from pathlib import Path
 
-from agents.core.config import ExecutorConfig
-from agents.core.exceptions import ExecutorError
-from agents.tools.executor.binaries import _check_binary
-from agents.tools.executor.classifiers import (
+from agent.core.config import ExecutorConfig
+from agent.core.exceptions import ExecutorError
+from agent.tools.executor.binaries import _check_binary
+from agent.tools.executor.classifiers import (
     _classify_subprocess_failure,
     _extract_nvcc_errors,
 )
-from agents.tools.executor.subprocess_runner import _run_subprocess
-from agents.tools.executor.workspace import _Workspace
+from agent.tools.executor.subprocess_runner import _run_subprocess
+from agent.tools.executor.workspace import _Workspace
 
 
 def _compile_cuda_for_ncu(

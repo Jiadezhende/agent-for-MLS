@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents.core.types import AgentContext, MemoryStore
-from agents.tools.circuit_breaker import CircuitBreaker
+from agent.core.types import AgentContext, MemoryStore
+from agent.tools.circuit_breaker import CircuitBreaker
 
 from ..agent_loop_signal import pop_stage_result
 from ..stage_agent import StageAgent
@@ -42,7 +42,7 @@ class LLMStageAgent(StageAgent):
     # --- run() — delegates to AgentLoop ---------------------------------
     def run(self, context: StageContext) -> StageResult:
         # Lazy import keeps test isolation cheap.
-        from agents.core.loop import AgentLoop
+        from agent.core.loop import AgentLoop
 
         agent_ctx = AgentContext(
             memory=MemoryStore(),

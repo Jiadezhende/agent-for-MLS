@@ -9,10 +9,10 @@ from __future__ import annotations
 import json
 import sys
 
-from agents.core.llm import LLMClient
-from agents.core.types import AgentContext
-from agents.tools.registry import ToolRegistry, _Terminated
-from agents.tools.response import ToolResponse, ToolStatus
+from agent.core.llm import LLMClient
+from agent.core.types import AgentContext
+from agent.tools.registry import ToolRegistry, _Terminated
+from agent.tools.response import ToolResponse, ToolStatus
 
 
 _LARGE_TEXT_ARGS: frozenset[str] = frozenset({"source", "source_or_path", "python_code", "content"})

@@ -4,7 +4,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from agents.core.exceptions import ExecutorError
+from agent.core.exceptions import ExecutorError
 
 
 def _safe_join(root: Path, rel: str) -> Path:

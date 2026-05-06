@@ -27,10 +27,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agents.tools.circuit_breaker import CircuitBreaker  # noqa: F401 (re-exported for imports)
+from agent.tools.circuit_breaker import CircuitBreaker  # noqa: F401 (re-exported for imports)
 
 if TYPE_CHECKING:
-    from agents.core.log_manager import LogManager
+    from agent.core.log_manager import LogManager
 
 
 # ===========================================================================

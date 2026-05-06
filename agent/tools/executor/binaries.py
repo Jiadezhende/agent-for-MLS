@@ -3,8 +3,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from agents.core.config import ExecutorConfig
-from agents.core.exceptions import ExecutorError
+from agent.core.config import ExecutorConfig
+from agent.core.exceptions import ExecutorError
 
 
 _BINARY_HINTS: dict[str, str] = {

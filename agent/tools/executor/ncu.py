@@ -3,9 +3,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from agents.core.config import ExecutorConfig
-from agents.tools.executor.binaries import _check_binary
-from agents.tools.executor.subprocess_runner import _run_subprocess
+from agent.core.config import ExecutorConfig
+from agent.tools.executor.binaries import _check_binary
+from agent.tools.executor.subprocess_runner import _run_subprocess
 
 
 def _precheck_ncu_permission() -> str | None:

@@ -13,10 +13,10 @@ from typing import Any
 
 import jsonschema
 
-from agents.core.types import AgentContext
-from agents.tools.base import Tool
-from agents.tools.circuit_breaker import CircuitBreaker
-from agents.tools.response import ToolErrorCode, ToolResponse, ToolStatus
+from agent.core.types import AgentContext
+from agent.tools.base import Tool
+from agent.tools.circuit_breaker import CircuitBreaker
+from agent.tools.response import ToolErrorCode, ToolResponse, ToolStatus
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +150,13 @@ class ToolFactory:
         self._executor = executor
 
     def build(self, tool_names: list[str]) -> ToolRegistry:
-        from agents.tools.builtin.recording import (
+        from agent.tools.builtin.recording import (
             FlagEventTool,
             RecordMeasurementTool,
             SubmitResultsTool,
         )
-        from agents.tools.builtin.skills import ListSkillsTool, ReadSkillTool
-        from agents.tools.executor_tools import (
+        from agent.tools.builtin.skills import ListSkillsTool, ReadSkillTool
+        from agent.tools.executor_tools import (
             ProfileWithNcuTool,
             ProfileWithNsysTool,
             ProfileWithTorchTool,

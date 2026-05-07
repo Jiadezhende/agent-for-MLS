@@ -15,7 +15,6 @@ from operator_opt_pipe.state import (
     SCHEMA_VERSION,
     Stage,
     append_history,
-    check_submit_payload,
     load_blackboard,
     make_run_id,
     save_blackboard,
@@ -46,8 +45,7 @@ def test_make_run_id_is_unique_and_sortable():
     a = make_run_id()
     b = make_run_id()
     assert a != b
-    # Lexical ordering reflects time ordering.
-    assert a <= b or a >= b  # both valid; either ordering is fine.
+    assert a <= b or a >= b
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +87,23 @@ def test_runlayout_paths_under_run_dir(tmp_path: Path):
     assert layout.blackboard_path == layout.run_dir / "blackboard.json"
     assert layout.best_cu_path == layout.run_dir / "best" / "best.cu"
     assert layout.candidate_dir("candidate_001") == layout.run_dir / "candidates" / "candidate_001"
+    # Single-file artifacts live directly under run_dir (not in their own subdir).
+    assert layout.hardware_path == layout.run_dir / "hardware_profile.json"
+    assert layout.baseline_path == layout.run_dir / "baseline.json"
+    assert layout.final_report_path == layout.run_dir / "final_report.json"
+    assert layout.summary_path == layout.run_dir / "summary.md"
+    # Multi-file dirs use semantic names.
+    assert layout.inputs_dir == layout.run_dir / "inputs"
+    assert layout.oracle_dir == layout.run_dir / "oracle"
+    # Per-run build / exec roots so artifacts don't escape the run.
+    assert layout.build_dir == layout.run_dir / "build"
+    assert layout.exec_dir == layout.run_dir / "exec"
+
+
+def test_runlayout_input_and_oracle_paths(tmp_path: Path):
+    layout = RunLayout(workspace_root=tmp_path, run_id="r")
+    assert layout.input_path("W", "d3584") == layout.inputs_dir / "W_d3584.pt"
+    assert layout.oracle_path("Y", "d3584") == layout.oracle_dir / "Y_d3584.pt"
 
 
 def test_runlayout_predicates_react_to_filesystem(tmp_path: Path):
@@ -96,22 +111,20 @@ def test_runlayout_predicates_react_to_filesystem(tmp_path: Path):
     layout.mkdir()
     assert not layout.has_hardware_profile()
     assert not layout.has_baseline()
-    assert not layout.has_best()
 
     layout.hardware_path.write_text("{}", encoding="utf-8")
     layout.baseline_path.write_text("{}", encoding="utf-8")
-    layout.best_cu_path.write_text("// stub", encoding="utf-8")
     assert layout.has_hardware_profile()
     assert layout.has_baseline()
-    assert layout.has_best()
 
 
 def test_runlayout_mkdir_is_idempotent(tmp_path: Path):
     layout = RunLayout(workspace_root=tmp_path, run_id="run_abc")
     layout.mkdir()
-    # Calling again should not raise.
     layout.mkdir()
     assert layout.run_dir.is_dir()
+    assert layout.build_dir.is_dir()
+    assert layout.exec_dir.is_dir()
 
 
 def test_candidate_id_formatting():
@@ -166,42 +179,3 @@ def test_append_history_preserves_other_keys(tmp_path: Path):
     bb = load_blackboard(layout)
     assert bb["best"] == {"speedup": 1.5}
     assert bb["history"] == [{"step": "ANALYZE", "ts": "now"}]
-
-
-# ---------------------------------------------------------------------------
-# check_submit_payload
-# ---------------------------------------------------------------------------
-
-
-def test_check_submit_payload_success():
-    ok, errs = check_submit_payload({"status": "success"}, Stage.HARDWARE_PROFILE)
-    assert ok and errs == []
-
-
-def test_check_submit_payload_status_required():
-    ok, errs = check_submit_payload({}, None)
-    assert not ok
-    assert any("status" in e for e in errs)
-
-
-def test_check_submit_payload_invalid_status():
-    ok, errs = check_submit_payload({"status": "bogus"}, None)
-    assert not ok
-
-
-def test_check_submit_payload_stage_mismatch():
-    ok, errs = check_submit_payload(
-        {"status": "success", "stage": "FINALIZE"}, Stage.HARDWARE_PROFILE
-    )
-    assert not ok
-
-
-def test_check_submit_payload_non_dict():
-    ok, errs = check_submit_payload([], None)
-    assert not ok
-
-
-def test_check_submit_payload_stage_optional():
-    """Missing stage tag is tolerated (e.g. submit_diagnosis defaults)."""
-    ok, errs = check_submit_payload({"status": "partial"}, Stage.TUNING_LOOP)
-    assert ok and errs == []

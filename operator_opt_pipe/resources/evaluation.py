@@ -29,7 +29,7 @@ from typing import Any
 
 from operator_opt_pipe.resources.benchmark import (
     BenchmarkSpec,
-    _parse_marked_output,
+    parse_marked_output,
 )
 from operator_opt_pipe.resources.contract import OperatorContract
 
@@ -117,8 +117,9 @@ def compile_and_check_quick(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    references_dir: Path,
+    oracle_dir: Path,
     sample_shape: int,
+    build_dir: Path,
     *,
     executor,
 ) -> QuickEvalResult:
@@ -126,7 +127,9 @@ def compile_and_check_quick(
 
     Used by ``write_candidate`` so the LLM gets immediate feedback on
     syntax / type errors / wrong forward signatures without paying for
-    a full multi-shape benchmark.
+    a full multi-shape benchmark. ``build_dir`` is passed to
+    ``cpp_extension.load(build_directory=...)`` so .so artifacts live
+    under the run instead of ``~/.cache/torch_extensions/``.
     """
     shape_id_str = f"{contract.shape_param}{int(sample_shape)}"
     script = _build_quick_script(
@@ -134,7 +137,8 @@ def compile_and_check_quick(
         candidate_id=candidate_id,
         candidate_cu=candidate_cu,
         inputs_dir=inputs_dir,
-        references_dir=references_dir,
+        oracle_dir=oracle_dir,
+        build_dir=build_dir,
         shape_value=sample_shape,
         shape_id=shape_id_str,
     )
@@ -143,7 +147,7 @@ def compile_and_check_quick(
         op_name=f"quick_eval/{candidate_id}",
         timeout_s=600,
     )
-    raw = _parse_marked_output(job, _QUICK_MARKER)
+    raw = parse_marked_output(job, _QUICK_MARKER)
     return QuickEvalResult(
         candidate_id=candidate_id,
         compile_ok=bool(raw.get("compile_ok")),
@@ -167,8 +171,9 @@ def benchmark_on_grid(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    references_dir: Path,
+    oracle_dir: Path,
     baseline_per_shape: dict[str, dict[str, Any]],
+    build_dir: Path,
     *,
     executor,
 ) -> BenchmarkResult:
@@ -184,7 +189,8 @@ def benchmark_on_grid(
         candidate_id=candidate_id,
         candidate_cu=candidate_cu,
         inputs_dir=inputs_dir,
-        references_dir=references_dir,
+        oracle_dir=oracle_dir,
+        build_dir=build_dir,
         spec=spec,
     )
     job = executor.profile_with_torch(
@@ -192,7 +198,7 @@ def benchmark_on_grid(
         op_name=f"benchmark/{candidate_id}",
         timeout_s=900,
     )
-    raw = _parse_marked_output(job, _BENCH_MARKER)
+    raw = parse_marked_output(job, _BENCH_MARKER)
     if not raw.get("compile_ok"):
         return BenchmarkResult(
             candidate_id=candidate_id,
@@ -269,13 +275,15 @@ def _build_quick_script(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    references_dir: Path,
+    oracle_dir: Path,
+    build_dir: Path,
     shape_value: int,
     shape_id: str,
 ) -> str:
     cu_path_s = str(candidate_cu.resolve()).replace("\\", "/")
     inp_dir_s = inputs_dir.resolve().as_posix()
-    ref_dir_s = references_dir.resolve().as_posix()
+    ora_dir_s = oracle_dir.resolve().as_posix()
+    bld_dir_s = build_dir.resolve().as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
     forward_call = contract.render_forward_call("mod")
 
@@ -284,7 +292,7 @@ def _build_quick_script(
         "    ",
     )
     load_ref = textwrap.indent(
-        contract.render_load_reference(dir_var="REF_DIR", shape_id_expr="SHAPE_ID"),
+        contract.render_load_reference(dir_var="ORACLE_DIR", shape_id_expr="SHAPE_ID"),
         "    ",
     )
 
@@ -296,13 +304,16 @@ import traceback
 import torch
 from torch.utils.cpp_extension import load
 
-CU_PATH   = r"{cu_path_s}"
-INPUT_DIR = r"{inp_dir_s}"
-REF_DIR   = r"{ref_dir_s}"
+CU_PATH    = r"{cu_path_s}"
+INPUT_DIR  = r"{inp_dir_s}"
+ORACLE_DIR = r"{ora_dir_s}"
+BUILD_DIR  = r"{bld_dir_s}"
 SHAPE_VAL = {int(shape_value)}
 SHAPE_ID  = "{shape_id}"
 RTOL = {float(contract.rtol)}
 ATOL = {float(contract.atol)}
+
+os.makedirs(BUILD_DIR, exist_ok=True)
 
 result = {{
     "compile_ok": False,
@@ -323,6 +334,7 @@ try:
     mod = load(
         name="{cand_name}",
         sources=[CU_PATH],
+        build_directory=BUILD_DIR,
         verbose=False,
         extra_cuda_cflags=["-O3"],
         with_cuda=True,
@@ -364,13 +376,15 @@ def _build_bench_script(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    references_dir: Path,
+    oracle_dir: Path,
+    build_dir: Path,
     spec: BenchmarkSpec,
 ) -> str:
     shape_var = contract.shape_param
     cu_path_s = str(candidate_cu.resolve()).replace("\\", "/")
     inp_dir_s = inputs_dir.resolve().as_posix()
-    ref_dir_s = references_dir.resolve().as_posix()
+    ora_dir_s = oracle_dir.resolve().as_posix()
+    bld_dir_s = build_dir.resolve().as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
     forward_call = contract.render_forward_call("mod")
     grid_repr = json.dumps(list(spec.shape_grid))
@@ -380,7 +394,7 @@ def _build_bench_script(
         "        ",
     )
     load_ref = textwrap.indent(
-        contract.render_load_reference(dir_var="REF_DIR", shape_id_expr="shape_id"),
+        contract.render_load_reference(dir_var="ORACLE_DIR", shape_id_expr="shape_id"),
         "        ",
     )
 
@@ -395,12 +409,15 @@ from torch.utils.cpp_extension import load
 
 CU_PATH    = r"{cu_path_s}"
 INPUT_DIR  = r"{inp_dir_s}"
-REF_DIR    = r"{ref_dir_s}"
+ORACLE_DIR = r"{ora_dir_s}"
+BUILD_DIR  = r"{bld_dir_s}"
 SHAPE_GRID = {grid_repr}
 SAMPLES    = {int(spec.samples)}
 WARMUP     = {int(spec.warmup)}
 RTOL = {float(contract.rtol)}
 ATOL = {float(contract.atol)}
+
+os.makedirs(BUILD_DIR, exist_ok=True)
 
 result = {{"compile_ok": False, "compile_log": "", "per_shape": []}}
 
@@ -414,6 +431,7 @@ try:
     mod = load(
         name="{cand_name}",
         sources=[CU_PATH],
+        build_directory=BUILD_DIR,
         verbose=False,
         extra_cuda_cflags=["-O3"],
         with_cuda=True,

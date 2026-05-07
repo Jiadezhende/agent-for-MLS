@@ -22,23 +22,13 @@ import mls_agent
 from mls_agent import AgentConfig, NullObserver, StdoutObserver
 
 from operator_opt_pipe import agents as agents_mod
-from operator_opt_pipe.resources import (
-    OperatorContract,
-    shape_id as make_shape_id,
-)
+from operator_opt_pipe.resources import OperatorContract
 from operator_opt_pipe.resources.baseline import (
-    BaselineResult,
-    run_pytorch_baseline,
+    build_correctness_fixtures,
+    measure_pytorch_latency,
 )
-from operator_opt_pipe.resources.benchmark import (
-    BenchmarkSpec,
-    generate_benchmark_spec,
-    materialize_inputs,
-)
-from operator_opt_pipe.resources.evaluation import (
-    BenchmarkResult,
-    benchmark_on_grid,
-)
+from operator_opt_pipe.resources.benchmark import BenchmarkSpec
+from operator_opt_pipe.resources.evaluation import benchmark_on_grid
 from operator_opt_pipe.state import (
     ROUND_STEP_ANALYZE,
     ROUND_STEP_EVALUATE,
@@ -76,11 +66,14 @@ class RoundResult:
 
 # Type aliases
 BenchmarkRunner = Callable[..., Any]
-"""(contract, spec, candidate_id, candidate_cu, inputs_dir, references_dir,
-   baseline_per_shape, executor) -> BenchmarkResult-like (dict or .to_dict())."""
+"""(contract, spec, candidate_id, candidate_cu, inputs_dir, oracle_dir,
+   baseline_per_shape, build_dir, executor) -> BenchmarkResult-like."""
 
-BaselineRunner = Callable[..., Any]
-"""(contract, spec, inputs_dir, references_dir, executor) -> BaselineResult-like."""
+BaselineLatencyRunner = Callable[..., Any]
+"""(contract, spec, inputs_dir, executor) -> BaselineResult-like."""
+
+FixturesRunner = Callable[..., Any]
+"""(contract, spec, inputs_dir, oracle_dir, executor) -> dict."""
 
 PromoteCallback = Callable[[str, float | None], None]
 AgentRunner = Callable[..., dict]
@@ -130,14 +123,9 @@ class RoundRunner:
     # ------------------------------------------------------------------
 
     def run_one_round(self, remaining_budget_s: float) -> RoundResult:
-        bb = load_blackboard(self.layout)
-        bb["round"] = {
-            "index": self.round_index,
-            "started_at": _utcnow_iso(),
-            "budget_s": remaining_budget_s,
-        }
-        save_blackboard(self.layout, bb)
-
+        # Per-round metadata lives in events.jsonl + history entries — no
+        # need to clobber a blackboard["round"] field that gets overwritten
+        # every round and was never load-bearing.
         result = RoundResult(
             round_index=self.round_index,
             candidate_id=None, speedup=None, promoted=False,
@@ -273,9 +261,9 @@ class PipelineOrchestrator:
         run_id: str | None = None,
         verbose: bool = False,
         # Injection points — tests override; production uses resources.*
-        baseline_runner: BaselineRunner | None = None,
+        baseline_runner: BaselineLatencyRunner | None = None,
         benchmark_runner: BenchmarkRunner | None = None,
-        materialize_runner: Callable[..., Any] | None = None,
+        fixtures_runner: FixturesRunner | None = None,
         hardware_profiler: AgentRunner | None = None,
         initial_candidate_runner: AgentRunner | None = None,
         analyst_runner: AgentRunner | None = None,
@@ -297,9 +285,9 @@ class PipelineOrchestrator:
         self.verbose = verbose
 
         # Default deterministic resource runners
-        self.baseline_runner = baseline_runner or run_pytorch_baseline
+        self.baseline_runner = baseline_runner or measure_pytorch_latency
         self.benchmark_runner = benchmark_runner or benchmark_on_grid
-        self.materialize_runner = materialize_runner or materialize_inputs
+        self.fixtures_runner = fixtures_runner or build_correctness_fixtures
 
         # Default agent runners
         self._hardware_profiler = hardware_profiler or agents_mod.run_hardware_profiler
@@ -343,11 +331,11 @@ class PipelineOrchestrator:
         return state
 
     def _seed_blackboard(self) -> None:
-        """Seed blackboard with operator + benchmark spec snapshots.
+        """Seed blackboard with the operator snapshot. Idempotent.
 
-        Idempotent. Agents read these via read_blackboard; the spec also lives
-        on disk under benchmark/spec.json so it survives restarts uncoupled
-        from blackboard.json.
+        The benchmark spec is NOT persisted to the blackboard — it is
+        derived from the contract on demand (``BenchmarkSpec.for_contract``)
+        so there is one source of truth.
         """
         bb = load_blackboard(self.layout)
         bb["operator"] = {
@@ -359,14 +347,7 @@ class PipelineOrchestrator:
             "forward_signature": self.contract.forward_signature_text(),
             "reference_pytorch": self.contract.reference_pytorch,
         }
-        spec = generate_benchmark_spec(self.contract)
-        bb["benchmark"] = spec.to_dict()
         save_blackboard(self.layout, bb)
-        self.layout.benchmark_spec_path.parent.mkdir(parents=True, exist_ok=True)
-        self.layout.benchmark_spec_path.write_text(
-            json.dumps(spec.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
     def _save_state(self) -> None:
         self._tick_elapsed()
@@ -438,7 +419,6 @@ class PipelineOrchestrator:
             # Mirror the blackboard["hardware"] payload onto disk for resume
             bb = load_blackboard(self.layout)
             hw = bb.get("hardware") or payload.get("payload") or payload
-            self.layout.hardware_path.parent.mkdir(parents=True, exist_ok=True)
             self.layout.hardware_path.write_text(
                 json.dumps(hw, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -448,17 +428,17 @@ class PipelineOrchestrator:
             self._record_stage_failure(Stage.HARDWARE_PROFILE, payload.get("caveats", []))
 
     def _run_benchmark_baseline(self) -> None:
-        spec = generate_benchmark_spec(self.contract)
+        spec = BenchmarkSpec.for_contract(self.contract)
         try:
-            self.materialize_runner(
+            self.fixtures_runner(
                 contract=self.contract, spec=spec,
-                inputs_dir=self.layout.baseline_inputs_dir,
+                inputs_dir=self.layout.inputs_dir,
+                oracle_dir=self.layout.oracle_dir,
                 executor=self.executor,
             )
             baseline = self.baseline_runner(
                 contract=self.contract, spec=spec,
-                inputs_dir=self.layout.baseline_inputs_dir,
-                references_dir=self.layout.baseline_references_dir,
+                inputs_dir=self.layout.inputs_dir,
                 executor=self.executor,
             )
         except Exception as exc:  # noqa: BLE001
@@ -472,7 +452,6 @@ class PipelineOrchestrator:
         bb = load_blackboard(self.layout)
         bb["baseline"] = baseline_dict
         save_blackboard(self.layout, bb)
-        self.layout.baseline_path.parent.mkdir(parents=True, exist_ok=True)
         self.layout.baseline_path.write_text(
             json.dumps(baseline_dict, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -511,16 +490,12 @@ class PipelineOrchestrator:
         speedup = _maybe_float(bench.get("speedup_geomean"))
 
         if compile_ok and all_correct:
+            # Initial candidate is not a "tuning round". The promotion
+            # itself + the best_promoted event in events.jsonl are the
+            # canonical record; leaderboard.jsonl is reserved for
+            # tuning-round candidates so its line numbers align with rounds.
             self._promote_to_best(candidate_id, speedup)
             self.run_state.mark_stage_complete(Stage.INITIAL_CANDIDATE)
-            _append_leaderboard(self.layout, {
-                "round_index": 0,
-                "candidate_id": candidate_id,
-                "compile_ok": True, "all_correct": True,
-                "speedup_geomean": speedup,
-                "speedup_worst": _maybe_float(bench.get("speedup_worst")),
-                "ts": _utcnow_iso(),
-            })
         else:
             self._record_stage_failure(
                 Stage.INITIAL_CANDIDATE,
@@ -544,6 +519,10 @@ class PipelineOrchestrator:
         runner.run_one_round(self.run_state.remaining_budget_s())
 
     def _run_finalize(self) -> None:
+        # Pre-fill final_metrics so the summary agent only writes narrative
+        # and never (re-)fabricates speedup numbers.
+        self._write_final_metrics()
+
         try:
             registry = agents_mod.build_registry(
                 "summary",
@@ -578,6 +557,7 @@ class PipelineOrchestrator:
             "status": payload.get("status", "failed"),
             "agent_summary": payload,
             "narrative": narrative,
+            "metrics": bb.get("final_metrics") or {},
             "best": bb.get("best") or {},
             "history_count": len(bb.get("history") or []),
         }
@@ -585,20 +565,37 @@ class PipelineOrchestrator:
         self.run_state.mark_stage_complete(Stage.FINALIZE)
         self._final_summary = final_payload
 
+    def _write_final_metrics(self) -> None:
+        """Snapshot orchestrator-owned performance numerics for the summary
+        agent to read. The summary agent is forbidden from inventing
+        speedup numbers — these are authoritative."""
+        bb = load_blackboard(self.layout)
+        best = bb.get("best") or {}
+        baseline = bb.get("baseline") or {}
+        bb["final_metrics"] = {
+            "best_candidate_id": self.run_state.best_candidate_id,
+            "best_speedup_geomean": self.run_state.best_speedup,
+            "baseline_ms_median_overall": baseline.get("ms_median_overall"),
+            "baseline_per_shape": baseline.get("per_shape") or {},
+            "best_promoted_at": best.get("promoted_at"),
+        }
+        save_blackboard(self.layout, bb)
+
     # ------------------------------------------------------------------
     # Best promotion + output sync
     # ------------------------------------------------------------------
 
     def _promote_to_best(self, candidate_id: str, speedup: float | None) -> None:
         cand_cu = self.layout.candidate_file(candidate_id, "candidate.cu")
-        self.layout.best_dir.mkdir(parents=True, exist_ok=True)
-        if cand_cu.is_file():
-            shutil.copyfile(cand_cu, self.layout.best_cu_path)
-        else:
-            self.layout.best_cu_path.write_text(
-                f"// placeholder for {candidate_id} — candidate.cu not on disk\n",
-                encoding="utf-8",
+        if not cand_cu.is_file():
+            # SubmitCandidateTool already validates this — if we reach the
+            # promote path without a real .cu, that's a bug, not a state
+            # we silently paper over with a placeholder source file.
+            raise FileNotFoundError(
+                f"_promote_to_best: candidate {candidate_id} has no candidate.cu at {cand_cu}"
             )
+        self.layout.best_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cand_cu, self.layout.best_cu_path)
         self.layout.best_result_path.write_text(
             json.dumps(
                 {
@@ -627,7 +624,7 @@ class PipelineOrchestrator:
         })
 
     def _sync_output(self) -> None:
-        if not self.layout.has_best():
+        if self.run_state.best_candidate_id is None or not self.layout.best_cu_path.is_file():
             return
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(self.layout.best_cu_path, self.output_path)
@@ -649,7 +646,6 @@ class PipelineOrchestrator:
         })
 
     def _write_final_artifacts(self, payload: dict) -> None:
-        self.layout.final_dir.mkdir(parents=True, exist_ok=True)
         self.layout.final_report_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -729,14 +725,8 @@ def _run_candidate_benchmark(
 ) -> dict:
     """Run the multi-shape benchmark for a candidate and persist the result."""
     cand_cu = layout.candidate_file(candidate_id, "candidate.cu")
+    spec = BenchmarkSpec.for_contract(contract)
     bb = load_blackboard(layout)
-    spec_dict = bb.get("benchmark") or {}
-    spec = BenchmarkSpec(
-        shape_grid=tuple(spec_dict.get("shape_grid") or contract.default_shape_grid()),
-        samples=int(spec_dict.get("samples", 30)),
-        warmup=int(spec_dict.get("warmup", 5)),
-        seed=int(spec_dict.get("seed", 0)),
-    )
     baseline_per_shape = (bb.get("baseline") or {}).get("per_shape") or {}
 
     try:
@@ -745,9 +735,10 @@ def _run_candidate_benchmark(
             spec=spec,
             candidate_id=candidate_id,
             candidate_cu=cand_cu,
-            inputs_dir=layout.baseline_inputs_dir,
-            references_dir=layout.baseline_references_dir,
+            inputs_dir=layout.inputs_dir,
+            oracle_dir=layout.oracle_dir,
             baseline_per_shape=baseline_per_shape,
+            build_dir=layout.build_dir,
             executor=executor,
         )
     except Exception as exc:  # noqa: BLE001

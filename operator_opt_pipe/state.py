@@ -1,10 +1,7 @@
-"""state.py — Stage enum, RunState, RunLayout, blackboard, payload validation.
+"""state.py — Stage enum, RunState, RunLayout, blackboard.
 
 Everything related to "where things live on disk" and "what the run currently
-looks like" is consolidated here. There is intentionally no ``StageResult``
-dataclass: the result of an LLM stage is whatever ``ToolResponse.terminate_with(payload=...)``
-attached, which surfaces as ``AgentResult.payload`` (a dict). ``check_submit_payload``
-provides lightweight validation at the orchestrator/runner boundary.
+looks like" is consolidated here.
 """
 from __future__ import annotations
 
@@ -17,7 +14,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -40,9 +36,6 @@ class Stage(str, Enum):
 ROUND_STEP_ANALYZE = "ANALYZE"
 ROUND_STEP_OPTIMIZE = "OPTIMIZE"
 ROUND_STEP_EVALUATE = "EVALUATE"
-
-
-_VALID_SUBMIT_STATUS = ("success", "partial", "failed")
 
 
 # ---------------------------------------------------------------------------
@@ -74,10 +67,6 @@ class RunState:
     best_candidate_id: str | None = None
     best_speedup: float | None = None
 
-    # ------------------------------------------------------------------
-    # Derived
-    # ------------------------------------------------------------------
-
     def remaining_budget_s(self) -> float:
         return max(0.0, self.time_budget_s - self.elapsed_s)
 
@@ -85,17 +74,12 @@ class RunState:
         if stage.value not in self.completed_stages:
             self.completed_stages.append(stage.value)
 
-    # ------------------------------------------------------------------
-    # Serialization
-    # ------------------------------------------------------------------
-
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str) -> "RunState":
-        data = json.loads(text)
-        return cls(**data)
+        return cls(**json.loads(text))
 
 
 # ---------------------------------------------------------------------------
@@ -107,16 +91,17 @@ class RunState:
 class RunLayout:
     """All filesystem paths for a single run live here.
 
-    The orchestrator and tools never compute paths from raw strings — they go
-    through this type. Predicates (``has_*``) are filesystem checks so resume
-    can detect partial state without reloading json blobs.
+    Predicates (``has_*``) are filesystem checks so resume can detect partial
+    state without reloading json blobs. Single-file artifacts live directly
+    under ``run_dir``; multi-file groups (inputs/oracle/candidates/best) get
+    their own subdir.
     """
 
     workspace_root: Path
     run_id: str
 
     # ------------------------------------------------------------------
-    # Top-level paths
+    # Top-level paths (single-file artifacts live directly under run_dir)
     # ------------------------------------------------------------------
 
     @property
@@ -140,6 +125,36 @@ class RunLayout:
         return self.run_dir / "events.jsonl"
 
     @property
+    def hardware_path(self) -> Path:
+        return self.run_dir / "hardware_profile.json"
+
+    @property
+    def baseline_path(self) -> Path:
+        return self.run_dir / "baseline.json"
+
+    @property
+    def final_report_path(self) -> Path:
+        return self.run_dir / "final_report.json"
+
+    @property
+    def summary_path(self) -> Path:
+        return self.run_dir / "summary.md"
+
+    # ------------------------------------------------------------------
+    # Multi-file groups
+    # ------------------------------------------------------------------
+
+    @property
+    def inputs_dir(self) -> Path:
+        """Correctness fixtures: candidate forward inputs, indexed by shape."""
+        return self.run_dir / "inputs"
+
+    @property
+    def oracle_dir(self) -> Path:
+        """Correctness oracle: PyTorch reference outputs, indexed by shape."""
+        return self.run_dir / "oracle"
+
+    @property
     def candidates_dir(self) -> Path:
         return self.run_dir / "candidates"
 
@@ -156,58 +171,31 @@ class RunLayout:
         return self.best_dir / "best_result.json"
 
     @property
-    def baseline_dir(self) -> Path:
-        return self.run_dir / "baseline"
-
-    @property
-    def baseline_inputs_dir(self) -> Path:
-        return self.baseline_dir / "inputs"
-
-    @property
-    def baseline_references_dir(self) -> Path:
-        return self.baseline_dir / "references"
-
-    @property
-    def baseline_path(self) -> Path:
-        return self.baseline_dir / "baseline.json"
-
-    def baseline_input_path(self, tensor_name: str, shape_id: str) -> Path:
-        """Operator-agnostic per-tensor input file path.
-
-        For LoRA at d=3584 this is ``baseline/inputs/W_d3584.pt``; for a
-        future multi-variable operator it might be ``W_d3584_h64.pt``.
-        """
-        return self.baseline_inputs_dir / f"{tensor_name}_{shape_id}.pt"
-
-    def baseline_reference_path(self, output_name: str, shape_id: str) -> Path:
-        return self.baseline_references_dir / f"{output_name}_{shape_id}.pt"
-
-    @property
     def benchmark_dir(self) -> Path:
         return self.run_dir / "benchmark"
-
-    @property
-    def benchmark_spec_path(self) -> Path:
-        return self.benchmark_dir / "spec.json"
 
     def benchmark_result_path(self, candidate_id: str) -> Path:
         return self.benchmark_dir / f"{candidate_id}.json"
 
     @property
-    def hardware_path(self) -> Path:
-        return self.run_dir / "hardware" / "hardware_profile.json"
+    def build_dir(self) -> Path:
+        """Per-run cpp_extension / nvcc build directory.
+
+        cpp_extension.load(build_directory=...) targets this so candidate
+        .so artifacts live under the run instead of ~/.cache/torch_extensions/.
+        """
+        return self.run_dir / "build"
 
     @property
-    def final_dir(self) -> Path:
-        return self.run_dir / "final"
+    def exec_dir(self) -> Path:
+        """Per-run Executor workspace (nvcc src/bin, ncu/nsys reports)."""
+        return self.run_dir / "exec"
 
-    @property
-    def final_report_path(self) -> Path:
-        return self.final_dir / "final_report.json"
+    def input_path(self, tensor_name: str, shape_id: str) -> Path:
+        return self.inputs_dir / f"{tensor_name}_{shape_id}.pt"
 
-    @property
-    def summary_path(self) -> Path:
-        return self.final_dir / "summary.md"
+    def oracle_path(self, output_name: str, shape_id: str) -> Path:
+        return self.oracle_dir / f"{output_name}_{shape_id}.pt"
 
     # ------------------------------------------------------------------
     # Per-candidate paths
@@ -233,9 +221,6 @@ class RunLayout:
     def has_baseline(self) -> bool:
         return self.baseline_path.is_file()
 
-    def has_best(self) -> bool:
-        return self.best_cu_path.is_file()
-
     # ------------------------------------------------------------------
     # Skeleton creation (idempotent — safe to call on resume)
     # ------------------------------------------------------------------
@@ -245,12 +230,11 @@ class RunLayout:
             self.run_dir,
             self.candidates_dir,
             self.best_dir,
-            self.baseline_dir,
-            self.baseline_inputs_dir,
-            self.baseline_references_dir,
+            self.inputs_dir,
+            self.oracle_dir,
             self.benchmark_dir,
-            self.hardware_path.parent,
-            self.final_dir,
+            self.build_dir,
+            self.exec_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -262,18 +246,6 @@ class RunLayout:
 
 SCHEMA_VERSION = 1
 
-TOP_KEYS = (
-    "schema_version",
-    "hardware",
-    "benchmark",
-    "baseline",
-    "best",
-    "latest_diagnosis",
-    "history",
-    "round",
-    "final_summary",
-)
-
 
 def _empty_blackboard() -> dict:
     return {"schema_version": SCHEMA_VERSION, "history": []}
@@ -282,17 +254,13 @@ def _empty_blackboard() -> dict:
 def load_blackboard(layout: RunLayout) -> dict:
     """Read ``blackboard.json``; missing file → fresh dict.
 
-    Always normalizes ``schema_version`` (defaults to 1) and ``history``
-    (defaults to ``[]``) so downstream code does not need to guard.
+    Always normalizes ``schema_version`` and ``history`` so downstream code
+    does not need to guard.
     """
     p = layout.blackboard_path
     if not p.is_file():
         return _empty_blackboard()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        # Corrupt file — fail loudly rather than silently dropping data
-        raise
+    data = json.loads(p.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"blackboard.json must contain a JSON object, got {type(data).__name__}")
     data.setdefault("schema_version", SCHEMA_VERSION)
@@ -319,41 +287,6 @@ def save_blackboard(layout: RunLayout, data: dict) -> None:
 
 
 def append_history(layout: RunLayout, entry: dict) -> None:
-    """Convenience: load, append to ``history``, save."""
     bb = load_blackboard(layout)
     bb.setdefault("history", []).append(entry)
     save_blackboard(layout, bb)
-
-
-# ---------------------------------------------------------------------------
-# Submit-payload validation
-# ---------------------------------------------------------------------------
-
-
-def check_submit_payload(payload: Any, expected_stage: Stage | None = None) -> tuple[bool, list[str]]:
-    """Lightweight check at the orchestrator/runner boundary.
-
-    The contract for every submit-style tool is:
-
-      * ``payload`` is a dict
-      * ``payload['status']`` is one of {"success", "partial", "failed"}
-      * if ``expected_stage`` is given, ``payload['stage']`` must equal its
-        ``.value`` (when present — absence is tolerated for tools that don't
-        write a stage tag, e.g. ``submit_diagnosis``)
-
-    Returns ``(ok, errors)``. ``errors`` is empty iff ``ok`` is True.
-    """
-    errors: list[str] = []
-    if not isinstance(payload, dict):
-        return False, [f"payload must be a dict, got {type(payload).__name__}"]
-    status = payload.get("status")
-    if status not in _VALID_SUBMIT_STATUS:
-        errors.append(f"payload.status must be one of {_VALID_SUBMIT_STATUS}, got {status!r}")
-    if expected_stage is not None:
-        stage_tag = payload.get("stage")
-        if stage_tag is not None and stage_tag != expected_stage.value:
-            errors.append(
-                f"payload.stage tag mismatch: expected {expected_stage.value!r}, "
-                f"got {stage_tag!r}"
-            )
-    return (not errors), errors

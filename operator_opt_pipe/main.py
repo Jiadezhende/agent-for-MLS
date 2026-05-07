@@ -3,10 +3,11 @@
 Wires environment-driven configuration (``LLMConfig``, ``ExecutorConfig``)
 to a ``PipelineOrchestrator`` instance.
 
-The operator is selected by name (CLI ``--operator`` flag, default
-``lora_matmul``); the matching ``skills/operators/<name>.md`` provides the
-contract via its YAML frontmatter. There is no separate spec file —
-everything contract-related lives in the skill markdown.
+The operator is selected by name (CLI ``--operator``, default
+``lora_matmul``); the matching ``operator_opt_pipe.operators.<name>``
+module supplies the ``OperatorContract``. The optional skill markdown at
+``skills/operators/<name>.md`` is read by the LLM (via ``read_skill``)
+for tuning narrative only — it does not affect the contract.
 """
 from __future__ import annotations
 
@@ -21,8 +22,9 @@ from mls_agent.llm.config import LLMConfig
 from mls_agent.tools.cuda.config import ExecutorConfig
 from mls_agent.tools.cuda.cuda_executor import Executor
 
+from operator_opt_pipe.operators import load_contract
 from operator_opt_pipe.orchestrator import PipelineOrchestrator
-from operator_opt_pipe.resources import load_contract
+from operator_opt_pipe.state import RunLayout, make_run_id
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -60,8 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     try:
-        contract = load_contract(args.skills_root, operator=args.operator)
-    except (FileNotFoundError, ValueError) as exc:
+        contract = load_contract(args.operator)
+    except FileNotFoundError as exc:
         print(f"error: load_contract: {exc}", file=sys.stderr)
         return 2
 
@@ -71,10 +73,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: LLMConfig.from_env: {exc}", file=sys.stderr)
         return 2
     backend = OpenAIBackend(llm_cfg)
-    agent_cfg = AgentConfig(max_iterations=args.max_agent_iterations)
+    # max_consecutive_no_tool_call=1: as soon as the agent stops calling
+    # tools, terminate. The default (2) wastes a turn waiting for a second
+    # silent reply that adds nothing after a successful write_blackboard.
+    agent_cfg = AgentConfig(
+        max_iterations=args.max_agent_iterations,
+        max_consecutive_no_tool_call=1,
+    )
+
+    # Pin run_id up front so Executor + Orchestrator share the same path.
+    run_id = args.run_id or make_run_id()
+    layout = RunLayout(workspace_root=Path(args.workspace).resolve(), run_id=run_id)
+    layout.mkdir()
 
     exec_cfg = ExecutorConfig.from_env()
-    exec_cfg.workspace_root = args.workspace
+    exec_cfg.workspace_root = str(layout.exec_dir)
     executor = Executor(exec_cfg)
 
     orchestrator = PipelineOrchestrator(
@@ -87,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         executor=executor,
         contract=contract,
         skills_dir=args.skills_root,
-        run_id=args.run_id,
+        run_id=run_id,
         verbose=args.verbose,
     )
     summary = orchestrator.run()

@@ -160,8 +160,8 @@ def _fake_baseline_runner(**kw):
     }
 
 
-def _fake_materialize(**kw):
-    return {"saved": [f"d{d}" for d in kw["spec"].shape_grid]}
+def _fake_fixtures(**kw):
+    return {"shape_ids": [f"d{d}" for d in kw["spec"].shape_grid]}
 
 
 def _fake_benchmark_runner(*, speedup: float, all_correct: bool = True):
@@ -306,7 +306,7 @@ def _build_orch(workspace: Path, contract: OperatorContract, **overrides) -> Pip
         contract=contract,
         run_id=overrides.pop("run_id", "run_test"),
         verbose=False,
-        materialize_runner=_fake_materialize,
+        fixtures_runner=_fake_fixtures,
         baseline_runner=_fake_baseline_runner,
         benchmark_runner=_fake_benchmark_runner(speedup=2.0),
         hardware_profiler=_canned_hardware,
@@ -382,12 +382,12 @@ def test_orchestrator_benchmark_baseline_skips_llm(
     workspace: Path, contract: OperatorContract,
 ):
     """BENCHMARK_BASELINE must call the deterministic runners, not any agent."""
-    materialize_calls: list[Any] = []
+    fixtures_calls: list[Any] = []
     baseline_calls: list[Any] = []
 
-    def fake_mat(**kw):
-        materialize_calls.append(kw["spec"])
-        return {"saved": []}
+    def fake_fix(**kw):
+        fixtures_calls.append(kw["spec"])
+        return {"shape_ids": []}
 
     def fake_baseline(**kw):
         baseline_calls.append(kw["spec"])
@@ -398,14 +398,17 @@ def test_orchestrator_benchmark_baseline_skips_llm(
     orch = _build_orch(
         workspace, contract,
         run_id="run_bb",
-        materialize_runner=fake_mat,
+        fixtures_runner=fake_fix,
         baseline_runner=fake_baseline,
         # Make initial candidate fail so the run terminates after baseline.
         initial_candidate_runner=_canned_failing_initial,
     )
     orch.run()
-    assert len(materialize_calls) == 1
+    assert len(fixtures_calls) == 1
     assert len(baseline_calls) == 1
     assert orch.layout.baseline_path.is_file()
     bb = load_blackboard(orch.layout)
-    assert "benchmark" in bb and "baseline" in bb
+    assert "baseline" in bb
+    # benchmark spec is no longer pre-seeded into the blackboard — it is
+    # derived from the contract on demand.
+    assert "benchmark" not in bb

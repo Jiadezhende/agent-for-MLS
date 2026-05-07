@@ -17,7 +17,6 @@ from operator_opt_pipe.resources import OperatorContract, TensorSpec
 from operator_opt_pipe.resources.evaluation import QuickEvalResult
 from operator_opt_pipe.state import (
     RunLayout,
-    Stage,
     load_blackboard,
     save_blackboard,
 )
@@ -166,10 +165,12 @@ def test_write_candidate_writes_file_and_returns_quick_result(
     """Valid source: file allocated, compile_and_check_quick called, dict returned."""
     captured = {}
 
-    def fake_quick(*, contract, candidate_id, candidate_cu, inputs_dir, references_dir, sample_shape, executor):
+    def fake_quick(*, contract, candidate_id, candidate_cu, inputs_dir, oracle_dir, sample_shape, build_dir, executor):
         captured["candidate_id"] = candidate_id
         captured["candidate_cu"] = candidate_cu
         captured["sample_shape"] = sample_shape
+        captured["oracle_dir"] = oracle_dir
+        captured["build_dir"] = build_dir
         return QuickEvalResult(
             candidate_id=candidate_id,
             compile_ok=True,
@@ -255,9 +256,13 @@ def test_submit_candidate_terminates_with_payload(layout: RunLayout):
     })
     assert resp.terminate is True
     payload = resp.terminate_payload
+    # SubmitCandidateTool passes parameters through verbatim; status/stage
+    # are stamped by the orchestrator boundary in agents._result_to_dict,
+    # not by the tool itself, so they aren't in the raw payload.
     assert payload["candidate_id"] == "candidate_005"
-    assert payload["status"] == "success"
-    assert payload["stage"] == Stage.TUNING_LOOP.value
+    assert payload["hypothesis"] == "fused W*X with low-rank correction"
+    assert "status" not in payload
+    assert "stage" not in payload
 
 
 def test_submit_candidate_rejects_missing_file(layout: RunLayout):

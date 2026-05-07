@@ -25,6 +25,10 @@ from mls_agent.tools.builtin.side_effect_tools import (
     RecordMeasurementTool,
     make_side_effect_tools,
 )
+from mls_agent.tools.builtin.terminate_tool import (
+    TerminateTool,
+    make_terminate_tool,
+)
 
 __all__ = [
     "FlagEventTool",
@@ -32,6 +36,8 @@ __all__ = [
     "ReadSkillTool",
     "RecordMeasurementTool",
     "SkillRegistry",
+    "TerminateTool",
     "make_side_effect_tools",
     "make_skill_tools",
+    "make_terminate_tool",
 ]

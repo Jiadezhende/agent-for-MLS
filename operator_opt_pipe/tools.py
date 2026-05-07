@@ -36,7 +36,6 @@ from operator_opt_pipe.resources.evaluation import (
 )
 from operator_opt_pipe.state import (
     RunLayout,
-    Stage,
     load_blackboard,
     save_blackboard,
 )
@@ -269,9 +268,10 @@ class WriteCandidateTool(Tool):
                 contract=self._contract,
                 candidate_id=cid,
                 candidate_cu=cu_path,
-                inputs_dir=self._layout.baseline_inputs_dir,
-                references_dir=self._layout.baseline_references_dir,
+                inputs_dir=self._layout.inputs_dir,
+                oracle_dir=self._layout.oracle_dir,
                 sample_shape=sample_shape,
+                build_dir=self._layout.build_dir,
                 executor=self._executor,
             )
         except Exception as exc:  # noqa: BLE001
@@ -402,14 +402,12 @@ class SubmitCandidateTool(Tool):
                 message=f"candidate {cid!r} has no candidate.cu on disk; "
                         "call write_candidate first.",
             )
-        payload = {
-            "status": "success",
-            "stage": Stage.TUNING_LOOP.value,
-            **parameters,
-        }
+        # Pass through whatever the LLM provided. status / stage are owned
+        # by the orchestrator (it adds them in agents._result_to_dict based
+        # on benchmark outcome and the current pipeline stage).
         return ToolResponse.terminate_with(
             summary=f"submit_candidate {cid}",
-            payload=payload,
+            payload=dict(parameters),
         )
 
 

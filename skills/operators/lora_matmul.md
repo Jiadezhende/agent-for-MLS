@@ -1,17 +1,6 @@
 ---
 name: operators/lora_matmul
-description: Operator contract for LoRA-fused MATMUL — formula, tensor specification, and bottleneck analysis.
-shape_param: d
-shape_param_range: [3584, 4608]
-inputs:
-  - {name: W, shape: [d, d], dtype: float32}
-  - {name: X, shape: [d, d], dtype: float32}
-  - {name: A, shape: [d, 16], dtype: float32}
-  - {name: B, shape: [d, 16], dtype: float32}
-output: {name: Y, shape: [d, d], dtype: float32}
-reference_pytorch: "W @ X + A @ (B.transpose(0, 1).contiguous() @ X)"
-forward_args: [W, X, A, B]
-correctness: {rtol: 1.0e-4, atol: 1.0e-4}
+description: Tuning notes & bottleneck analysis for LoRA-fused MATMUL Y = W X + A (B^T X).
 ---
 
 # Operator: LoRA-fused MATMUL
@@ -29,18 +18,10 @@ Where:
 - B ∈ ℝ^(d×r) — LoRA down-projection (applied as B^T)
 - r = 16 (fixed low rank)
 - All tensors: float32
+- Device: CUDA GPU
 
 This is a LoRA (Low-Rank Adaptation) fused matmul. The second term `A(B^T X)` is a
 low-rank correction to the base matrix multiply `WX`.
-
-## Input Specification
-
-- All four tensors (W, X, A, B) are stored as `.pt` files, loaded with `torch.load`.
-- Hidden dimension d is chosen from **d ∈ [3584, 4608]** at evaluation time.
-- The implementation must produce correct results for **any integer d in this range**,
-  not just a single fixed value. Do not hard-code d = 4096.
-- dtype: float32 for all tensors.
-- Device: CUDA GPU.
 
 ## Optimization Goal
 

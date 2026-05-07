@@ -3,10 +3,10 @@
 Verifies the ``mls_agent.Agent → tool → AgentResult → operator_opt_pipe dict``
 round-trip without involving the network or any real LLM.
 
-Two termination paths are tested:
-  * COMPLETED via ``submit_candidate.terminate_with(payload)``
-  * NO_TOOL_CALL after a successful ``write_blackboard`` call followed by
-    a plain text response
+All success paths are now COMPLETED:
+  * ``submit_candidate.terminate_with(payload)`` for optimizer roles
+  * ``terminate`` (no payload) for hardware_profiler / analyst / summary
+A no-tool-call streak now surfaces as ``status="failed"`` with caveats.
 """
 from __future__ import annotations
 
@@ -98,11 +98,11 @@ class _NoopExecutor:
 
 
 # ---------------------------------------------------------------------------
-# Hardware profiler — natural exit (write_blackboard + plain text)
+# Hardware profiler — explicit terminate after write_blackboard
 # ---------------------------------------------------------------------------
 
 
-def test_run_hardware_profiler_natural_exit(layout: RunLayout, contract: OperatorContract):
+def test_run_hardware_profiler_terminate(layout: RunLayout, contract: OperatorContract):
     registry = agents.build_registry(
         "hardware_profiler",
         layout=layout, contract=contract,
@@ -113,10 +113,7 @@ def test_run_hardware_profiler_natural_exit(layout: RunLayout, contract: Operato
                    {"key": "hardware",
                     "payload": {"metrics": {"sm": 30, "dram_bw_gbps": 384.0}}},
                    content="probing complete."),
-        # After write succeeds the LLM stops calling tools — natural exit.
-        _final_text("hardware profile recorded; SM=30, DRAM=384 GB/s."),
-        # Extra response in case max_consecutive_no_tool_call needs a second turn.
-        _final_text("done."),
+        _tool_call("c2", "terminate", {"summary": "SM=30 DRAM=384"}),
     ])
     out = agents.run_hardware_profiler(
         backend=backend, registry=registry,
@@ -125,18 +122,19 @@ def test_run_hardware_profiler_natural_exit(layout: RunLayout, contract: Operato
         observer=NullObserver(),
     )
     assert out["status"] == "success"
-    assert out["blackboard_key"] == "hardware"
-    assert out["payload"]["metrics"]["sm"] == 30
+    assert out["stage"] == Stage.HARDWARE_PROFILE.value
+    assert out["summary"] == "SM=30 DRAM=384"
+    # Blackboard content is verified separately — orchestrator reads it from disk.
     bb = load_blackboard(layout)
     assert bb["hardware"]["metrics"]["sm"] == 30
 
 
 # ---------------------------------------------------------------------------
-# Summary — same natural-exit pattern
+# Summary — same terminate pattern
 # ---------------------------------------------------------------------------
 
 
-def test_run_summary_natural_exit(layout: RunLayout, contract: OperatorContract):
+def test_run_summary_terminate(layout: RunLayout, contract: OperatorContract):
     registry = agents.build_registry(
         "summary",
         layout=layout, contract=contract,
@@ -150,8 +148,7 @@ def test_run_summary_natural_exit(layout: RunLayout, contract: OperatorContract)
                         "narrative": "Fused W*X with low-rank correction; saturated DRAM.",
                     }},
                    content="summary written."),
-        _final_text("done."),
-        _final_text("nothing else."),
+        _tool_call("c2", "terminate", {}),
     ])
     out = agents.run_summary(
         backend=backend, registry=registry,
@@ -160,7 +157,7 @@ def test_run_summary_natural_exit(layout: RunLayout, contract: OperatorContract)
         observer=NullObserver(),
     )
     assert out["status"] == "success"
-    assert out["payload"]["best_speedup"] == 2.5
+    assert out["stage"] == Stage.FINALIZE.value
     bb = load_blackboard(layout)
     assert bb["final_summary"]["best_speedup"] == 2.5
 
@@ -214,9 +211,10 @@ def test_run_optimizer_cold_completed_path(
     )
     assert out["status"] == "success"
     assert out["candidate_id"] == "candidate_000"
-    # SubmitCandidateTool stamps stage=TUNING_LOOP regardless of who submitted;
-    # orchestrator distinguishes initial vs tuning by RunState, not by tag.
-    assert out["stage"] == Stage.TUNING_LOOP.value
+    # The agents.run_optimizer_cold runner stamps stage=INITIAL_CANDIDATE
+    # at the orchestrator boundary (its expected_stage). SubmitCandidateTool
+    # itself no longer hard-codes a stage tag.
+    assert out["stage"] == Stage.INITIAL_CANDIDATE.value
 
 
 # ---------------------------------------------------------------------------
@@ -224,21 +222,24 @@ def test_run_optimizer_cold_completed_path(
 # ---------------------------------------------------------------------------
 
 
-def test_invalid_blackboard_write_falls_back_to_failure(
+def test_no_terminate_call_surfaces_as_failure(
     layout: RunLayout, contract: OperatorContract,
 ):
-    """If the agent fails to write the expected key, the runner returns failed."""
+    """If the agent stops calling tools without invoking ``terminate``,
+    the loop ends with reason=no_tool_call and the runner returns failed.
+    """
     registry = agents.build_registry(
         "hardware_profiler",
         layout=layout, contract=contract,
         executor=_NoopExecutor(), skills_dir=None,
     )
-    # Write to a forbidden key — tool returns ERROR; LLM never writes "hardware".
     backend = _ScriptedBackend([
         _tool_call("c1", "write_blackboard",
-                   {"key": "best", "payload": {"speedup": 1.0}}),
-        _final_text("oops, can't do that."),
-        _final_text("giving up."),
+                   {"key": "hardware",
+                    "payload": {"metrics": {"sm": 30}}}),
+        # LLM forgets to call terminate — keeps producing plain text.
+        _final_text("done; SM=30."),
+        _final_text("really done."),
     ])
     out = agents.run_hardware_profiler(
         backend=backend, registry=registry,
@@ -248,6 +249,7 @@ def test_invalid_blackboard_write_falls_back_to_failure(
     )
     assert out["status"] == "failed"
     assert out["caveats"]
+    assert "no_tool_call" in out["caveats"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +271,11 @@ def test_build_registry_per_role_tool_set(layout: RunLayout, contract: OperatorC
         executor=_NoopExecutor(), skills_dir=None,
     )
     names = optimizer.names()
-    # Optimizer must NOT see profile / write_blackboard tools.
+    # Optimizer must NOT see profile / write_blackboard / terminate tools —
+    # it terminates via submit_candidate.
     assert "write_blackboard" not in names
     assert "profile_with_ncu" not in names
+    assert "terminate" not in names
     # Optimizer DOES get write_candidate + submit_candidate.
     assert "write_candidate" in names
     assert "submit_candidate" in names
@@ -282,8 +286,18 @@ def test_build_registry_per_role_tool_set(layout: RunLayout, contract: OperatorC
         executor=_NoopExecutor(), skills_dir=None,
     )
     a_names = analyst.names()
-    # Analyst gets profile tools + write_blackboard but NOT candidate tools.
+    # Analyst gets profile tools + write_blackboard + terminate but NOT
+    # candidate tools.
     assert "profile_with_ncu" in a_names
     assert "write_blackboard" in a_names
+    assert "terminate" in a_names
     assert "write_candidate" not in a_names
     assert "submit_candidate" not in a_names
+
+    # hardware_profiler and summary also get terminate.
+    for natural_exit_role in ("hardware_profiler", "summary"):
+        reg = agents.build_registry(
+            natural_exit_role, layout=layout, contract=contract,
+            executor=_NoopExecutor(), skills_dir=None,
+        )
+        assert "terminate" in reg.names()

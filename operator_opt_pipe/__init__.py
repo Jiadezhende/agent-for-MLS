@@ -15,7 +15,6 @@ from operator_opt_pipe.state import (
     RunState,
     SCHEMA_VERSION,
     Stage,
-    check_submit_payload,
     load_blackboard,
     save_blackboard,
 )
@@ -29,7 +28,6 @@ __all__ = [
     "RunState",
     "SCHEMA_VERSION",
     "Stage",
-    "check_submit_payload",
     "load_blackboard",
     "next_stage",
     "save_blackboard",

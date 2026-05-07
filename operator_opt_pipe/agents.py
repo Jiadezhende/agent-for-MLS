@@ -33,10 +33,13 @@ from mls_agent import (
     Agent,
     AgentConfig,
     AgentResult,
-    Tool,
     ToolRegistry,
 )
-from mls_agent.tools.builtin import make_side_effect_tools, make_skill_tools
+from mls_agent.tools.builtin import (
+    make_side_effect_tools,
+    make_skill_tools,
+    make_terminate_tool,
+)
 from mls_agent.tools.cuda.profile_tools import make_profile_tools
 
 from operator_opt_pipe.resources.contract import OperatorContract
@@ -63,12 +66,15 @@ VALID_ROLES: tuple[str, ...] = (
 )
 
 
-# Per-role write_blackboard whitelist. Value is the list of required payload
-# field names (used for shallow validation); None disables validation.
+# Per-role write_blackboard whitelist. The whitelist itself is the only
+# enforcement — required-field validation is intentionally disabled (None)
+# so a phrasing mismatch from the LLM does not fail an entire stage.
+# Performance numerics are owned by the orchestrator; the agent only writes
+# narrative-shaped data.
 ROLE_BLACKBOARD_KEYS: dict[str, dict[str, list[str] | None]] = {
-    "hardware_profiler": {"hardware": ["metrics"]},
-    "analyst":           {"latest_diagnosis": ["bottleneck", "evidence"]},
-    "summary":           {"final_summary": ["best_speedup", "narrative"]},
+    "hardware_profiler": {"hardware": None},
+    "analyst":           {"latest_diagnosis": None},
+    "summary":           {"final_summary": None},
 }
 
 
@@ -113,6 +119,7 @@ def build_registry(
             for tool in make_profile_tools(executor=executor):
                 reg.register(tool)
         reg.register(WriteBlackboardTool(layout, ROLE_BLACKBOARD_KEYS[role]))
+        reg.register(make_terminate_tool())
     elif role == "analyst":
         if executor is not None:
             # Same factory — agents only get the subset they need by selecting
@@ -122,11 +129,13 @@ def build_registry(
                 if tool.NAME in ("profile_with_ncu", "profile_with_nsys", "profile_with_torch"):
                     reg.register(tool)
         reg.register(WriteBlackboardTool(layout, ROLE_BLACKBOARD_KEYS[role]))
+        reg.register(make_terminate_tool())
     elif role in ("optimizer_cold", "optimizer"):
         reg.register(WriteCandidateTool(layout, contract, executor))
         reg.register(SubmitCandidateTool(layout))
     elif role == "summary":
         reg.register(WriteBlackboardTool(layout, ROLE_BLACKBOARD_KEYS[role]))
+        reg.register(make_terminate_tool())
     return reg
 
 
@@ -148,12 +157,12 @@ SM count, DRAM bandwidth, L2 size, peak boost clock. Cite the metric
 numbers for each finding.
 
 When done, call write_blackboard with key="hardware" and a payload
-containing at least:
+including (any subset is acceptable; richer is better):
   metrics: { sm_count, dram_bw_gbps, l2_kb, peak_clock_mhz, ... }
   device_name, compute_capability, caveats (list of strings).
 
-After write_blackboard succeeds, summarize what you wrote in plain text and
-do NOT call any further tools — the loop will end naturally."""
+After write_blackboard succeeds, call the `terminate` tool to end the
+loop. Optionally pass a one-line `summary` describing what you found."""
 
 
 SYSTEM_PROMPT_OPTIMIZER_COLD = """\
@@ -198,7 +207,8 @@ Workflow:
        "tile_hints": {"BM": 128, "BN": 128, "BK": 16}   # optional
      }
 
-After a successful write_blackboard, summarize and stop calling tools."""
+After a successful write_blackboard, call the `terminate` tool to end
+the loop. Optionally pass a one-line `summary`."""
 
 
 SYSTEM_PROMPT_OPTIMIZER = """\
@@ -219,15 +229,19 @@ benchmark after submit_candidate and decides promotion."""
 
 
 SYSTEM_PROMPT_SUMMARY = """\
-You are the Finalize stage. Read the best candidate, baseline, and history
-from the blackboard. Call write_blackboard with key="final_summary" and a
-payload containing:
-  best_speedup: float | null
-  best_candidate_id: string | null
-  narrative: 3-6 sentences describing the path that got there
-  caveats: list of remaining concerns
+You are the Finalize stage. The orchestrator has already written
+final_metrics to the blackboard with best_candidate_id and best_speedup
+numbers — read it via read_blackboard("final_metrics"). Do NOT re-derive
+or re-quote the speedup numbers from history; they are authoritative in
+final_metrics.
 
-After a successful write, summarize and stop calling tools."""
+Call write_blackboard with key="final_summary" and a payload containing:
+  narrative: 3-6 sentences describing the path that got there, citing
+             final_metrics for any numerics
+  caveats:   list of remaining concerns (optional)
+
+After a successful write, call the `terminate` tool to end the loop.
+Optionally pass a one-line `summary`."""
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +291,7 @@ def _build_user_msg_analyst(contract: OperatorContract, blackboard: dict) -> str
         contract.summary_for_prompt() + "\n\n"
         + _section(
             "Blackboard snapshot",
-            _format_keys(blackboard, ("baseline", "best", "history", "round")),
+            _format_keys(blackboard, ("baseline", "best", "history")),
         )
         + "\n"
         + "Diagnose the current bottleneck and write_blackboard('latest_diagnosis', ...)."
@@ -289,7 +303,7 @@ def _build_user_msg_optimizer(contract: OperatorContract, blackboard: dict) -> s
         contract.summary_for_prompt() + "\n\n"
         + _section(
             "Blackboard snapshot",
-            _format_keys(blackboard, ("baseline", "best", "latest_diagnosis", "history", "round")),
+            _format_keys(blackboard, ("baseline", "best", "latest_diagnosis", "history")),
         )
         + "\n"
         + "Propose and submit the next candidate."
@@ -301,10 +315,11 @@ def _build_user_msg_summary(contract: OperatorContract, blackboard: dict) -> str
         contract.summary_for_prompt() + "\n\n"
         + _section(
             "Blackboard snapshot",
-            _format_keys(blackboard, ("baseline", "best", "history")),
+            _format_keys(blackboard, ("final_metrics", "baseline", "best", "history")),
         )
         + "\n"
-        + "Write the final report via write_blackboard('final_summary', ...)."
+        + "Write the final narrative via write_blackboard('final_summary', "
+          "{'narrative': ...})."
     )
 
 
@@ -313,27 +328,26 @@ def _build_user_msg_summary(contract: OperatorContract, blackboard: dict) -> str
 # ---------------------------------------------------------------------------
 
 
-# Termination reasons that count as "agent succeeded"
-_OK_REASONS = ("completed", "no_tool_call")
+# Only an explicit `terminate` (or `submit_candidate`) call counts as
+# success. Any other termination reason — `no_tool_call`, `max_iterations`,
+# `llm_error` — surfaces as a failed dict with caveats.
+_OK_REASONS = ("completed",)
 
 
 def _result_to_dict(
     result: AgentResult,
     *,
     expected_stage: Stage | None,
-    blackboard_key: str | None = None,
-    layout: RunLayout | None = None,
 ) -> dict:
     """Convert ``AgentResult`` into the dict the orchestrator consumes.
 
-    Two cases:
+    Success requires an explicit terminate path (``reason="completed"``).
+    Two shapes:
 
-    * ``submit_candidate`` agents return ``COMPLETED`` with the payload
-      attached. Pass it through, optionally validating ``stage``.
-    * ``write_blackboard`` agents return ``NO_TOOL_CALL`` (the loop ended
-      after the LLM stopped calling tools). The orchestrator reads the
-      blackboard key the agent was supposed to write, so we synthesize
-      a success payload referencing it.
+    * ``submit_candidate`` returns a dict payload (candidate_id, hypothesis,
+      …). Pass it through with status / stage stamped at this boundary.
+    * ``terminate`` returns ``payload=None``. Synthesize ``{status, stage,
+      summary}`` — orchestrator reads the actual data from blackboard.
     """
     if result.reason not in _OK_REASONS:
         return {
@@ -345,45 +359,31 @@ def _result_to_dict(
             ],
         }
 
-    if result.reason == "completed":
-        if isinstance(result.payload, dict):
-            payload = dict(result.payload)
-            payload.setdefault("status", "success")
-            if expected_stage is not None:
-                payload.setdefault("stage", expected_stage.value)
-            return payload
-        return {
-            "status": "failed",
-            "stage": expected_stage.value if expected_stage else None,
-            "caveats": ["terminate_with payload was not a dict"],
-        }
+    if result.payload is None:
+        out: dict = {"status": "success"}
+        if expected_stage is not None:
+            out["stage"] = expected_stage.value
+        if result.summary:
+            out["summary"] = result.summary
+        return out
 
-    # NO_TOOL_CALL: did the agent actually write the blackboard key?
-    if blackboard_key is not None and layout is not None:
-        bb = load_blackboard(layout)
-        if blackboard_key in bb:
-            payload = bb[blackboard_key]
-            return {
-                "status": "success",
-                "stage": expected_stage.value if expected_stage else None,
-                "blackboard_key": blackboard_key,
-                "payload": payload,
-                "summary": result.summary,
-            }
-        return {
-            "status": "failed",
-            "stage": expected_stage.value if expected_stage else None,
-            "caveats": [
-                f"agent ended without writing blackboard[{blackboard_key!r}]"
-            ],
-        }
+    if isinstance(result.payload, dict):
+        payload = dict(result.payload)
+        # status / stage are owned by the orchestrator boundary: the LLM
+        # tool can't know whether benchmark will pass, and it can't know
+        # which stage drove this run. We stamp success here because
+        # reaching `completed` means submit_candidate succeeded — the
+        # orchestrator marks the candidate failed downstream if the
+        # benchmark rejects it.
+        payload["status"] = "success"
+        if expected_stage is not None:
+            payload["stage"] = expected_stage.value
+        return payload
 
-    # Generic NO_TOOL_CALL with no expected key — treat as partial success.
     return {
-        "status": "partial",
+        "status": "failed",
         "stage": expected_stage.value if expected_stage else None,
-        "caveats": ["agent ended without calling a tool"],
-        "summary": result.summary,
+        "caveats": ["terminate_with payload was neither dict nor None"],
     }
 
 
@@ -396,8 +396,6 @@ def _run_agent(
     agent_cfg: AgentConfig,
     observer: mls_agent.AgentObserver,
     expected_stage: Stage | None,
-    blackboard_key: str | None,
-    layout: RunLayout | None,
 ) -> dict:
     agent = Agent(
         backend=backend,
@@ -407,12 +405,7 @@ def _run_agent(
         observer=observer,
     )
     result = agent.run(user_message)
-    return _result_to_dict(
-        result,
-        expected_stage=expected_stage,
-        blackboard_key=blackboard_key,
-        layout=layout,
-    )
+    return _result_to_dict(result, expected_stage=expected_stage)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +428,6 @@ def run_hardware_profiler(
         system_prompt=SYSTEM_PROMPT_HARDWARE_PROFILER,
         user_message=user_msg, agent_cfg=agent_cfg, observer=observer,
         expected_stage=Stage.HARDWARE_PROFILE,
-        blackboard_key="hardware", layout=layout,
     )
 
 
@@ -455,7 +447,6 @@ def run_optimizer_cold(
         system_prompt=SYSTEM_PROMPT_OPTIMIZER_COLD,
         user_message=user_msg, agent_cfg=agent_cfg, observer=observer,
         expected_stage=Stage.INITIAL_CANDIDATE,
-        blackboard_key=None, layout=None,
     )
 
 
@@ -475,7 +466,6 @@ def run_analyst(
         system_prompt=SYSTEM_PROMPT_ANALYST,
         user_message=user_msg, agent_cfg=agent_cfg, observer=observer,
         expected_stage=Stage.TUNING_LOOP,
-        blackboard_key="latest_diagnosis", layout=layout,
     )
 
 
@@ -495,7 +485,6 @@ def run_optimizer(
         system_prompt=SYSTEM_PROMPT_OPTIMIZER,
         user_message=user_msg, agent_cfg=agent_cfg, observer=observer,
         expected_stage=Stage.TUNING_LOOP,
-        blackboard_key=None, layout=None,
     )
 
 
@@ -515,7 +504,6 @@ def run_summary(
         system_prompt=SYSTEM_PROMPT_SUMMARY,
         user_message=user_msg, agent_cfg=agent_cfg, observer=observer,
         expected_stage=Stage.FINALIZE,
-        blackboard_key="final_summary", layout=layout,
     )
 
 

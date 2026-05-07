@@ -9,8 +9,11 @@ from operator_opt_pipe.state import RunLayout, RunState, Stage
 
 
 # Don't bother starting another tuning round if the budget is already shorter
-# than this — go straight to FINALIZE so the run ends cleanly.
-MIN_TUNING_SLICE_S = 60.0
+# than this — go straight to FINALIZE so the run ends cleanly. A round
+# (analyst LLM + ncu/nsys probes + optimizer LLM + write_candidate compile +
+# multi-shape benchmark) realistically takes 200–400 s, so 300 s is the
+# minimum slice that gives a round a fair chance to finish.
+MIN_TUNING_SLICE_S = 300.0
 
 
 def next_stage(state: RunState, layout: RunLayout) -> Stage:

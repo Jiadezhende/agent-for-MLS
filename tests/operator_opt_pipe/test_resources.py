@@ -1,26 +1,24 @@
-"""Unit tests for operator_opt_pipe.resources (no GPU required).
+"""Unit tests for operator_opt_pipe.resources + operators registry (no GPU required).
 
 Covers:
   * eval_shape — controlled mini-DSL for shape resolution
   * shape_id — stable shape filename component
-  * load_contract — frontmatter parsing + validation
+  * operators.load_contract — registry dict lookup
   * OperatorContract render_* helpers — used by subprocess script generators
 
-GPU-flagged integration tests for materialize_inputs / run_pytorch_baseline /
-benchmark_on_grid would belong in a separate file; they need real torch +
-CUDA + nvcc and are expected to be skipped in CI.
+GPU-flagged integration tests for build_correctness_fixtures /
+measure_pytorch_latency / benchmark_on_grid live in a separate file; they
+need real torch + CUDA + nvcc and are expected to be skipped in CI.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
+from operator_opt_pipe.operators import OPERATORS, load_contract
 from operator_opt_pipe.resources import (
     OperatorContract,
     TensorSpec,
     eval_shape,
-    load_contract,
     shape_id,
 )
 
@@ -60,7 +58,6 @@ def test_eval_shape_rejects_attribute_access():
 
 
 def test_eval_shape_rejects_non_int_result():
-    # Comparisons would yield bool; comparisons are forbidden anyway.
     with pytest.raises(ValueError):
         eval_shape("d > 1", d=4096)
 
@@ -77,22 +74,17 @@ def test_shape_id_single_variable():
 
 def test_shape_id_omits_unrelated_vars():
     contract = _lora_contract()
-    # Only `d` is the operator's shape param; extra unrelated keys aren't appended
-    # because we only walk shape_param + sorted other shape_values.
     sid = shape_id(contract, d=4096, h=64)
-    # d3584 / d4096 / d4096_h64 — h64 IS appended because it's an extra var.
     assert sid.startswith("d4096")
 
 
 # ---------------------------------------------------------------------------
-# load_contract
+# operators.load_contract — registry-based dict lookup
 # ---------------------------------------------------------------------------
 
 
-def test_load_contract_reads_lora_skill():
-    """Use the real LoRA skill markdown shipped with the repo."""
-    repo_root = Path(__file__).resolve().parents[2]
-    contract = load_contract(repo_root / "skills", operator="lora_matmul")
+def test_load_contract_returns_lora_contract():
+    contract = load_contract("lora_matmul")
     assert contract.shape_param == "d"
     assert contract.shape_param_range == (3584, 4608)
     assert len(contract.inputs) == 4
@@ -100,51 +92,52 @@ def test_load_contract_reads_lora_skill():
     assert names == ["W", "X", "A", "B"]
     assert contract.output.name == "Y"
     assert contract.forward_args == ("W", "X", "A", "B")
-    # Reference formula matches the Phase-2 spec
     assert "W @ X" in contract.reference_pytorch
-    # Tolerances default or come from frontmatter
     assert contract.rtol == 1e-4
     assert contract.atol == 1e-4
 
 
-def test_load_contract_rejects_missing_file(tmp_path: Path):
-    with pytest.raises(FileNotFoundError):
-        load_contract(tmp_path, operator="bogus_op")
+def test_load_contract_returns_plain_matmul_contract():
+    contract = load_contract("plain_matmul")
+    assert contract.shape_param == "d"
+    assert contract.forward_args == ("W", "X")
+    assert contract.reference_pytorch == "W @ X"
 
 
-def test_load_contract_rejects_missing_fields(tmp_path: Path):
-    skill_path = tmp_path / "operators" / "incomplete.md"
-    skill_path.parent.mkdir(parents=True, exist_ok=True)
-    skill_path.write_text(
-        "---\n"
-        "name: operators/incomplete\n"
-        "shape_param: d\n"
-        # missing shape_param_range, inputs, output, reference_pytorch, forward_args
-        "---\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="missing fields"):
-        load_contract(tmp_path, operator="incomplete")
+def test_load_contract_rejects_unknown_operator():
+    with pytest.raises(FileNotFoundError, match="unknown operator"):
+        load_contract("bogus_op")
 
 
-def test_load_contract_rejects_undeclared_forward_arg(tmp_path: Path):
-    skill_path = tmp_path / "operators" / "bad.md"
-    skill_path.parent.mkdir(parents=True, exist_ok=True)
-    skill_path.write_text(
-        "---\n"
-        "name: operators/bad\n"
-        "shape_param: d\n"
-        "shape_param_range: [1, 100]\n"
-        "inputs:\n"
-        "  - {name: A, shape: [d, d], dtype: float32}\n"
-        "output: {name: Y, shape: [d, d], dtype: float32}\n"
-        "reference_pytorch: \"A\"\n"
-        "forward_args: [A, BOGUS]\n"
-        "---\n",
-        encoding="utf-8",
-    )
+def test_operators_registry_keys_are_short_names():
+    assert "lora_matmul" in OPERATORS
+    assert "plain_matmul" in OPERATORS
+
+
+def test_operator_contract_rejects_undeclared_forward_arg():
     with pytest.raises(ValueError, match="undeclared inputs"):
-        load_contract(tmp_path, operator="bad")
+        OperatorContract(
+            name="operators/bad",
+            inputs=(TensorSpec(name="A", shape=("d", "d"), dtype="float32"),),
+            output=TensorSpec(name="Y", shape=("d", "d"), dtype="float32"),
+            reference_pytorch="A",
+            forward_args=("A", "BOGUS"),
+            shape_param="d",
+            shape_param_range=(1, 100),
+        )
+
+
+def test_operator_contract_rejects_inverted_range():
+    with pytest.raises(ValueError, match="min > max"):
+        OperatorContract(
+            name="operators/bad",
+            inputs=(TensorSpec(name="A", shape=("d", "d"), dtype="float32"),),
+            output=TensorSpec(name="Y", shape=("d", "d"), dtype="float32"),
+            reference_pytorch="A",
+            forward_args=("A",),
+            shape_param="d",
+            shape_param_range=(100, 1),
+        )
 
 
 # ---------------------------------------------------------------------------

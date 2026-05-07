@@ -160,8 +160,38 @@ class RunLayout:
         return self.run_dir / "baseline"
 
     @property
+    def baseline_inputs_dir(self) -> Path:
+        return self.baseline_dir / "inputs"
+
+    @property
+    def baseline_references_dir(self) -> Path:
+        return self.baseline_dir / "references"
+
+    @property
     def baseline_path(self) -> Path:
         return self.baseline_dir / "baseline.json"
+
+    def baseline_input_path(self, tensor_name: str, shape_id: str) -> Path:
+        """Operator-agnostic per-tensor input file path.
+
+        For LoRA at d=3584 this is ``baseline/inputs/W_d3584.pt``; for a
+        future multi-variable operator it might be ``W_d3584_h64.pt``.
+        """
+        return self.baseline_inputs_dir / f"{tensor_name}_{shape_id}.pt"
+
+    def baseline_reference_path(self, output_name: str, shape_id: str) -> Path:
+        return self.baseline_references_dir / f"{output_name}_{shape_id}.pt"
+
+    @property
+    def benchmark_dir(self) -> Path:
+        return self.run_dir / "benchmark"
+
+    @property
+    def benchmark_spec_path(self) -> Path:
+        return self.benchmark_dir / "spec.json"
+
+    def benchmark_result_path(self, candidate_id: str) -> Path:
+        return self.benchmark_dir / f"{candidate_id}.json"
 
     @property
     def hardware_path(self) -> Path:
@@ -216,6 +246,9 @@ class RunLayout:
             self.candidates_dir,
             self.best_dir,
             self.baseline_dir,
+            self.baseline_inputs_dir,
+            self.baseline_references_dir,
+            self.benchmark_dir,
             self.hardware_path.parent,
             self.final_dir,
         ):

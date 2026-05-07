@@ -1,9 +1,12 @@
-"""CLI entry: ``python -m operator_opt_pipe.main --spec ... --time-budget ...``.
+"""CLI entry: ``python -m operator_opt_pipe.main --operator lora_matmul ...``.
 
 Wires environment-driven configuration (``LLMConfig``, ``ExecutorConfig``)
-to a ``PipelineOrchestrator`` instance. The legacy ``run.sh`` continues to
-point at the old ``main.py`` until the new pipeline finishes its lora_resources
-implementation.
+to a ``PipelineOrchestrator`` instance.
+
+The operator is selected by name (CLI ``--operator`` flag, default
+``lora_matmul``); the matching ``skills/operators/<name>.md`` provides the
+contract via its YAML frontmatter. There is no separate spec file —
+everything contract-related lives in the skill markdown.
 """
 from __future__ import annotations
 
@@ -18,8 +21,8 @@ from mls_agent.llm.config import LLMConfig
 from mls_agent.tools.cuda.config import ExecutorConfig
 from mls_agent.tools.cuda.cuda_executor import Executor
 
-from operator_opt_pipe.lora_resources.contract import load_contract
 from operator_opt_pipe.orchestrator import PipelineOrchestrator
+from operator_opt_pipe.resources import load_contract
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -27,13 +30,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="operator_opt_pipe",
         description="Autonomous CUDA-operator optimization pipeline.",
     )
-    p.add_argument("--spec", required=True, help="Path to target_spec.json (must contain 'operator').")
+    p.add_argument("--operator", default="lora_matmul",
+                   help="Operator name; resolves to skills/operators/<name>.md.")
     p.add_argument("--time-budget", type=float, default=1800.0,
-                   help="Wall-clock time budget in seconds (default 1800).")
+                   help="Wall-clock time budget in seconds (default 1800 = 30 min).")
     p.add_argument("--workspace", default=os.getenv("AGENT_WORKSPACE_ROOT", "./workspace"),
                    help="Workspace root directory.")
     p.add_argument("--output", default="./optimized_lora.cu",
-                   help="Path to the file synced from best/best.cu.")
+                   help="Path to the file synced from best/best.cu (Phase-2 contract).")
     p.add_argument("--skills-root", default="./skills",
                    help="Directory containing skills/operators/<name>.md.")
     p.add_argument("--run-id", default=None, help="Resume an existing run by id.")
@@ -46,21 +50,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Optional .env loading (no-op if python-dotenv missing)
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()
+    except ImportError:
+        pass
+
     args = _parse_args(argv)
 
-    spec_path = Path(args.spec)
-    if not spec_path.is_file():
-        print(f"error: spec file not found: {spec_path}", file=sys.stderr)
-        return 2
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    operator = spec.get("operator")
-    if not operator:
-        print(f"error: spec.json missing 'operator' field; got: {spec}", file=sys.stderr)
+    try:
+        contract = load_contract(args.skills_root, operator=args.operator)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: load_contract: {exc}", file=sys.stderr)
         return 2
 
-    contract = load_contract(args.skills_root, operator=operator)
-
-    llm_cfg = LLMConfig.from_env()
+    try:
+        llm_cfg = LLMConfig.from_env()
+    except EnvironmentError as exc:
+        print(f"error: LLMConfig.from_env: {exc}", file=sys.stderr)
+        return 2
     backend = OpenAIBackend(llm_cfg)
     agent_cfg = AgentConfig(max_iterations=args.max_agent_iterations)
 
@@ -69,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     executor = Executor(exec_cfg)
 
     orchestrator = PipelineOrchestrator(
-        spec=spec,
+        operator=args.operator,
         time_budget_s=args.time_budget,
         workspace_root=args.workspace,
         output_path=args.output,

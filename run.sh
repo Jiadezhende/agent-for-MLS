@@ -19,7 +19,7 @@ sysctl -w kernel.perf_event_paranoid=2 2>/dev/null || true
 #     even if we time out later;
 #   - after every best update during TUNING_LOOP.
 python3 main.py \
-  --spec target_spec.json \
+  --operator lora_matmul \
   --time-budget 1800 \
   --output ./optimized_lora.cu \
   --verbose

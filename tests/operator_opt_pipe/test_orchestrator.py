@@ -1,7 +1,8 @@
-"""Orchestrator + RoundRunner + build_registry tests.
+"""Orchestrator + RoundRunner integration tests with injected mocks.
 
-We bypass the LLM layer entirely by injecting per-stage runners that return
-canned dicts. The agent-glue tests live in test_agents.py.
+Bypasses the LLM layer by passing per-stage runner functions; bypasses GPU
+work by passing fake baseline / materialize / benchmark runners. The
+agent-glue tests live in test_agents.py.
 """
 from __future__ import annotations
 
@@ -11,20 +12,18 @@ from typing import Any
 
 import pytest
 
-from mls_agent import AgentConfig, NullObserver, ToolRegistry
+from mls_agent import AgentConfig
 
-from operator_opt_pipe.lora_resources.contract import LoRAContract
 from operator_opt_pipe.orchestrator import (
     PipelineOrchestrator,
-    ROLE_TOOLS,
     RoundRunner,
-    build_registry,
-    make_default_tools,
 )
+from operator_opt_pipe.resources import OperatorContract, TensorSpec
 from operator_opt_pipe.state import (
     RunLayout,
     Stage,
     load_blackboard,
+    save_blackboard,
 )
 
 
@@ -34,16 +33,20 @@ from operator_opt_pipe.state import (
 
 
 @pytest.fixture
-def contract() -> LoRAContract:
-    return LoRAContract(
-        operator="lora_matmul",
-        d_range=(3584, 4608),
-        r=16,
-        dtype="float32",
-        device="cuda",
+def contract() -> OperatorContract:
+    return OperatorContract(
+        name="operators/lora_matmul",
+        inputs=(
+            TensorSpec(name="W", shape=("d", "d"), dtype="float32"),
+            TensorSpec(name="X", shape=("d", "d"), dtype="float32"),
+            TensorSpec(name="A", shape=("d", 16), dtype="float32"),
+            TensorSpec(name="B", shape=("d", 16), dtype="float32"),
+        ),
+        output=TensorSpec(name="Y", shape=("d", "d"), dtype="float32"),
+        reference_pytorch="W @ X + A @ (B.transpose(0, 1).contiguous() @ X)",
         forward_args=("W", "X", "A", "B"),
-        reference_pytorch="W @ X + A @ (B.T @ X)",
-        output_name="Y",
+        shape_param="d",
+        shape_param_range=(3584, 4608),
     )
 
 
@@ -53,109 +56,167 @@ def workspace(tmp_path: Path) -> Path:
 
 
 class _NoopExecutor:
-    """Stand-in for ``mls_agent.tools.cuda.cuda_executor.Executor``.
-
-    Profile tools are constructed against this object so they appear in the
-    role whitelists, but no test actually dispatches a CUDA tool — the
-    LLM-stage runners are mocked instead. Methods raise to make accidental
-    use loud.
-    """
-
     def __getattr__(self, name):
-        def _err(*args, **kwargs):
+        def _err(*a, **kw):
             raise AssertionError(f"_NoopExecutor.{name} should not be called in tests")
         return _err
 
 
-def _full_tool_bag(layout: RunLayout, tmp_path: Path | None = None) -> dict:
-    """Build the production tool set with safe stand-ins for external deps."""
-    skills_dir = (tmp_path / "skills") if tmp_path is not None else None
-    return make_default_tools(layout=layout, executor=_NoopExecutor(), skills_dir=skills_dir)
+class _NullBackend:
+    """Minimal LLMBackend stub — tests use injected runners instead."""
+
+    def chat(self, messages, tools):
+        raise AssertionError("LLM backend must not be invoked when runners are injected")
+
+
+# Canned agent runners --------------------------------------------------------
+
+
+def _canned_hardware(**kw):
+    layout = kw["layout"]
+    bb = load_blackboard(layout)
+    bb["hardware"] = {"metrics": {"sm": 30, "dram_bw_gbps": 384.0}}
+    save_blackboard(layout, bb)
+    return {
+        "status": "success",
+        "stage": Stage.HARDWARE_PROFILE.value,
+        "blackboard_key": "hardware",
+        "payload": bb["hardware"],
+    }
+
+
+def _canned_initial_candidate(cid: str = "candidate_000"):
+    def _runner(**kw):
+        layout = kw["layout"]
+        target = layout.candidate_file(cid, "candidate.cu")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("// initial candidate\n", encoding="utf-8")
+        return {
+            "status": "success",
+            "stage": Stage.TUNING_LOOP.value,
+            "candidate_id": cid,
+            "hypothesis": "naive baseline kernel",
+            "experiment_type": "baseline",
+        }
+    return _runner
+
+
+def _canned_failing_initial(**kw):
+    return {
+        "status": "failed",
+        "stage": Stage.INITIAL_CANDIDATE.value,
+        "caveats": ["test forces failure"],
+    }
+
+
+def _canned_analyst(**kw):
+    layout = kw["layout"]
+    bb = load_blackboard(layout)
+    bb["latest_diagnosis"] = {
+        "bottleneck": "dram_bound",
+        "evidence": ["test"],
+    }
+    save_blackboard(layout, bb)
+    return {"status": "success", "stage": Stage.TUNING_LOOP.value,
+            "blackboard_key": "latest_diagnosis",
+            "payload": bb["latest_diagnosis"]}
+
+
+def _canned_optimizer(cid: str = "candidate_111"):
+    def _runner(**kw):
+        layout = kw["layout"]
+        target = layout.candidate_file(cid, "candidate.cu")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("// canned\n", encoding="utf-8")
+        return {
+            "status": "success", "stage": Stage.TUNING_LOOP.value,
+            "candidate_id": cid, "hypothesis": "test",
+            "experiment_type": "canned",
+        }
+    return _runner
+
+
+def _canned_summary(**kw):
+    layout = kw["layout"]
+    bb = load_blackboard(layout)
+    bb["final_summary"] = {
+        "best_speedup": bb.get("best", {}).get("speedup"),
+        "narrative": "test summary",
+    }
+    save_blackboard(layout, bb)
+    return {"status": "success", "stage": Stage.FINALIZE.value,
+            "blackboard_key": "final_summary",
+            "payload": bb["final_summary"]}
+
+
+def _fake_baseline_runner(**kw):
+    return {
+        "spec": kw["spec"].to_dict(),
+        "per_shape": {f"d{d}": {"ms_median": 100.0, "ms_min": 90.0,
+                                "ms_max": 110.0, "samples": 30}
+                      for d in kw["spec"].shape_grid},
+        "ms_median_overall": 100.0,
+        "reference_pytorch": kw["contract"].reference_pytorch,
+    }
+
+
+def _fake_materialize(**kw):
+    return {"saved": [f"d{d}" for d in kw["spec"].shape_grid]}
+
+
+def _fake_benchmark_runner(*, speedup: float, all_correct: bool = True):
+    def _runner(**kw):
+        spec = kw["spec"]
+        cid = kw["candidate_id"]
+        per_shape = {}
+        for d in spec.shape_grid:
+            sid = f"d{d}"
+            per_shape[sid] = {
+                "ms_median": 50.0, "ms_min": 45.0, "ms_max": 55.0,
+                "samples": 30, "max_abs_err": 1e-6, "rel_l2_err": 1e-7,
+                "speedup": speedup,
+            }
+        return {
+            "candidate_id": cid,
+            "compile_ok": True,
+            "per_shape": per_shape,
+            "speedup_geomean": speedup,
+            "speedup_worst": speedup,
+            "speedup_best": speedup,
+            "correctness_per_shape": {sid: all_correct for sid in per_shape},
+            "all_correct": all_correct,
+            "diagnostics": {},
+        }
+    return _runner
 
 
 # ---------------------------------------------------------------------------
-# build_registry / ROLE_TOOLS
+# RoundRunner: promotion only when speedup > current best
 # ---------------------------------------------------------------------------
 
 
-def test_role_tools_optimizer_excludes_evaluate_and_run_python():
-    """The Optimizer must never see performance-evaluation tools."""
-    optimizer_tools = ROLE_TOOLS["optimizer"]
-    assert "evaluate_candidate" not in optimizer_tools
-    assert "benchmark_candidate" not in optimizer_tools
-    assert "run_python" not in optimizer_tools
-    assert "edit_file" not in optimizer_tools
-    # Same for cold-start optimizer
-    assert "evaluate_candidate" not in ROLE_TOOLS["optimizer_cold"]
-    assert "run_python" not in ROLE_TOOLS["optimizer_cold"]
-
-
-def test_build_registry_missing_tool_raises(workspace: Path):
+def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract: OperatorContract):
     layout = RunLayout(workspace_root=workspace, run_id="r")
     layout.mkdir()
-    # Operator-pipe internal tools only — builtin/profile factories not supplied.
-    tools = make_default_tools(layout=layout)
-    with pytest.raises(ValueError, match="not provided"):
-        build_registry("hardware_profiler", tools)
-
-
-def test_build_registry_with_complete_tools(workspace: Path):
-    layout = RunLayout(workspace_root=workspace, run_id="r")
-    layout.mkdir()
-    tools = _full_tool_bag(layout, workspace)
-    reg = build_registry("hardware_profiler", tools)
-    assert isinstance(reg, ToolRegistry)
-    assert "submit_hardware_profile" in reg.names()
-    assert "run_cuda_probe" in reg.names()
-
-
-def test_build_registry_unknown_role():
-    with pytest.raises(ValueError, match="unknown role"):
-        build_registry("nope", {})
-
-
-# ---------------------------------------------------------------------------
-# RoundRunner — best promotion happens only via promote_callback
-# ---------------------------------------------------------------------------
-
-
-def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract: LoRAContract):
-    layout = RunLayout(workspace_root=workspace, run_id="r")
-    layout.mkdir()
-    # Pre-existing best speedup.
-    from operator_opt_pipe.state import save_blackboard
     save_blackboard(layout, {
         "schema_version": 1, "history": [],
         "best": {"candidate_id": "candidate_000", "speedup": 1.5},
+        # Synthetic benchmark spec mirrors what orchestrator seeds.
+        "benchmark": {"shape_grid": [3584, 4096, 4608], "samples": 30,
+                      "warmup": 5, "seed": 0},
     })
-    tools = _full_tool_bag(layout, workspace)
     promotions: list[tuple[str, float | None]] = []
-
-    def promote(cid: str, sp: float | None) -> None:
-        promotions.append((cid, sp))
-
-    def fake_evaluator(*, layout, executor, candidate_id, baseline_ms_median):
-        # Worse speedup than current best — must NOT promote.
-        return {
-            "candidate_id": candidate_id,
-            "compile_ok": True,
-            "correctness_ok": True,
-            "candidate_ms_median": 10.0,
-            "speedup": 1.2,
-            "samples": 30,
-            "diagnostics": {},
-        }
 
     runner = RoundRunner(
         layout=layout, contract=contract,
         backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None, tools=tools,
-        evaluator=fake_evaluator,
-        promote_callback=promote,
-        observer=NullObserver(),
+        executor=_NoopExecutor(), skills_dir=None,
+        benchmark_runner=_fake_benchmark_runner(speedup=1.2),
+        promote_callback=lambda cid, sp: promotions.append((cid, sp)),
+        observer=__import__("mls_agent").NullObserver(),
         round_index=1,
         analyst_runner=_canned_analyst,
-        optimizer_runner=_canned_optimizer,
+        optimizer_runner=_canned_optimizer(),
     )
     result = runner.run_one_round(remaining_budget_s=300.0)
     assert result.candidate_id == "candidate_111"
@@ -164,27 +225,26 @@ def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract:
     assert promotions == []
 
 
-def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: LoRAContract):
+def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: OperatorContract):
     layout = RunLayout(workspace_root=workspace, run_id="r")
     layout.mkdir()
-    from operator_opt_pipe.state import save_blackboard
-    save_blackboard(layout, {"schema_version": 1, "history": []})  # no current best
-    tools = _full_tool_bag(layout, workspace)
+    save_blackboard(layout, {
+        "schema_version": 1, "history": [],
+        "benchmark": {"shape_grid": [3584, 4096, 4608], "samples": 30,
+                      "warmup": 5, "seed": 0},
+    })
     promotions: list[tuple[str, float | None]] = []
 
     runner = RoundRunner(
         layout=layout, contract=contract,
         backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None, tools=tools,
-        evaluator=lambda *, layout, executor, candidate_id, baseline_ms_median: {
-            "candidate_id": candidate_id, "compile_ok": True, "correctness_ok": True,
-            "candidate_ms_median": 8.0, "speedup": 2.3, "samples": 30, "diagnostics": {},
-        },
+        executor=_NoopExecutor(), skills_dir=None,
+        benchmark_runner=_fake_benchmark_runner(speedup=2.3),
         promote_callback=lambda cid, sp: promotions.append((cid, sp)),
-        observer=NullObserver(),
+        observer=__import__("mls_agent").NullObserver(),
         round_index=1,
         analyst_runner=_canned_analyst,
-        optimizer_runner=_canned_optimizer,
+        optimizer_runner=_canned_optimizer(),
     )
     result = runner.run_one_round(remaining_budget_s=300.0)
     assert result.promoted is True
@@ -195,25 +255,29 @@ def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: Lo
     assert len(lines) == 1
     entry = json.loads(lines[0])
     assert entry["candidate_id"] == "candidate_111"
-    assert entry["speedup"] == 2.3
+    assert entry["speedup_geomean"] == 2.3
+    # benchmark/<cid>.json persisted
+    assert layout.benchmark_result_path("candidate_111").is_file()
 
 
-def test_round_runner_writes_history_steps(workspace: Path, contract: LoRAContract):
+def test_round_runner_writes_history_steps(workspace: Path, contract: OperatorContract):
     layout = RunLayout(workspace_root=workspace, run_id="r")
     layout.mkdir()
-    tools = _full_tool_bag(layout, workspace)
+    save_blackboard(layout, {
+        "schema_version": 1, "history": [],
+        "benchmark": {"shape_grid": [3584, 4096, 4608], "samples": 30,
+                      "warmup": 5, "seed": 0},
+    })
     runner = RoundRunner(
         layout=layout, contract=contract,
         backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None, tools=tools,
-        evaluator=lambda **kw: {"candidate_id": "candidate_111", "compile_ok": True,
-                                  "correctness_ok": True, "candidate_ms_median": 9.0,
-                                  "speedup": 1.7, "samples": 30, "diagnostics": {}},
+        executor=_NoopExecutor(), skills_dir=None,
+        benchmark_runner=_fake_benchmark_runner(speedup=1.7),
         promote_callback=lambda cid, sp: None,
-        observer=NullObserver(),
+        observer=__import__("mls_agent").NullObserver(),
         round_index=2,
         analyst_runner=_canned_analyst,
-        optimizer_runner=_canned_optimizer,
+        optimizer_runner=_canned_optimizer(),
     )
     runner.run_one_round(remaining_budget_s=120.0)
     bb = load_blackboard(layout)
@@ -224,100 +288,46 @@ def test_round_runner_writes_history_steps(workspace: Path, contract: LoRAContra
 
 
 # ---------------------------------------------------------------------------
-# PipelineOrchestrator — full-run smoke
+# PipelineOrchestrator end-to-end with injected mocks
 # ---------------------------------------------------------------------------
 
 
-def test_orchestrator_runs_full_pipeline_with_injected_mocks(
-    workspace: Path, contract: LoRAContract
-):
+def _build_orch(workspace: Path, contract: OperatorContract, **overrides) -> PipelineOrchestrator:
+    """Default orchestrator wiring with safe stubs everywhere."""
     output_path = workspace / "optimized_lora.cu"
-
-    # Inject a baseline_runner that doesn't hit the lora_resources stub.
-    def fake_baseline_runner(*, layout, executor, contract, spec):
-        return {"ms_median_overall": 100.0, "per_d": {}, "spec": spec.to_dict()}
-
-    # Initial candidate runner: returns a payload with candidate_id=... and pretends
-    # write_candidate already produced a file on disk so promote can copy it.
-    cand_id_initial = "candidate_000"
-
-    def fake_initial(*, backend, registry, layout, contract, agent_cfg, observer):
-        # Pretend write_candidate dropped a file already.
-        target = layout.candidate_file(cand_id_initial, "candidate.cu")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("// initial candidate\n", encoding="utf-8")
-        return {
-            "status": "success",
-            "stage": Stage.INITIAL_CANDIDATE.value,
-            "candidate_id": cand_id_initial,
-            "hypothesis": "naive baseline kernel",
-            "experiment_type": "baseline",
-        }
-
-    def fake_evaluator(*, layout, executor, candidate_id, baseline_ms_median):
-        return {
-            "candidate_id": candidate_id,
-            "compile_ok": True, "correctness_ok": True,
-            "candidate_ms_median": 50.0, "speedup": 2.0,
-            "samples": 30, "diagnostics": {},
-        }
-
-    def fake_hardware(*, backend, registry, layout, contract, agent_cfg, observer):
-        return {
-            "status": "success", "stage": Stage.HARDWARE_PROFILE.value,
-            "metrics": {"sm": 30, "dram_bw_gbps": 384.0},
-        }
-
-    def fake_summary(*, backend, registry, layout, contract, agent_cfg, observer):
-        return {
-            "status": "success", "stage": Stage.FINALIZE.value,
-            "metrics": {"final_speedup": 2.0},
-            "next_recommendation": None,
-        }
-
-    def fake_analyst(*, backend, registry, layout, contract, agent_cfg, observer):
-        return {"status": "success", "stage": Stage.TUNING_LOOP.value,
-                "metrics": {"summary": "DRAM-bound on low-rank correction"}}
-
-    def fake_optimizer(*, backend, registry, layout, contract, agent_cfg, observer):
-        cid = "candidate_001"
-        target = layout.candidate_file(cid, "candidate.cu")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("// fused kernel\n", encoding="utf-8")
-        return {
-            "status": "success", "stage": Stage.TUNING_LOOP.value,
-            "candidate_id": cid, "hypothesis": "fuse W*X with low-rank correction",
-            "experiment_type": "fused-correction",
-        }
-
-    # Use a tiny budget so the tuning loop runs once and FINALIZE follows.
-    layout = RunLayout(workspace_root=workspace, run_id="run_test")
-    layout.mkdir()
-    orch = PipelineOrchestrator(
-        spec={"operator": "lora_matmul"},
-        time_budget_s=1.0,                       # below MIN_TUNING_SLICE_S → finalize after init candidate
+    defaults = dict(
+        operator="lora_matmul",
+        time_budget_s=1.0,
         workspace_root=workspace,
         output_path=output_path,
-        backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None,
+        backend=_NullBackend(),
+        agent_cfg=AgentConfig(max_iterations=2),
+        executor=_NoopExecutor(),
         contract=contract,
-        run_id="run_test",
+        run_id=overrides.pop("run_id", "run_test"),
         verbose=False,
-        tools=_full_tool_bag(layout, workspace),
-        evaluator=fake_evaluator,
-        baseline_runner=fake_baseline_runner,
-        hardware_profiler=fake_hardware,
-        initial_candidate_runner=fake_initial,
-        analyst_runner=fake_analyst,
-        optimizer_runner=fake_optimizer,
-        summary_runner=fake_summary,
+        materialize_runner=_fake_materialize,
+        baseline_runner=_fake_baseline_runner,
+        benchmark_runner=_fake_benchmark_runner(speedup=2.0),
+        hardware_profiler=_canned_hardware,
+        initial_candidate_runner=_canned_initial_candidate(),
+        analyst_runner=_canned_analyst,
+        optimizer_runner=_canned_optimizer(),
+        summary_runner=_canned_summary,
     )
+    defaults.update(overrides)
+    return PipelineOrchestrator(**defaults)
+
+
+def test_orchestrator_runs_full_pipeline_with_injected_mocks(
+    workspace: Path, contract: OperatorContract,
+):
+    output_path = workspace / "optimized_lora.cu"
+    orch = _build_orch(workspace, contract, output_path=output_path)
     summary = orch.run()
 
-    # state.json is on disk and reflects the completed stages
-    state_text = orch.layout.state_path.read_text(encoding="utf-8")
-    state_blob = json.loads(state_text)
-    assert state_blob["best_candidate_id"] == cand_id_initial
+    state_blob = json.loads(orch.layout.state_path.read_text(encoding="utf-8"))
+    assert state_blob["best_candidate_id"] == "candidate_000"
     assert state_blob["best_speedup"] == 2.0
     assert Stage.HARDWARE_PROFILE.value in state_blob["completed_stages"]
     assert Stage.BENCHMARK_BASELINE.value in state_blob["completed_stages"]
@@ -328,139 +338,74 @@ def test_orchestrator_runs_full_pipeline_with_injected_mocks(
     assert output_path.is_file()
     assert output_path.read_text(encoding="utf-8") == "// initial candidate\n"
 
-    # Final summary surfaced through orchestrator.run() return value
-    assert summary["best_candidate_id"] == cand_id_initial
+    assert summary["best_candidate_id"] == "candidate_000"
     assert summary["best_speedup"] == 2.0
     assert summary["final"]["status"] == "success"
-
-    # Final report markdown + json on disk
     assert orch.layout.final_report_path.is_file()
     assert orch.layout.summary_path.is_file()
 
 
-def test_orchestrator_resume_picks_existing_state(workspace: Path, contract: LoRAContract):
-    output_path = workspace / "optimized_lora.cu"
-    # First run: only complete hardware + baseline before "stopping".
-    def hw_runner(**kw):
-        return {"status": "success", "stage": Stage.HARDWARE_PROFILE.value, "metrics": {}}
+def test_orchestrator_finalize_reads_blackboard_summary(
+    workspace: Path, contract: OperatorContract,
+):
+    """FINALIZE renders narrative from blackboard["final_summary"], not from
+    the summary agent's payload directly."""
+    orch = _build_orch(workspace, contract, run_id="run_finalize")
+    orch.run()
+    final_payload = json.loads(orch.layout.final_report_path.read_text(encoding="utf-8"))
+    assert "narrative" in final_payload
+    assert final_payload["narrative"]["narrative"] == "test summary"
 
-    def baseline_runner(*, layout, executor, contract, spec):
-        return {"ms_median_overall": 100.0}
 
-    # Initial candidate fails so the run finalizes without a best.
-    def initial_failing(**kw):
-        return {"status": "failed", "stage": Stage.INITIAL_CANDIDATE.value,
-                "caveats": ["test forces failure"]}
-
-    def evaluator_fail(**kw):
-        raise AssertionError("must not be called for failing initial candidate")
-
-    def summary_runner(**kw):
-        return {"status": "success", "stage": Stage.FINALIZE.value, "metrics": {}}
-
-    layout1 = RunLayout(workspace_root=workspace, run_id="run_resume")
-    layout1.mkdir()
-    orch1 = PipelineOrchestrator(
-        spec={"operator": "lora_matmul"}, time_budget_s=1.0,
-        workspace_root=workspace, output_path=output_path,
-        backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None, contract=contract, run_id="run_resume", verbose=False,
-        tools=_full_tool_bag(layout1, workspace),
-        evaluator=evaluator_fail,
-        baseline_runner=baseline_runner,
-        hardware_profiler=hw_runner,
-        initial_candidate_runner=initial_failing,
-        analyst_runner=lambda **kw: {"status": "success", "stage": Stage.TUNING_LOOP.value},
-        optimizer_runner=lambda **kw: {"status": "failed", "stage": Stage.TUNING_LOOP.value},
-        summary_runner=summary_runner,
+def test_orchestrator_resume_picks_existing_state(workspace: Path, contract: OperatorContract):
+    """First run completes hardware + baseline, fails INITIAL_CANDIDATE → finalize.
+    Second orchestrator with same run_id picks up completed_stages."""
+    orch1 = _build_orch(
+        workspace, contract,
+        run_id="run_resume",
+        initial_candidate_runner=_canned_failing_initial,
     )
     orch1.run()
-    # Hardware + baseline artifacts on disk
     assert orch1.layout.has_hardware_profile()
     assert orch1.layout.has_baseline()
 
-    # Second orchestrator with same run_id should pick up state.json
-    orch2 = PipelineOrchestrator(
-        spec={"operator": "lora_matmul"}, time_budget_s=1.0,
-        workspace_root=workspace, output_path=output_path,
-        backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None, contract=contract, run_id="run_resume", verbose=False,
-        tools=_full_tool_bag(layout1, workspace),
-        evaluator=evaluator_fail,
-        baseline_runner=baseline_runner,
-        hardware_profiler=hw_runner,
-        initial_candidate_runner=initial_failing,
-        analyst_runner=lambda **kw: {"status": "success", "stage": Stage.TUNING_LOOP.value},
-        optimizer_runner=lambda **kw: {"status": "failed", "stage": Stage.TUNING_LOOP.value},
-        summary_runner=summary_runner,
+    orch2 = _build_orch(
+        workspace, contract,
+        run_id="run_resume",
+        initial_candidate_runner=_canned_failing_initial,
     )
-    # The completed_stages from the first run must be preserved
     assert Stage.HARDWARE_PROFILE.value in orch2.run_state.completed_stages
     assert Stage.BENCHMARK_BASELINE.value in orch2.run_state.completed_stages
 
 
-def test_orchestrator_benchmark_baseline_skips_llm(workspace: Path, contract: LoRAContract):
-    """BENCHMARK_BASELINE must call the deterministic runner, not any agent."""
-    output_path = workspace / "optimized_lora.cu"
-
-    def hw_runner(**kw):
-        return {"status": "success", "stage": Stage.HARDWARE_PROFILE.value, "metrics": {}}
-
+def test_orchestrator_benchmark_baseline_skips_llm(
+    workspace: Path, contract: OperatorContract,
+):
+    """BENCHMARK_BASELINE must call the deterministic runners, not any agent."""
+    materialize_calls: list[Any] = []
     baseline_calls: list[Any] = []
 
-    def baseline_runner(*, layout, executor, contract, spec):
-        baseline_calls.append(spec)
-        return {"ms_median_overall": 42.0}
+    def fake_mat(**kw):
+        materialize_calls.append(kw["spec"])
+        return {"saved": []}
 
-    # Force the run to terminate after BENCHMARK_BASELINE by making initial candidate fail.
-    def init_fail(**kw):
-        return {"status": "failed", "stage": Stage.INITIAL_CANDIDATE.value,
-                "caveats": ["test"]}
+    def fake_baseline(**kw):
+        baseline_calls.append(kw["spec"])
+        return {"spec": kw["spec"].to_dict(), "per_shape": {},
+                "ms_median_overall": 42.0,
+                "reference_pytorch": kw["contract"].reference_pytorch}
 
-    layout = RunLayout(workspace_root=workspace, run_id="run_bb")
-    layout.mkdir()
-    orch = PipelineOrchestrator(
-        spec={"operator": "lora_matmul"}, time_budget_s=1.0,
-        workspace_root=workspace, output_path=output_path,
-        backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
-        executor=None, contract=contract, run_id="run_bb", verbose=False,
-        tools=_full_tool_bag(layout, workspace),
-        evaluator=lambda **kw: pytest.fail("evaluator should not be called"),
-        baseline_runner=baseline_runner,
-        hardware_profiler=hw_runner,
-        initial_candidate_runner=init_fail,
-        summary_runner=lambda **kw: {"status": "success", "stage": Stage.FINALIZE.value},
+    orch = _build_orch(
+        workspace, contract,
+        run_id="run_bb",
+        materialize_runner=fake_mat,
+        baseline_runner=fake_baseline,
+        # Make initial candidate fail so the run terminates after baseline.
+        initial_candidate_runner=_canned_failing_initial,
     )
     orch.run()
+    assert len(materialize_calls) == 1
     assert len(baseline_calls) == 1
     assert orch.layout.baseline_path.is_file()
     bb = load_blackboard(orch.layout)
     assert "benchmark" in bb and "baseline" in bb
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-class _NullBackend:
-    """Minimal LLMBackend stub — tests use injected runners instead."""
-    def chat(self, messages, tools):
-        raise AssertionError("LLM backend must not be invoked when runners are injected")
-
-
-def _canned_analyst(*, backend, registry, layout, contract, agent_cfg, observer):
-    return {"status": "success", "stage": Stage.TUNING_LOOP.value,
-            "metrics": {"summary": "test"}}
-
-
-def _canned_optimizer(*, backend, registry, layout, contract, agent_cfg, observer):
-    cid = "candidate_111"
-    target = layout.candidate_file(cid, "candidate.cu")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("// canned\n", encoding="utf-8")
-    return {"status": "success", "stage": Stage.TUNING_LOOP.value,
-            "candidate_id": cid, "hypothesis": "test",
-            "experiment_type": "canned"}
-
-

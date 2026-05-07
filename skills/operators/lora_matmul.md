@@ -9,8 +9,9 @@ inputs:
   - {name: A, shape: [d, 16], dtype: float32}
   - {name: B, shape: [d, 16], dtype: float32}
 output: {name: Y, shape: [d, d], dtype: float32}
-reference_pytorch: "W @ X + A @ (B.T @ X)"
+reference_pytorch: "W @ X + A @ (B.transpose(0, 1).contiguous() @ X)"
 forward_args: [W, X, A, B]
+correctness: {rtol: 1.0e-4, atol: 1.0e-4}
 ---
 
 # Operator: LoRA-fused MATMUL

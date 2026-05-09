@@ -1,12 +1,13 @@
 ---
 name: operators/lora_matmul_tuning
-description: Tuning navigation guide for LoRA-fused MATMUL — search space, result-driven optimization decisions, low-rank exploitation, and tile size reference.
+description: Tuning navigation guide for LoRA-fused MATMUL — realistic performance ceiling, profiling-driven exploration, search space dimensions, and tile size guidance.
 ---
 
 # LoRA MATMUL — Tuning Navigation Guide
 
 Companion to `operators/lora_matmul`. Use this during TUNING_LOOP to decide what
-to build next given your current evaluation results.
+to build next. Start by reading the hardware blackboard; let profiling evidence
+drive every decision rather than following a fixed recipe.
 
 > **Dependency constraint (official eval environment)**
 > Allowed headers: `<torch/extension.h>`, `<cuda_runtime.h>`, `<mma.h>` (for
@@ -14,77 +15,168 @@ to build next given your current evaluation results.
 > cuBLAS/cuDNN calls, Thrust, or any header not in the CUDA 12 toolkit. No
 > extra source files beyond `optimized_lora.cu`. No `extra_ldflags`.
 
-## Search Space
+## Realistic Performance Ceiling
 
-| Dimension | Options | Notes |
-|-----------|---------|-------|
-| Kernel architecture | `split` / `fused` | `split` = separate kernels for W@X and A@(B^T@X); `fused` = single kernel handles both paths sharing smem |
-| Low-rank path | `sequential` / `smem_side` | `sequential` = B^T@X then A@T as two passes; `smem_side` = accumulate low-rank contribution in smem while streaming WX tiles, no intermediate DRAM write |
-| Memory access | `naive` / `smem_tile` / `float4` | Float4 (128-bit) vectorized loads are almost always worth doing for W and X |
-| Compute unit | `cuda_cores` / `tensor_cores` | Tensor cores (WMMA/mma.sync) need sm_80+; use TF32 accumulation for float32 inputs |
-| Tile shape BM × BN × BK | runtime-tuned | Drives smem usage and occupancy; see reference table below |
+The PyTorch baseline calls cuBLAS for both GEMM terms — cuBLAS is already
+highly tuned. Understand the ceiling before writing a kernel:
 
-## Navigation Rules
+**WX term** (d×d @ d×d): arithmetic intensity ≈ d/6 FLOP/Byte.
+For d ≥ 3584 this exceeds the roofline crossover on any modern GPU — WX is
+**deeply compute-bound**. A hand-written CUDA core kernel will not beat cuBLAS
+on this term alone. Savings come from kernel-launch fusion and shared memory
+reuse, not raw FLOP throughput.
 
-Apply the **first matching rule** top-to-bottom after each `evaluate_candidate` result:
+**A(B^T X) term** (low-rank, r=16): arithmetic intensity ≈ 0.5 FLOP/Byte.
+This term is **strongly memory-bound**. Fusing it into the WX tile loop
+eliminates one DRAM round-trip for the intermediate T = B^T X — this is where
+the real gain comes from.
 
-| Signal | Diagnosis | Next step |
-|--------|-----------|-----------|
-| `compile_ok=False` | Syntax / API error | Fix PYBIND11_MODULE binding, `forward` signature, and `#include <torch/extension.h>` |
-| `correctness_ok=False` | Algorithm bug | Check: (a) row/col index order in matmul loops, (b) B.T vs B in the low-rank term, (c) accumulation into output (+=) not overwrite (=) |
-| speedup < 1.0, fused kernel | smem bank conflict or occupancy too low | Add `#pragma unroll`; check smem layout to avoid bank conflicts on the BK dimension; try a smaller BK=8 |
-| speedup < 1.0, split/naive kernel | Memory access pattern suboptimal | Switch to float4 vectorized loads; ensure `blockDim.x` is a multiple of 32 |
-| speedup 1.0–1.5 | Likely memory-bound (DRAM bottleneck) | Increase BM/BN for better data reuse; use float4; consider fusing both terms to eliminate one DRAM write/read round-trip |
-| speedup 1.5–3.0 | Good. Likely compute-bound | Try tensor cores (WMMA API); unroll inner K loop; increase ILP via register blocking |
-| speedup 3.0–8.0 | Excellent. Confirm measurement | Run `mode="confirm"`; if `variance_pct < 15%` submit `best_update` |
-| speedup > 8.0 | Possible measurement artifact | Verify `torch.cuda.synchronize()` placement and Event recording; re-run confirm before claiming best |
-| `variance_pct > 15%` on confirm | Timing unstable across d values | Try d-adaptive launch config (different tile per d); submit `strategy_guidance` and note config |
-| per-d speedup spread > 2× | Tile config mismatched to some d | Add runtime dispatch: smaller BM/BN for d values that aren't multiples of the tile width |
+**Practical speedup range**: 1.3–2.0× over the sequential PyTorch baseline is
+a realistic target. Reaching 2×+ requires aggressive tensor-core usage and
+near-perfect memory access patterns. Anything above 2× warrants timing
+verification; above 3× is almost certainly a measurement artifact.
 
-## Low-rank Exploitation (r = 16, fixed)
+## Step 0 — Read Hardware Before Writing Any Kernel
 
-The intermediate `T = B^T X` has shape (16, d) — tiny enough for on-chip storage.
-This is the main handle for eliminating DRAM traffic in the low-rank term.
+Call `read_blackboard("hardware")` first. Use the measured values to anchor
+every subsequent decision:
 
-**Recommended pattern** — compute the low-rank contribution inside the WX tile loop:
+| Field | How to use it |
+|-------|--------------|
+| `dram_bw_gbps` | Memory bandwidth ceiling; `memory_ceiling_TBs = dram_bw_gbps / 1000` |
+| `sm_count` | Warp concurrency ceiling; occupancy target = blocks_per_sm × sm_count |
+| `l2_kb` | Working-set guidance for tile sizes |
+| `compute_capability` | cc ≥ 8.0 → WMMA tensor cores available; cc < 8.0 → CUDA cores only |
+| `peak_clock_mhz` | FP32 ceiling ≈ sm_count × 128 × 2 × peak_clock_mhz × 1e6 / 1e12 TFLOPS |
 
+Roofline crossover (FLOP/Byte) = FP32_ceiling_TFLOPS × 1e3 / dram_bw_gbps.
+Compare WX arithmetic intensity (≈ d/6) against crossover to confirm whether
+WX is compute-bound or memory-bound on **this specific machine**.
+
+## Exploration Space
+
+Each dimension is a direction to explore, not a fixed prescription. Profile
+first (Step 2), then pick the dimension most likely to address the observed
+bottleneck.
+
+**Kernel architecture**
+- `split`: two separate kernel launches (one for WX, one for A(B^TX)). Simpler
+  to write and debug. Two DRAM round-trips for X.
+- `fused`: one kernel, both terms share smem tiles of X. Eliminates the second
+  X load from DRAM. Preferred direction once correctness is confirmed.
+
+**Low-rank path** (r = 16, fixed)
+- `sequential`: compute T = B^T X to a temporary DRAM buffer, then A @ T.
+  Two extra DRAM writes/reads for the 16×d intermediate.
+- `smem_side`: accumulate the low-rank contribution inside the WX k-tile loop.
+  T lives in registers (or smem if BM > 32). Eliminates all intermediate DRAM.
+  This is almost always the better choice; explore it early.
+
+**Memory access pattern**
+- `naive`: one float per thread per load.
+- `smem_tile`: W and X tiles staged through shared memory; enables coalescing
+  and data reuse across threads.
+- `float4`: 128-bit vectorized loads (4 floats at once). Effective when
+  columns are 128-bit aligned; use with `__ldg` for read-only inputs.
+
+**Compute unit**
+- `cuda_cores`: standard FP32 FMA. Good baseline.
+- `tensor_cores`: WMMA API (`#include <mma.h>`), requires cc ≥ 8.0. Uses
+  TF32 accumulation for float32 inputs (slight precision reduction but within
+  rtol/atol). Only attempt this if ncu shows compute utilization > 60% and
+  you have confirmed correctness with cuda_cores first.
+
+**Tile shape BM × BN × BK**
+- Drives shared memory use: `smem_bytes = (BM + BN + 16) × BK × 4` (the +16
+  accounts for the B slice).
+- Hard ceiling: `cudaDeviceProp.sharedMemPerBlock` (typically 48–100 KB).
+- Starting point: BM = BN = 64, BK = 16. Adjust based on occupancy data from
+  ncu — if occupancy is low because smem is the limiter, reduce BM/BN; if
+  occupancy is fine but compute is low, increase BM/BN.
+- Register pressure: keeping t_tile (the low-rank accumulator) in registers
+  requires 16 × BM floats. Use BM ≤ 32 to stay within register budget, or
+  spill t_tile to smem for larger BM.
+
+## Step 1 — Correctness First
+
+Write the simplest fused kernel that passes compile and correctness checks.
+Do not optimize yet. A slow but correct kernel lets the analyst run ncu
+in the next round and generate real evidence.
+
+Fix guide for common failures:
+- `compile_ok=False` → Check `PYBIND11_MODULE`, `forward` signature, headers.
+- `correctness_ok=False` → Check: (a) row/col index order, (b) B vs B^T in
+  the low-rank term (B is stored as d×r; access as `B[k * r + rank_idx]` for
+  B^T), (c) accumulate with `+=` not `=`.
+
+## Step 2 — Profile Before the Next Iteration
+
+After a correct candidate exists, the analyst stage runs ncu. Read
+`read_blackboard("latest_diagnosis")` before writing the next candidate.
+
+Key ncu metrics and what they tell you:
+
+| Metric | Low value means | High value means |
+|--------|----------------|-----------------|
+| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | under-utilized SMs | compute-bound |
+| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | low DRAM pressure | memory-bound |
+| `l1tex__t_sectors_pipe_lsu_mem_shared_op_ld.sum` | little smem use | smem-heavy |
+
+Direction from evidence:
+- DRAM util high, compute util low → **memory-bound**: improve access patterns
+  (float4, coalescing, larger tiles for reuse)
+- Compute util high, DRAM util low → **compute-bound**: try tensor cores or
+  unroll the inner K loop for ILP
+- Both low → occupancy or launch overhead: check smem allocation vs. hardware
+  limit; reduce BM/BN to fit more blocks per SM
+
+## Step 3 — One Variable at a Time
+
+Change one dimension per candidate. Keep the prior `candidate_id` as a
+reference so the speedup delta is attributable to the single change.
+Record your hypothesis in the `submit_candidate` call.
+
+## Speedup Signals
+
+| Observed speedup | Interpretation |
+|-----------------|---------------|
+| < 1.0 | Access pattern regression or bank conflict — profile for root cause |
+| 1.0–1.3 | Modest gain; continue profiling to find the dominant bottleneck |
+| 1.3–1.8 | Meaningful improvement; look at the next ncu bottleneck |
+| 1.8–2.0 | Near the realistic ceiling; verify timing stability before submitting |
+| > 2.0 | Very strong — double-check `torch.cuda.synchronize()` placement and cudaEvent recording before claiming |
+
+## Low-rank Exploitation (r = 16)
+
+The `smem_side` pattern eliminates DRAM traffic for the intermediate T = B^T X.
+Pseudocode for the fused tile loop:
+
+```cuda
+for (int kk = 0; kk < d; kk += BK) {
+    // Load tiles into shared memory
+    smem_W[BM][BK] <- W[row][kk:kk+BK]   // base weight slice
+    smem_X[BK][BN] <- X[kk:kk+BK][col]   // input slice (shared with low-rank)
+    smem_B[BK][16] <- B[kk:kk+BK][0:16]  // B slice (r=16 cols)
+
+    __syncthreads();
+
+    // Base GEMM contribution
+    acc_W += dot(smem_W[ty][0:BK], smem_X[0:BK][tx]);
+
+    // Low-rank contribution: accumulate A @ (B^T @ X) in registers
+    for (int k = 0; k < BK; k++) {
+        float x_val = smem_X[k][tx];
+        for (int r = 0; r < 16; r++)
+            t_reg[r] += smem_B[k][r] * x_val;  // t_reg = B^T @ X column
+    }
+    __syncthreads();
+}
+// Load A tile once, compute low-rank output
+smem_A[BM][16] <- A[row][0:16]
+float acc_lr = dot(smem_A[ty][0:16], t_reg[0:16]);
+Y[row][col] = acc_W + acc_lr;
 ```
-for k_tile in range(K // BK):
-    smem_X[BM, BK]  ← load from global X          // input tile
-    smem_W[BM, BK]  ← load from global W          // base weight tile
-    smem_B[16, BK]  ← load from global B          // all 16 rows of B slice
 
-    acc_W  += smem_W  @ smem_X.T                   // base GEMM contribution
-    t_tile  = smem_B  @ smem_X.T                   // low-rank T slice (16 × BM)
-    // t_tile lives in registers (16 × BM ≤ 512 floats for BM=32)
-
-load smem_A[BM, 16] from global A
-acc_lr = smem_A @ t_full                           // (BM × 16) @ (16 × BN)
-Y[BM, BN] = acc_W + acc_lr
-```
-
-**Register pressure**: for BM=64, t_tile needs 16×64 = 1024 floats (4 KB), which
-exceeds the register budget. Use BM ≤ 32 when keeping t_tile in registers, or spill
-t_tile to shared memory.
-
-## Tile Size Reference
-
-Shared memory per block: `smem_bytes = (BM + BN) × BK × 4`.
-Keep `smem_bytes < L2_mb × 1024² / 4` to fit working set in L2.
-
-| GPU L2 cache | Recommended BM × BN × BK | smem / block |
-|--------------|--------------------------|--------------|
-| 4 MB         | 64 × 64 × 16             | 64 KB        |
-| 8 MB         | 128 × 64 × 16            | 96 KB        |
-| 16 MB        | 128 × 128 × 16           | 128 KB       |
-| 32 MB        | 128 × 128 × 32           | 256 KB       |
-
-Check `cudaDeviceProp.sharedMemPerMultiprocessor` — most GPUs cap smem per block
-at 48–100 KB. Use 128×128 tiles only if the device supports ≥ 128 KB per block.
-
-## Anomaly Signals
-
-- `max_abs_diff > 1e-2` on any d → do not submit `best_update`; fix the kernel first.
-- speedup > 8× on quick mode → verify with `mode="confirm"` before claiming `best_update`.
-- `variance_pct > 15%` → submit `strategy_guidance`, note tile config and d values affected.
-- Compiler / driver errors → `compile_ok=False` will be set; analyze `compile_error` field.
+Register pressure: `t_reg[16]` is 16 floats per thread — safe for any BM.
+The accumulated `smem_W / smem_X` tiles are the larger cost; BM=BN=64 with
+BK=16 uses 64×4 + 64×4 + 16×4 = 576 bytes of smem per warp-width element.

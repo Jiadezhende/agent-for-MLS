@@ -22,7 +22,7 @@ from mls_agent.llm.config import LLMConfig
 from mls_agent.tools.cuda.config import ExecutorConfig
 from mls_agent.tools.cuda.cuda_executor import Executor
 
-from operator_opt_pipe.operators import load_contract
+from operator_opt_pipe.operators import load_contract, load_ops
 from operator_opt_pipe.orchestrator import PipelineOrchestrator
 from operator_opt_pipe.state import RunLayout, make_run_id
 
@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         contract = load_contract(args.operator)
+        ops = load_ops(args.operator)
     except FileNotFoundError as exc:
         print(f"error: load_contract: {exc}", file=sys.stderr)
         return 2
@@ -99,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_cfg=agent_cfg,
         executor=executor,
         contract=contract,
+        ops=ops,
         skills_dir=args.skills_root,
         run_id=run_id,
         verbose=args.verbose,

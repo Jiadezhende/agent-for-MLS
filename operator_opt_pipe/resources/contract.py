@@ -105,59 +105,6 @@ class OperatorContract:
         mid = (lo + hi) // 2
         return (lo, mid, hi)
 
-    # ------------------------------------------------------------------
-    # Source-rendering helpers (used by baseline + evaluation subprocess
-    # script generators).
-    # ------------------------------------------------------------------
-
-    def render_input_creation(self, *, device_var: str = "device") -> str:
-        lines = []
-        for t in self.inputs:
-            lines.append(
-                f"{t.name} = torch.randn({t.render_shape()}, "
-                f"device={device_var}, dtype={t.torch_dtype()})"
-            )
-        return "\n".join(lines)
-
-    def render_save_inputs(self, *, dir_var: str, shape_id_expr: str) -> str:
-        lines = []
-        for t in self.inputs:
-            lines.append(
-                f'torch.save({t.name}.cpu(), os.path.join({dir_var}, '
-                f'f"{t.name}_{{{shape_id_expr}}}.pt"))'
-            )
-        return "\n".join(lines)
-
-    def render_load_inputs(self, *, dir_var: str, shape_id_expr: str,
-                           device_var: str = "device") -> str:
-        lines = []
-        for t in self.inputs:
-            lines.append(
-                f'{t.name} = torch.load(os.path.join({dir_var}, '
-                f'f"{t.name}_{{{shape_id_expr}}}.pt"), map_location={device_var})'
-            )
-        return "\n".join(lines)
-
-    def render_reference_compute(self) -> str:
-        return f"{self.output.name} = {self.reference_pytorch}"
-
-    def render_save_reference(self, *, dir_var: str, shape_id_expr: str) -> str:
-        return (
-            f'torch.save({self.output.name}.cpu(), '
-            f'os.path.join({dir_var}, f"{self.output.name}_{{{shape_id_expr}}}.pt"))'
-        )
-
-    def render_load_reference(self, *, dir_var: str, shape_id_expr: str,
-                              var_name: str = "Y_ref",
-                              device_var: str = "device") -> str:
-        return (
-            f'{var_name} = torch.load(os.path.join({dir_var}, '
-            f'f"{self.output.name}_{{{shape_id_expr}}}.pt"), map_location={device_var})'
-        )
-
-    def render_forward_call(self, mod_var: str = "mod") -> str:
-        return f"{mod_var}.forward({', '.join(self.forward_args)})"
-
     def forward_signature_text(self) -> str:
         return f"forward({', '.join(self.forward_args)})"
 

@@ -16,26 +16,35 @@ Two entry points:
 Both use ``torch.utils.cpp_extension.load`` with ``extra_cuda_cflags=["-O3"]``
 to mirror the official Phase-2 evaluation harness — local "best" matches
 scoring "best".
+
+The subprocess script is a fixed template that imports the operator
+``OPS`` instance via ``operator_opt_pipe.operators.load_ops`` at runtime;
+all operator-specific behaviour (input load, forward call, oracle load)
+goes through ``OPS`` methods. No string-template rendering of operator
+formulae.
 """
 from __future__ import annotations
 
 import json
 import math
 import statistics
-import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from operator_opt_pipe.operators._base import OperatorOps
 from operator_opt_pipe.resources.benchmark import (
     BenchmarkSpec,
     parse_marked_output,
 )
-from operator_opt_pipe.resources.contract import OperatorContract
 
 
 _QUICK_MARKER = "=== QUICK_RESULT ==="
 _BENCH_MARKER = "=== BENCH_RESULT ==="
+
+# Project root — added to sys.path inside subprocess scripts so that the
+# generated subprocess (cwd=workspace/exec) can ``import operator_opt_pipe``.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +122,7 @@ class BenchmarkResult:
 
 
 def compile_and_check_quick(
-    contract: OperatorContract,
+    ops: OperatorOps,
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
@@ -131,15 +140,15 @@ def compile_and_check_quick(
     ``cpp_extension.load(build_directory=...)`` so .so artifacts live
     under the run instead of ``~/.cache/torch_extensions/``.
     """
-    shape_id_str = f"{contract.shape_param}{int(sample_shape)}"
+    shape_id_str = ops.shape_id(int(sample_shape))
     script = _build_quick_script(
-        contract=contract,
+        ops=ops,
         candidate_id=candidate_id,
         candidate_cu=candidate_cu,
         inputs_dir=inputs_dir,
         oracle_dir=oracle_dir,
         build_dir=build_dir,
-        shape_value=sample_shape,
+        shape_value=int(sample_shape),
         shape_id=shape_id_str,
     )
     job = executor.profile_with_torch(
@@ -166,7 +175,7 @@ def compile_and_check_quick(
 
 
 def benchmark_on_grid(
-    contract: OperatorContract,
+    ops: OperatorOps,
     spec: BenchmarkSpec,
     candidate_id: str,
     candidate_cu: Path,
@@ -185,7 +194,7 @@ def benchmark_on_grid(
     summarize across shapes.
     """
     script = _build_bench_script(
-        contract=contract,
+        ops=ops,
         candidate_id=candidate_id,
         candidate_cu=candidate_cu,
         inputs_dir=inputs_dir,
@@ -271,7 +280,7 @@ def benchmark_on_grid(
 
 def _build_quick_script(
     *,
-    contract: OperatorContract,
+    ops: OperatorOps,
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
@@ -284,35 +293,31 @@ def _build_quick_script(
     inp_dir_s = inputs_dir.resolve().as_posix()
     ora_dir_s = oracle_dir.resolve().as_posix()
     bld_dir_s = build_dir.resolve().as_posix()
+    project_root_s = _PROJECT_ROOT.as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
-    forward_call = contract.render_forward_call("mod")
-
-    load_inputs = textwrap.indent(
-        contract.render_load_inputs(dir_var="INPUT_DIR", shape_id_expr="SHAPE_ID"),
-        "    ",
-    )
-    load_ref = textwrap.indent(
-        contract.render_load_reference(dir_var="ORACLE_DIR", shape_id_expr="SHAPE_ID"),
-        "    ",
-    )
 
     return f'''import json
-import os
 import sys
 import traceback
 
+sys.path.insert(0, r"{project_root_s}")
+
 import torch
 from torch.utils.cpp_extension import load
+
+from operator_opt_pipe.operators import load_ops
 
 CU_PATH    = r"{cu_path_s}"
 INPUT_DIR  = r"{inp_dir_s}"
 ORACLE_DIR = r"{ora_dir_s}"
 BUILD_DIR  = r"{bld_dir_s}"
-SHAPE_VAL = {int(shape_value)}
-SHAPE_ID  = "{shape_id}"
-RTOL = {float(contract.rtol)}
-ATOL = {float(contract.atol)}
+SHORT_NAME = "{ops.short_name}"
+SHAPE_VAL  = {int(shape_value)}
+SHAPE_ID   = "{shape_id}"
+RTOL = {float(ops.contract.rtol)}
+ATOL = {float(ops.contract.atol)}
 
+import os
 os.makedirs(BUILD_DIR, exist_ok=True)
 
 result = {{
@@ -329,6 +334,8 @@ if not torch.cuda.is_available():
     print("{_QUICK_MARKER}")
     print(json.dumps(result))
     sys.exit(0)
+
+ops = load_ops(SHORT_NAME)
 
 try:
     mod = load(
@@ -348,17 +355,13 @@ except Exception as exc:
 
 try:
     device = torch.device("cuda")
-    {contract.shape_param} = SHAPE_VAL
-{load_inputs}
-{load_ref}
-    Y_ref = Y_ref.to(device)
+    inputs = ops.load_inputs(INPUT_DIR, SHAPE_ID, device=device)
+    Y_ref = ops.load_oracle(ORACLE_DIR, SHAPE_ID, device=device)
     with torch.no_grad():
-        Y = {forward_call}
+        Y = ops.forward_call(mod, inputs)
     diff = (Y - Y_ref).float()
-    max_abs_err = float(diff.abs().max().item())
-    rel_l2_err = float((diff.norm() / (Y_ref.float().norm() + 1e-12)).item())
-    result["max_abs_err"] = max_abs_err
-    result["rel_l2_err"] = rel_l2_err
+    result["max_abs_err"] = float(diff.abs().max().item())
+    result["rel_l2_err"] = float((diff.norm() / (Y_ref.float().norm() + 1e-12)).item())
     result["correctness_ok"] = bool(torch.allclose(Y, Y_ref, rtol=RTOL, atol=ATOL))
 except Exception as exc:
     result["diagnostics"]["error"] = (
@@ -372,7 +375,7 @@ print(json.dumps(result))
 
 def _build_bench_script(
     *,
-    contract: OperatorContract,
+    ops: OperatorOps,
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
@@ -380,43 +383,38 @@ def _build_bench_script(
     build_dir: Path,
     spec: BenchmarkSpec,
 ) -> str:
-    shape_var = contract.shape_param
     cu_path_s = str(candidate_cu.resolve()).replace("\\", "/")
     inp_dir_s = inputs_dir.resolve().as_posix()
     ora_dir_s = oracle_dir.resolve().as_posix()
     bld_dir_s = build_dir.resolve().as_posix()
+    project_root_s = _PROJECT_ROOT.as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
-    forward_call = contract.render_forward_call("mod")
     grid_repr = json.dumps(list(spec.shape_grid))
 
-    load_inputs = textwrap.indent(
-        contract.render_load_inputs(dir_var="INPUT_DIR", shape_id_expr="shape_id"),
-        "        ",
-    )
-    load_ref = textwrap.indent(
-        contract.render_load_reference(dir_var="ORACLE_DIR", shape_id_expr="shape_id"),
-        "        ",
-    )
-
     return f'''import json
-import os
 import statistics
 import sys
 import traceback
 
+sys.path.insert(0, r"{project_root_s}")
+
 import torch
 from torch.utils.cpp_extension import load
+
+from operator_opt_pipe.operators import load_ops
 
 CU_PATH    = r"{cu_path_s}"
 INPUT_DIR  = r"{inp_dir_s}"
 ORACLE_DIR = r"{ora_dir_s}"
 BUILD_DIR  = r"{bld_dir_s}"
+SHORT_NAME = "{ops.short_name}"
 SHAPE_GRID = {grid_repr}
 SAMPLES    = {int(spec.samples)}
 WARMUP     = {int(spec.warmup)}
-RTOL = {float(contract.rtol)}
-ATOL = {float(contract.atol)}
+RTOL = {float(ops.contract.rtol)}
+ATOL = {float(ops.contract.atol)}
 
+import os
 os.makedirs(BUILD_DIR, exist_ok=True)
 
 result = {{"compile_ok": False, "compile_log": "", "per_shape": []}}
@@ -426,6 +424,8 @@ if not torch.cuda.is_available():
     print("{_BENCH_MARKER}")
     print(json.dumps(result))
     sys.exit(0)
+
+ops = load_ops(SHORT_NAME)
 
 try:
     mod = load(
@@ -445,8 +445,8 @@ except Exception as exc:
 
 device = torch.device("cuda")
 per_shape = []
-for {shape_var} in SHAPE_GRID:
-    shape_id = f"{shape_var}{{{shape_var}}}"
+for d in SHAPE_GRID:
+    shape_id = ops.shape_id(int(d))
     entry = {{
         "shape_id": shape_id,
         "correct": False,
@@ -458,28 +458,28 @@ for {shape_var} in SHAPE_GRID:
         "samples": 0,
     }}
     try:
-{load_inputs}
-{load_ref}
-        Y_ref = Y_ref.to(device)
+        inputs = ops.load_inputs(INPUT_DIR, shape_id, device=device)
+        Y_ref = ops.load_oracle(ORACLE_DIR, shape_id, device=device)
         with torch.no_grad():
-            Y = {forward_call}
+            Y = ops.forward_call(mod, inputs)
         diff = (Y - Y_ref).float()
         entry["max_abs_err"] = float(diff.abs().max().item())
         entry["rel_l2_err"] = float((diff.norm() / (Y_ref.float().norm() + 1e-12)).item())
         entry["correct"] = bool(torch.allclose(Y, Y_ref, rtol=RTOL, atol=ATOL))
         if entry["correct"]:
-            for _ in range(WARMUP):
-                _ = {forward_call}
-            torch.cuda.synchronize()
-            times = []
-            for _ in range(SAMPLES):
-                s = torch.cuda.Event(enable_timing=True)
-                e = torch.cuda.Event(enable_timing=True)
-                s.record()
-                _ = {forward_call}
-                e.record()
+            with torch.no_grad():
+                for _ in range(WARMUP):
+                    _ = ops.forward_call(mod, inputs)
                 torch.cuda.synchronize()
-                times.append(s.elapsed_time(e))
+                times = []
+                for _ in range(SAMPLES):
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record()
+                    _ = ops.forward_call(mod, inputs)
+                    e.record()
+                    torch.cuda.synchronize()
+                    times.append(s.elapsed_time(e))
             entry["ms_median"] = float(statistics.median(times))
             entry["ms_min"] = float(min(times))
             entry["ms_max"] = float(max(times))

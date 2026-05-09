@@ -42,6 +42,7 @@ from mls_agent.tools.builtin import (
 )
 from mls_agent.tools.cuda.profile_tools import make_profile_tools
 
+from operator_opt_pipe.operators._base import OperatorOps
 from operator_opt_pipe.resources.contract import OperatorContract
 from operator_opt_pipe.state import RunLayout, Stage, load_blackboard
 from operator_opt_pipe.tools import (
@@ -88,6 +89,7 @@ def build_registry(
     *,
     layout: RunLayout,
     contract: OperatorContract,
+    ops: OperatorOps,
     executor: Any,
     skills_dir: Any | None = None,
 ) -> ToolRegistry:
@@ -131,7 +133,7 @@ def build_registry(
         reg.register(WriteBlackboardTool(layout, ROLE_BLACKBOARD_KEYS[role]))
         reg.register(make_terminate_tool())
     elif role in ("optimizer_cold", "optimizer"):
-        reg.register(WriteCandidateTool(layout, contract, executor))
+        reg.register(WriteCandidateTool(layout, ops, executor))
         reg.register(SubmitCandidateTool(layout))
     elif role == "summary":
         reg.register(WriteBlackboardTool(layout, ROLE_BLACKBOARD_KEYS[role]))
@@ -185,7 +187,12 @@ Workflow:
      expected_effect / risk fields.
 
 The forward signature MUST match the contract verbatim. Use
-torch::Tensor and PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{ m.def("forward", &forward); }}."""
+torch::Tensor and PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{ m.def("forward", &forward); }}.
+
+Allowed headers only: <torch/extension.h>, <cuda_runtime.h>, <mma.h> (tensor
+cores), standard C/C++ headers. Do NOT use CUTLASS, direct cuBLAS/cuDNN calls,
+Thrust, or any header outside the standard CUDA 12 toolkit. The compilation
+command passes no extra_ldflags — external library links will fail."""
 
 
 SYSTEM_PROMPT_ANALYST = """\
@@ -225,7 +232,12 @@ Workflow:
      bottleneck this candidate addresses and how.
 
 You do NOT see runtime numbers — the orchestrator runs the multi-shape
-benchmark after submit_candidate and decides promotion."""
+benchmark after submit_candidate and decides promotion.
+
+Allowed headers only: <torch/extension.h>, <cuda_runtime.h>, <mma.h> (tensor
+cores), standard C/C++ headers. Do NOT use CUTLASS, direct cuBLAS/cuDNN calls,
+Thrust, or any header outside the standard CUDA 12 toolkit. The compilation
+command passes no extra_ldflags — external library links will fail."""
 
 
 SYSTEM_PROMPT_SUMMARY = """\

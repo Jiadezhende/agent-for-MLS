@@ -22,6 +22,7 @@ import mls_agent
 from mls_agent import AgentConfig, NullObserver, StdoutObserver
 
 from operator_opt_pipe import agents as agents_mod
+from operator_opt_pipe.operators._base import OperatorOps
 from operator_opt_pipe.resources import OperatorContract
 from operator_opt_pipe.resources.baseline import (
     build_correctness_fixtures,
@@ -66,14 +67,14 @@ class RoundResult:
 
 # Type aliases
 BenchmarkRunner = Callable[..., Any]
-"""(contract, spec, candidate_id, candidate_cu, inputs_dir, oracle_dir,
+"""(ops, spec, candidate_id, candidate_cu, inputs_dir, oracle_dir,
    baseline_per_shape, build_dir, executor) -> BenchmarkResult-like."""
 
 BaselineLatencyRunner = Callable[..., Any]
-"""(contract, spec, inputs_dir, executor) -> BaselineResult-like."""
+"""(ops, spec, inputs_dir) -> BaselineResult-like (in-process; no executor)."""
 
 FixturesRunner = Callable[..., Any]
-"""(contract, spec, inputs_dir, oracle_dir, executor) -> dict."""
+"""(ops, spec, inputs_dir, oracle_dir) -> dict (in-process; no executor)."""
 
 PromoteCallback = Callable[[str, float | None], None]
 AgentRunner = Callable[..., dict]
@@ -96,6 +97,7 @@ class RoundRunner:
         *,
         layout: RunLayout,
         contract: OperatorContract,
+        ops: OperatorOps,
         backend: mls_agent.LLMBackend,
         agent_cfg: AgentConfig,
         executor: Any,
@@ -109,6 +111,7 @@ class RoundRunner:
     ) -> None:
         self.layout = layout
         self.contract = contract
+        self.ops = ops
         self.backend = backend
         self.agent_cfg = agent_cfg
         self.executor = executor
@@ -137,6 +140,7 @@ class RoundRunner:
             backend=self.backend,
             registry=agents_mod.build_registry(
                 "analyst", layout=self.layout, contract=self.contract,
+                ops=self.ops,
                 executor=self.executor, skills_dir=self.skills_dir,
             ),
             layout=self.layout, contract=self.contract,
@@ -158,6 +162,7 @@ class RoundRunner:
             backend=self.backend,
             registry=agents_mod.build_registry(
                 "optimizer", layout=self.layout, contract=self.contract,
+                ops=self.ops,
                 executor=self.executor, skills_dir=self.skills_dir,
             ),
             layout=self.layout, contract=self.contract,
@@ -186,7 +191,7 @@ class RoundRunner:
 
         # 3. Multi-shape benchmark — orchestrator-owned, agent never sees this
         bench_dict = _run_candidate_benchmark(
-            self.layout, self.contract, self.executor,
+            self.layout, self.ops, self.executor,
             self.benchmark_runner, candidate_id,
         )
         compile_ok = bool(bench_dict.get("compile_ok"))
@@ -257,6 +262,7 @@ class PipelineOrchestrator:
         agent_cfg: AgentConfig,
         executor: Any,
         contract: OperatorContract,
+        ops: OperatorOps,
         skills_dir: str | Path | None = None,
         run_id: str | None = None,
         verbose: bool = False,
@@ -278,6 +284,7 @@ class PipelineOrchestrator:
         self.agent_cfg = agent_cfg
         self.executor = executor
         self.contract = contract
+        self.ops = ops
         self.skills_dir = skills_dir
         self.run_id = run_id or make_run_id()
         self.layout = RunLayout(workspace_root=self.workspace_root, run_id=self.run_id)
@@ -405,6 +412,7 @@ class PipelineOrchestrator:
             registry = agents_mod.build_registry(
                 "hardware_profiler",
                 layout=self.layout, contract=self.contract,
+                ops=self.ops,
                 executor=self.executor, skills_dir=self.skills_dir,
             )
         except ValueError as exc:
@@ -431,15 +439,13 @@ class PipelineOrchestrator:
         spec = BenchmarkSpec.for_contract(self.contract)
         try:
             self.fixtures_runner(
-                contract=self.contract, spec=spec,
+                ops=self.ops, spec=spec,
                 inputs_dir=self.layout.inputs_dir,
                 oracle_dir=self.layout.oracle_dir,
-                executor=self.executor,
             )
             baseline = self.baseline_runner(
-                contract=self.contract, spec=spec,
+                ops=self.ops, spec=spec,
                 inputs_dir=self.layout.inputs_dir,
-                executor=self.executor,
             )
         except Exception as exc:  # noqa: BLE001
             self._record_stage_failure(
@@ -463,6 +469,7 @@ class PipelineOrchestrator:
             registry = agents_mod.build_registry(
                 "optimizer_cold",
                 layout=self.layout, contract=self.contract,
+                ops=self.ops,
                 executor=self.executor, skills_dir=self.skills_dir,
             )
         except ValueError as exc:
@@ -482,7 +489,7 @@ class PipelineOrchestrator:
             return
 
         bench = _run_candidate_benchmark(
-            self.layout, self.contract, self.executor,
+            self.layout, self.ops, self.executor,
             self.benchmark_runner, candidate_id,
         )
         compile_ok = bool(bench.get("compile_ok"))
@@ -506,7 +513,7 @@ class PipelineOrchestrator:
     def _run_tuning_loop(self) -> None:
         self.run_state.round_index += 1
         runner = RoundRunner(
-            layout=self.layout, contract=self.contract,
+            layout=self.layout, contract=self.contract, ops=self.ops,
             backend=self.backend, agent_cfg=self.agent_cfg,
             executor=self.executor, skills_dir=self.skills_dir,
             benchmark_runner=self.benchmark_runner,
@@ -527,6 +534,7 @@ class PipelineOrchestrator:
             registry = agents_mod.build_registry(
                 "summary",
                 layout=self.layout, contract=self.contract,
+                ops=self.ops,
                 executor=self.executor, skills_dir=self.skills_dir,
             )
         except ValueError as exc:
@@ -718,20 +726,20 @@ def _coerce_dict(obj: Any) -> dict:
 
 def _run_candidate_benchmark(
     layout: RunLayout,
-    contract: OperatorContract,
+    ops: OperatorOps,
     executor: Any,
     benchmark_runner: BenchmarkRunner,
     candidate_id: str,
 ) -> dict:
     """Run the multi-shape benchmark for a candidate and persist the result."""
     cand_cu = layout.candidate_file(candidate_id, "candidate.cu")
-    spec = BenchmarkSpec.for_contract(contract)
+    spec = BenchmarkSpec.for_contract(ops.contract)
     bb = load_blackboard(layout)
     baseline_per_shape = (bb.get("baseline") or {}).get("per_shape") or {}
 
     try:
         bench = benchmark_runner(
-            contract=contract,
+            ops=ops,
             spec=spec,
             candidate_id=candidate_id,
             candidate_cu=cand_cu,

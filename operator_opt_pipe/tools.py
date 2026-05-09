@@ -29,7 +29,7 @@ from typing import Any, Mapping
 
 from mls_agent import Event, Tool, ToolErrorCode, ToolResponse
 
-from operator_opt_pipe.resources.contract import OperatorContract
+from operator_opt_pipe.operators._base import OperatorOps
 from operator_opt_pipe.resources.evaluation import (
     QuickEvalResult,
     compile_and_check_quick,
@@ -210,11 +210,12 @@ class WriteCandidateTool(Tool):
     def __init__(
         self,
         layout: RunLayout,
-        contract: OperatorContract,
+        ops: OperatorOps,
         executor,
     ) -> None:
         self._layout = layout
-        self._contract = contract
+        self._ops = ops
+        self._contract = ops.contract
         self._executor = executor
 
     def parameters_schema(self) -> dict[str, Any]:
@@ -265,7 +266,7 @@ class WriteCandidateTool(Tool):
 
         try:
             quick = compile_and_check_quick(
-                contract=self._contract,
+                ops=self._ops,
                 candidate_id=cid,
                 candidate_cu=cu_path,
                 inputs_dir=self._layout.inputs_dir,

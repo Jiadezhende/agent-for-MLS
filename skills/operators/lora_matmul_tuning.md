@@ -8,6 +8,12 @@ description: Tuning navigation guide for LoRA-fused MATMUL — search space, res
 Companion to `operators/lora_matmul`. Use this during TUNING_LOOP to decide what
 to build next given your current evaluation results.
 
+> **Dependency constraint (official eval environment)**
+> Allowed headers: `<torch/extension.h>`, `<cuda_runtime.h>`, `<mma.h>` (for
+> tensor cores), standard C/C++ headers. **Do NOT use** CUTLASS, direct
+> cuBLAS/cuDNN calls, Thrust, or any header not in the CUDA 12 toolkit. No
+> extra source files beyond `optimized_lora.cu`. No `extra_ldflags`.
+
 ## Search Space
 
 | Dimension | Options | Notes |

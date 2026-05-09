@@ -196,15 +196,6 @@ def _execute_ncu(
             hint="Provide at least one ncu metric name in the metrics list.",
         )
 
-    permission_hint = _precheck_ncu_permission()
-    if permission_hint:
-        raise ExecutorError(
-            "ncu_permission_denied",
-            error_class="infrastructure",
-            phase="profile",
-            hint=permission_hint,
-        )
-
     bin_path = _safe_join(workspace.root, binary_path)
     if not bin_path.exists():
         raise ExecutorError(

@@ -70,15 +70,24 @@ def build_correctness_fixtures(
     generator = torch.Generator(device=device)
     generator.manual_seed(int(spec.seed))
 
+    # TF32 on Ampere truncates float32 mantissa to 10 bits, introducing
+    # max abs errors ~0.1 for d≥3584 matmuls — far above atol=1e-4.
+    # Disable for oracle generation so custom FP32 kernels can pass.
+    old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+
     shape_ids: list[str] = []
-    for d in spec.shape_grid:
-        inputs = ops.make_inputs(int(d), device=device, generator=generator)
-        sid = ops.shape_id(int(d))
-        ops.save_inputs(inputs, inputs_dir, sid)
-        with torch.no_grad():
-            Y = ops.reference(inputs)
-        ops.save_oracle(Y, oracle_dir, sid)
-        shape_ids.append(sid)
+    try:
+        for d in spec.shape_grid:
+            inputs = ops.make_inputs(int(d), device=device, generator=generator)
+            sid = ops.shape_id(int(d))
+            ops.save_inputs(inputs, inputs_dir, sid)
+            with torch.no_grad():
+                Y = ops.reference(inputs)
+            ops.save_oracle(Y, oracle_dir, sid)
+            shape_ids.append(sid)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
 
     return {"shape_ids": shape_ids}
 

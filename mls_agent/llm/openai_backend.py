@@ -241,6 +241,13 @@ class OpenAIBackend(LLMBackend):
                 }
                 for tc in msg.tool_calls
             ]
+        # Thinking-mode models (DeepSeek-reasoner, Qwen with thinking, …)
+        # require the `reasoning_content` from a prior assistant turn to be
+        # passed back on every subsequent request, otherwise they 400 with
+        # "The `reasoning_content` in the thinking mode must be passed back
+        # to the API." Forward it verbatim when present.
+        if msg.reasoning_content:
+            out["reasoning_content"] = msg.reasoning_content
         return out
 
     @staticmethod

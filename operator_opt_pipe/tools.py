@@ -306,6 +306,37 @@ class WriteCandidateTool(Tool):
         ]
         if quick.max_abs_err is not None:
             text_lines.append(f"max_abs_err: {quick.max_abs_err:.3e}")
+
+        # Pull prev candidates' max_abs_err so the agent doesn't have to scroll
+        # its own context to spot a flat-error pattern.
+        prev_errs = _prev_quick_errors(self._layout, idx, lookback=2)
+        if prev_errs and quick.max_abs_err is not None:
+            prev_id, prev_err = prev_errs[0]
+            delta = quick.max_abs_err - prev_err
+            delta_pct = (delta / prev_err * 100.0) if prev_err > 0 else 0.0
+            text_lines.append(
+                f"prev_max_abs_err: {prev_err:.3e} "
+                f"(delta: {delta:+.2e}, {delta_pct:+.1f}%)"
+            )
+            quick_dict["prev_max_abs_err"] = prev_err
+            quick_dict["delta_pct"] = delta_pct
+            # Invariance hint: 2+ consecutive correctness failures with <5% delta
+            # → reduction order, not precision.
+            if (
+                not quick.correctness_ok
+                and len(prev_errs) >= 2
+                and abs(delta_pct) < 5.0
+                and prev_errs[1][1] > 0
+                and abs(prev_err - prev_errs[1][1]) / prev_errs[1][1] * 100.0 < 5.0
+            ):
+                text_lines.append(
+                    "hint: max_abs_err invariant across 3 attempts → likely "
+                    "reduction-order (not precision). Stop tweaking accumulator "
+                    "dtype; delegate matmul reduction to torch::mm and only fuse "
+                    "epilogue. See cuda_kernel_debug.md §oracle precision mismatch."
+                )
+                quick_dict["invariance_hint"] = True
+
         if not quick.compile_ok and quick.compile_log:
             text_lines.append("compile_log:")
             text_lines.append(quick.compile_log[-1500:])
@@ -339,6 +370,30 @@ def _next_candidate_index(layout: RunLayout) -> int:
             except ValueError:
                 continue
     return best + 1
+
+
+def _prev_quick_errors(
+    layout: RunLayout, current_idx: int, *, lookback: int = 2
+) -> list[tuple[str, float]]:
+    """Return up to `lookback` prior candidates' (id, max_abs_err) in newest-first
+    order. Skip candidates whose correctness_quick.json is missing or has
+    no numeric max_abs_err (e.g. compile failures).
+    """
+    out: list[tuple[str, float]] = []
+    i = current_idx - 1
+    while i >= 0 and len(out) < lookback:
+        prev_id = layout.candidate_id(i)
+        prev_path = layout.candidate_file(prev_id, "correctness_quick.json")
+        if prev_path.is_file():
+            try:
+                payload = json.loads(prev_path.read_text(encoding="utf-8"))
+                err = payload.get("max_abs_err")
+                if isinstance(err, (int, float)):
+                    out.append((prev_id, float(err)))
+            except (json.JSONDecodeError, OSError):
+                pass
+        i -= 1
+    return out
 
 
 # ---------------------------------------------------------------------------

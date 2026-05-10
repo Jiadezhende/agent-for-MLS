@@ -137,6 +137,14 @@ produce the *same* max_abs_err, and a pure-PyTorch forward gives 0 error,
 you are looking at an oracle precision mismatch, not a logic bug. See
 `cuda_kernel_debug` → "Special case: oracle precision mismatch" for details.
 
+**Diagnostic shortcut**: if two consecutive custom kernels with different
+precision/accumulator strategies (e.g. FP32 → FP64, with/without TF32 disable)
+produce max_abs_err within 5% of each other, the issue is **reduction order**,
+not precision. Don't try a third precision tweak — switch to `at::mm` /
+`torch::mm` for the matmul reduction and only fuse the LoRA epilogue. The
+`write_candidate` tool will print a `hint:` line on the third such attempt,
+but recognizing the pattern after two iterations saves a wasted round.
+
 Fix guide for compile/correctness failures:
 - `compile_ok=False` → Check `PYBIND11_MODULE`, `forward` signature, headers.
 - `correctness_ok=False` with large identical error across kernel variants →

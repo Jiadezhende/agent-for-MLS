@@ -343,7 +343,7 @@ try:
         sources=[CU_PATH],
         build_directory=BUILD_DIR,
         verbose=False,
-        extra_cuda_cflags=["-O3"],
+        extra_cuda_cflags=["-O0", "--threads", "4"],
         with_cuda=True,
     )
     result["compile_ok"] = True

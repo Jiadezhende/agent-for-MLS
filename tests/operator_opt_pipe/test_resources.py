@@ -4,7 +4,7 @@ Covers:
   * eval_shape — controlled mini-DSL for shape resolution
   * shape_id — stable shape filename component
   * operators.load_contract — registry dict lookup
-  * OperatorContract render_* helpers — used by subprocess script generators
+  * OperatorContract structural validation + default_shape_grid
 
 GPU-flagged integration tests for build_correctness_fixtures /
 measure_pytorch_latency / benchmark_on_grid live in a separate file; they
@@ -141,27 +141,13 @@ def test_operator_contract_rejects_inverted_range():
 
 
 # ---------------------------------------------------------------------------
-# OperatorContract render helpers (subprocess script generators rely on these)
+# OperatorContract derived helpers
 # ---------------------------------------------------------------------------
 
 
-def test_render_input_creation_uses_contract():
+def test_forward_signature_text_uses_forward_args():
     contract = _lora_contract()
-    rendered = contract.render_input_creation()
-    assert "W = torch.randn(d, d, device=device, dtype=torch.float32)" in rendered
-    assert "A = torch.randn(d, 16, device=device, dtype=torch.float32)" in rendered
-
-
-def test_render_save_inputs_uses_shape_id_var():
-    contract = _lora_contract()
-    rendered = contract.render_save_inputs(dir_var="DIR", shape_id_expr="sid")
-    assert 'os.path.join(DIR, f"W_{sid}.pt")' in rendered
-    assert 'os.path.join(DIR, f"B_{sid}.pt")' in rendered
-
-
-def test_render_forward_call_preserves_argument_order():
-    contract = _lora_contract()
-    assert contract.render_forward_call("mod") == "mod.forward(W, X, A, B)"
+    assert contract.forward_signature_text() == "forward(W, X, A, B)"
 
 
 def test_default_shape_grid_is_three_points():
@@ -192,3 +178,42 @@ def _lora_contract() -> OperatorContract:
         shape_param="d",
         shape_param_range=(3584, 4608),
     )
+
+
+# ---------------------------------------------------------------------------
+# Compile flag policy: quick = -O0 (fast), bench = -O3 (real perf)
+# ---------------------------------------------------------------------------
+
+
+def test_quick_script_uses_O0_for_fast_correctness_check(tmp_path):
+    """Quick correctness check skips -O3 to keep per-iter compile under 20s."""
+    from operator_opt_pipe.operators import load_ops
+    from operator_opt_pipe.resources.evaluation import _build_quick_script
+
+    ops = load_ops("lora_matmul")
+    script = _build_quick_script(
+        ops=ops, candidate_id="candidate_000",
+        candidate_cu=tmp_path / "candidate.cu",
+        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        build_dir=tmp_path / "bld", shape_value=3584, shape_id="d3584",
+    )
+    assert '"-O0"' in script
+    assert '"-O3"' not in script
+
+
+def test_bench_script_keeps_O3_for_realistic_perf(tmp_path):
+    """Multi-shape benchmark stays at -O3 — what Phase-2 evaluator uses."""
+    from operator_opt_pipe.operators import load_ops
+    from operator_opt_pipe.resources.benchmark import BenchmarkSpec
+    from operator_opt_pipe.resources.evaluation import _build_bench_script
+
+    ops = load_ops("lora_matmul")
+    spec = BenchmarkSpec(shape_grid=(3584,), samples=10, warmup=2, seed=0)
+    script = _build_bench_script(
+        ops=ops, candidate_id="candidate_000",
+        candidate_cu=tmp_path / "candidate.cu",
+        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        build_dir=tmp_path / "bld", spec=spec,
+    )
+    assert '"-O3"' in script
+    assert '"-O0"' not in script

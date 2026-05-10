@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -649,6 +650,18 @@ def _autodetect_env(
         if arch:
             changes["nvcc_default_flags"] = list(cfg.nvcc_default_flags) + [arch]
             notes.append(f"[auto-detect] GPU arch: added {arch} to nvcc flags")
+            # Pin TORCH_CUDA_ARCH_LIST so subprocess `cpp_extension.load`
+            # builds for the detected SM only, not a multi-arch fatbin.
+            # Format: "-arch=sm_86" → "8.6".
+            sm_match = re.search(r"sm_(\d+)", arch)
+            if sm_match and "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                cc = sm_match.group(1)
+                dotted = f"{cc[0]}.{cc[1:]}" if len(cc) >= 2 else cc
+                os.environ["TORCH_CUDA_ARCH_LIST"] = dotted
+                notes.append(
+                    f"[auto-detect] TORCH_CUDA_ARCH_LIST={dotted} "
+                    "(skip multi-arch fatbin in cpp_extension.load)"
+                )
         else:
             notes.append(
                 "[auto-detect] GPU arch: nvidia-smi unavailable; "

@@ -125,6 +125,10 @@ class RunLayout:
         return self.run_dir / "events.jsonl"
 
     @property
+    def trace_path(self) -> Path:
+        return self.run_dir / "agent_trace.log"
+
+    @property
     def hardware_path(self) -> Path:
         return self.run_dir / "hardware_profile.json"
 

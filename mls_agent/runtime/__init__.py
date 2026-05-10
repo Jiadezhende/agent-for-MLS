@@ -14,6 +14,7 @@ from mls_agent.runtime.exceptions import (
 from mls_agent.runtime.loop import ReActLoop
 from mls_agent.runtime.observer import (
     AgentObserver,
+    CompositeObserver,
     NullObserver,
     StdoutObserver,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "AgentContext",
     "AgentObserver",
     "AgentResult",
+    "CompositeObserver",
     "MlsAgentError",
     "NullObserver",
     "ReActLoop",

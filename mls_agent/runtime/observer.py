@@ -70,11 +70,13 @@ class StdoutObserver:
         *,
         prefix: str = "",
         stream=None,
-        truncate_arg_log_at: int = 120,
+        truncate_arg_log_at: int | None = 120,
+        truncate_response_at: int | None = 200,
     ) -> None:
         self._prefix = prefix
         self._stream = stream if stream is not None else sys.stderr
         self._truncate = truncate_arg_log_at
+        self._truncate_response = truncate_response_at
 
     # ------------------------------------------------------------------
 
@@ -85,6 +87,8 @@ class StdoutObserver:
     def _summarize_args(self, args: dict[str, Any] | None) -> str:
         if not args:
             return "(no args)"
+        if self._truncate is None:
+            return json.dumps(args, separators=(",", ":"), default=str)
         compacted: dict[str, Any] = {}
         for k, v in args.items():
             if isinstance(v, str) and len(v) > self._truncate:
@@ -93,19 +97,24 @@ class StdoutObserver:
                 compacted[k] = v
         return json.dumps(compacted, separators=(",", ":"), default=str)
 
+    def _clip(self, text: str, limit: int) -> str:
+        if self._truncate_response is None:
+            return text
+        return text[:limit]
+
     def _summarize_response(self, response: ToolResponse) -> str:
         if response.status == ToolStatus.ERROR:
             code = (response.error_info or {}).get("code", "?")
-            return f"status=error  code={code}  {response.text[:80]}"
+            return f"status=error  code={code}  {self._clip(response.text, 80)}"
         if response.status == ToolStatus.PARTIAL:
-            return f"status=partial  {response.text[:80]}"
+            return f"status=partial  {self._clip(response.text, 80)}"
         # SUCCESS
         stats = response.stats or {}
         elapsed = stats.get("elapsed_s", "")
         cache = " [cache_hit]" if stats.get("cache_hit") else ""
         timing = f"  elapsed={elapsed}s{cache}" if elapsed else ""
         terminate = "  TERMINATE" if response.terminate else ""
-        return f"status=success{timing}{terminate}  {response.text[:200]}"
+        return f"status=success{timing}{terminate}  {self._clip(response.text, 200)}"
 
     # ------------------------------------------------------------------
     # Observer hooks
@@ -147,3 +156,46 @@ class StdoutObserver:
 
     def on_error(self, exc: Exception, phase: ReActPhase) -> None:
         self._emit(f"  ERROR in phase {phase.value}: {type(exc).__name__}: {exc}")
+
+
+class CompositeObserver:
+    """Fan out hooks to multiple observers.
+
+    Each child is called in order; an exception from one child is
+    swallowed so the others still see the event. Useful for running a
+    terse stderr observer alongside a verbose file observer.
+    """
+
+    def __init__(self, *observers) -> None:
+        self._observers = observers
+
+    def _fanout(self, hook: str, *args, **kwargs) -> None:
+        for obs in self._observers:
+            try:
+                getattr(obs, hook)(*args, **kwargs)
+            except Exception:  # noqa: BLE001 — observers must never break the loop
+                pass
+
+    def on_run_start(self, ctx: AgentContext) -> None:
+        self._fanout("on_run_start", ctx)
+
+    def on_iteration_start(self, iteration: int, ctx: AgentContext) -> None:
+        self._fanout("on_iteration_start", iteration, ctx)
+
+    def on_phase_transition(self, prev, next) -> None:
+        self._fanout("on_phase_transition", prev, next)
+
+    def on_llm_call(self, messages: Sequence[Message]) -> None:
+        self._fanout("on_llm_call", messages)
+
+    def on_llm_response(self, response: ChatResponse) -> None:
+        self._fanout("on_llm_response", response)
+
+    def on_tool_call(self, call: ToolCall, response: ToolResponse) -> None:
+        self._fanout("on_tool_call", call, response)
+
+    def on_terminate(self, result: AgentResult) -> None:
+        self._fanout("on_terminate", result)
+
+    def on_error(self, exc: Exception, phase: ReActPhase) -> None:
+        self._fanout("on_error", exc, phase)

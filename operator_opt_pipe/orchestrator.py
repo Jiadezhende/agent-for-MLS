@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import mls_agent
-from mls_agent import AgentConfig, NullObserver, StdoutObserver
+from mls_agent import AgentConfig, CompositeObserver, NullObserver, StdoutObserver
 
 from operator_opt_pipe import agents as agents_mod
 from operator_opt_pipe.operators._base import OperatorOps
@@ -288,8 +289,21 @@ class PipelineOrchestrator:
         self.skills_dir = skills_dir
         self.run_id = run_id or make_run_id()
         self.layout = RunLayout(workspace_root=self.workspace_root, run_id=self.run_id)
-        self.observer = StdoutObserver(prefix="") if verbose else NullObserver()
         self.verbose = verbose
+        self._trace_log = None
+        if verbose:
+            self.layout.mkdir()
+            self._trace_log = self.layout.trace_path.open("a", encoding="utf-8")
+            console_obs = StdoutObserver(prefix="", stream=sys.stderr)
+            file_obs = StdoutObserver(
+                prefix="",
+                stream=self._trace_log,
+                truncate_arg_log_at=None,
+                truncate_response_at=None,
+            )
+            self.observer = CompositeObserver(console_obs, file_obs)
+        else:
+            self.observer = NullObserver()
 
         # Default deterministic resource runners
         self.baseline_runner = baseline_runner or measure_pytorch_latency
@@ -370,39 +384,53 @@ class PipelineOrchestrator:
 
     def run(self) -> dict:
         self._wall_started = time.monotonic()
-        for _ in range(MAX_LOOP_ITERATIONS):
-            self._tick_elapsed()
-            stage = next_stage(self.run_state, self.layout)
-            self.run_state.current_stage = stage.value
-            _emit_event(self.layout, {"type": "stage_enter", "stage": stage.value, "ts": _utcnow_iso()})
-            if self.verbose:
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(
-                    f"[{ts}] [orch] stage={stage.value} elapsed={self.run_state.elapsed_s:.1f}s "
-                    f"remaining={self.run_state.remaining_budget_s():.1f}s",
-                    flush=True,
-                )
+        try:
+            for _ in range(MAX_LOOP_ITERATIONS):
+                self._tick_elapsed()
+                stage = next_stage(self.run_state, self.layout)
+                self.run_state.current_stage = stage.value
+                _emit_event(self.layout, {"type": "stage_enter", "stage": stage.value, "ts": _utcnow_iso()})
+                if self.verbose:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    self._emit_orch(
+                        f"[{ts}] [orch] stage={stage.value} elapsed={self.run_state.elapsed_s:.1f}s "
+                        f"remaining={self.run_state.remaining_budget_s():.1f}s"
+                    )
 
-            if stage is Stage.FINALIZE:
+                if stage is Stage.FINALIZE:
+                    self._run_finalize()
+                    self._save_state()
+                    break
+                if stage is Stage.HARDWARE_PROFILE:
+                    self._run_hardware_profile()
+                elif stage is Stage.BENCHMARK_BASELINE:
+                    self._run_benchmark_baseline()
+                elif stage is Stage.INITIAL_CANDIDATE:
+                    self._run_initial_candidate()
+                elif stage is Stage.TUNING_LOOP:
+                    self._run_tuning_loop()
+                else:
+                    raise RuntimeError(f"unhandled stage {stage!r} from next_stage")
+                self._save_state()
+            else:
+                _emit_event(self.layout, {"type": "loop_guard_tripped", "ts": _utcnow_iso()})
                 self._run_finalize()
                 self._save_state()
-                break
-            if stage is Stage.HARDWARE_PROFILE:
-                self._run_hardware_profile()
-            elif stage is Stage.BENCHMARK_BASELINE:
-                self._run_benchmark_baseline()
-            elif stage is Stage.INITIAL_CANDIDATE:
-                self._run_initial_candidate()
-            elif stage is Stage.TUNING_LOOP:
-                self._run_tuning_loop()
-            else:
-                raise RuntimeError(f"unhandled stage {stage!r} from next_stage")
-            self._save_state()
-        else:
-            _emit_event(self.layout, {"type": "loop_guard_tripped", "ts": _utcnow_iso()})
-            self._run_finalize()
-            self._save_state()
-        return self._collect_summary()
+            return self._collect_summary()
+        finally:
+            if self._trace_log is not None:
+                try:
+                    self._trace_log.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._trace_log = None
+
+    def _emit_orch(self, msg: str) -> None:
+        """Print an orchestrator-level line to stderr and the trace log."""
+        print(msg, file=sys.stderr, flush=True)
+        if self._trace_log is not None:
+            self._trace_log.write(msg + "\n")
+            self._trace_log.flush()
 
     # ------------------------------------------------------------------
     # Stage runners

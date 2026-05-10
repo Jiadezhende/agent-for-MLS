@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from mls_agent.llm.types import ChatResponse, Message, ToolCall
@@ -104,17 +105,19 @@ class StdoutObserver:
         cache = " [cache_hit]" if stats.get("cache_hit") else ""
         timing = f"  elapsed={elapsed}s{cache}" if elapsed else ""
         terminate = "  TERMINATE" if response.terminate else ""
-        return f"status=success{timing}{terminate}  {response.text[:60]}"
+        return f"status=success{timing}{terminate}  {response.text[:200]}"
 
     # ------------------------------------------------------------------
     # Observer hooks
     # ------------------------------------------------------------------
 
     def on_run_start(self, ctx: AgentContext) -> None:
-        self._emit(f"run start  ({len(ctx.messages)} initial messages)")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._emit(f"[{ts}] run start  ({len(ctx.messages)} initial messages)")
 
     def on_iteration_start(self, iteration: int, ctx: AgentContext) -> None:
-        self._emit(f"\n── iter {iteration + 1} {'─' * 50}")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._emit(f"\n[{ts}] ── iter {iteration + 1} {'─' * 50}")
 
     def on_phase_transition(self, prev, next) -> None:
         # Quiet on phase transitions by default — too noisy.

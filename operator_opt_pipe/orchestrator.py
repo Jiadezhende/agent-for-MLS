@@ -288,7 +288,7 @@ class PipelineOrchestrator:
         self.skills_dir = skills_dir
         self.run_id = run_id or make_run_id()
         self.layout = RunLayout(workspace_root=self.workspace_root, run_id=self.run_id)
-        self.observer = StdoutObserver(prefix=f"[{self.run_id[:8]}] ") if verbose else NullObserver()
+        self.observer = StdoutObserver(prefix="") if verbose else NullObserver()
         self.verbose = verbose
 
         # Default deterministic resource runners
@@ -376,8 +376,9 @@ class PipelineOrchestrator:
             self.run_state.current_stage = stage.value
             _emit_event(self.layout, {"type": "stage_enter", "stage": stage.value, "ts": _utcnow_iso()})
             if self.verbose:
+                ts = datetime.now().strftime("%H:%M:%S")
                 print(
-                    f"[orch] stage={stage.value} elapsed={self.run_state.elapsed_s:.1f}s "
+                    f"[{ts}] [orch] stage={stage.value} elapsed={self.run_state.elapsed_s:.1f}s "
                     f"remaining={self.run_state.remaining_budget_s():.1f}s",
                     flush=True,
                 )

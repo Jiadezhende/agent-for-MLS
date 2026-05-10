@@ -239,7 +239,9 @@ def _execute_ncu(
             phase="profile",
             hint=(
                 "ERR_NVGPUCTRPERM: no permission for GPU hardware counters. "
-                "Do NOT retry ncu — switch to run_cuda_probe self-timed kernels instead."
+                "Do NOT retry ncu. Alternatives: "
+                "(1) run_cuda_probe with self-timed kernels (clock64 / cudaEvent); "
+                "(2) profile_with_torch to run a Python/torch timing script."
             ),
             returncode=sub.returncode,
             stderr=sub.stderr[-2000:] if sub.stderr else "",

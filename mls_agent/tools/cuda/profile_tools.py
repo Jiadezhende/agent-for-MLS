@@ -282,7 +282,10 @@ class ProfileWithTorchTool(Tool):
         "Run a Python script (typically importing torch) and capture its stdout. "
         "Use to measure PyTorch baselines, generate reference tensors for "
         "correctness validation, or run any Python-based GPU workload. The "
-        "script's CWD is the workspace root, so relative writes stay sandboxed."
+        "script's CWD is the workspace root, so relative writes stay sandboxed. "
+        "Also use as a fallback when ncu/nsys are unavailable (e.g. permission "
+        "denied): write a timing loop using torch.cuda.Event or torch.profiler "
+        "and capture the printed output."
     )
 
     def __init__(self, executor: Any) -> None:

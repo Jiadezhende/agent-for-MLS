@@ -710,6 +710,7 @@ def _autodetect_env(
                     build_directory=d,
                     verbose=False,
                     extra_cuda_cflags=["-O0"],
+                    is_python_module=False,
                 )
             notes.append("[auto-detect] load_inline: ok")
         except Exception as exc:

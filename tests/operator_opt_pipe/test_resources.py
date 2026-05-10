@@ -217,3 +217,41 @@ def test_bench_script_keeps_O3_for_realistic_perf(tmp_path):
     )
     assert '"-O3"' in script
     assert '"-O0"' not in script
+
+
+def test_quick_script_uses_online_reference_not_saved_oracle(tmp_path):
+    """Reference is recomputed in-process via ops.reference — mirrors Phase-2.
+
+    Loading the strict-FP32 saved oracle would reject candidates that match
+    Phase-2's in-process cuBLAS reference (which may have TF32 enabled).
+    """
+    from operator_opt_pipe.operators import load_ops
+    from operator_opt_pipe.resources.evaluation import _build_quick_script
+
+    ops = load_ops("lora_matmul")
+    script = _build_quick_script(
+        ops=ops, candidate_id="candidate_000",
+        candidate_cu=tmp_path / "candidate.cu",
+        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        build_dir=tmp_path / "bld", shape_value=3584, shape_id="d3584",
+    )
+    assert "ops.reference(inputs)" in script
+    assert "load_oracle" not in script
+
+
+def test_bench_script_uses_online_reference_not_saved_oracle(tmp_path):
+    """Bench correctness must use the same in-process ref policy as quick."""
+    from operator_opt_pipe.operators import load_ops
+    from operator_opt_pipe.resources.benchmark import BenchmarkSpec
+    from operator_opt_pipe.resources.evaluation import _build_bench_script
+
+    ops = load_ops("lora_matmul")
+    spec = BenchmarkSpec(shape_grid=(3584,), samples=10, warmup=2, seed=0)
+    script = _build_bench_script(
+        ops=ops, candidate_id="candidate_000",
+        candidate_cu=tmp_path / "candidate.cu",
+        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        build_dir=tmp_path / "bld", spec=spec,
+    )
+    assert "ops.reference(inputs)" in script
+    assert "load_oracle" not in script

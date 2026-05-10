@@ -627,8 +627,18 @@ def _detect_tool_path_glob(on_path_name: str, glob_patterns: list[str]) -> str |
     return candidates[0] if candidates else None
 
 
-def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]:
-    """Fill in missing ExecutorConfig values through best-effort auto-detection."""
+def _autodetect_env(
+    cfg: "ExecutorConfig",
+    *,
+    verify_compile: bool = False,
+) -> tuple["ExecutorConfig", list[str]]:
+    """Fill in missing ExecutorConfig values through best-effort auto-detection.
+
+    When ``verify_compile=True`` (used by the pipeline preflight), also checks
+    for g++ and runs a trivial load_inline smoke test to validate the full
+    CUDA extension build chain. The default ``False`` keeps existing behavior
+    so unit tests and normal Executor construction stay fast.
+    """
     import dataclasses
 
     changes: dict[str, Any] = {}
@@ -678,6 +688,31 @@ def _autodetect_env(cfg: "ExecutorConfig") -> tuple["ExecutorConfig", list[str]]
         if detected:
             changes["nsys_bin"] = detected
             notes.append(f"[auto-detect] nsys: {detected}")
+
+    # g++ detection — always included so callers can read the note
+    gxx = shutil.which("g++")
+    if gxx:
+        notes.append(f"[auto-detect] g++: {gxx}")
+    else:
+        notes.append("[auto-detect] g++: not found on PATH")
+
+    # Full compile chain smoke test — only when verify_compile=True
+    if verify_compile:
+        try:
+            import tempfile
+            import torch
+            from torch.utils.cpp_extension import load_inline
+            with tempfile.TemporaryDirectory() as d:
+                load_inline(
+                    name="autodetect_nop",
+                    cuda_sources=["__global__ void _nop_() {}"],
+                    build_directory=d,
+                    verbose=False,
+                    extra_cuda_cflags=["-O0"],
+                )
+            notes.append("[auto-detect] load_inline: ok")
+        except Exception as exc:
+            notes.append(f"[auto-detect] load_inline: FAILED — {exc}")
 
     if changes:
         cfg = dataclasses.replace(cfg, **changes)

@@ -31,10 +31,21 @@ This term is **strongly memory-bound**. Fusing it into the WX tile loop
 eliminates one DRAM round-trip for the intermediate T = B^T X — this is where
 the real gain comes from.
 
-**Practical speedup range**: 1.3–2.0× over the sequential PyTorch baseline is
-a realistic target. Reaching 2×+ requires aggressive tensor-core usage and
-near-perfect memory access patterns. Anything above 2× warrants timing
-verification; above 3× is almost certainly a measurement artifact.
+**Practical speedup range**: The achievable range depends heavily on which
+correctness constraint applies. With atol=1e-4 (Phase-2), the WX term must
+use cuBLAS-equivalent precision (e.g. `at::mm`); optimization space is limited
+to the low-rank correction and overhead reduction, which historically yields
+~1.05–1.10×. If a looser tolerance is acceptable, a fully fused FP32 kernel
+can potentially reach 1.3–2.0×. Before committing to a strategy, estimate the
+actual benefit from the available headroom rather than assuming the higher end.
+Anything above 2× warrants timing verification; above 3× is almost certainly
+a measurement artifact.
+
+**Starting point warning**: a kernel that calls `torch::matmul` for all GEMMs
+and adds a custom elementwise kernel will often be *slower* than the PyTorch
+baseline due to the extra tensor allocation and the custom kernel replacing
+PyTorch's fused `+`. Verify that the very first candidate is at least at parity
+before spending iterations on further tuning.
 
 ## Step 0 — Read Hardware Before Writing Any Kernel
 

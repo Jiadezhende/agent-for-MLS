@@ -89,6 +89,21 @@ def main(argv: list[str] | None = None) -> int:
 
     exec_cfg = ExecutorConfig.from_env()
     exec_cfg.workspace_root = str(layout.exec_dir)
+
+    # Fail fast: detect full build chain (nvcc + g++ + load_inline) before
+    # starting any agent. Writes env_info to blackboard["environment"] so all
+    # agents can read it without re-probing.
+    from operator_opt_pipe.preflight import check_build_env
+    from operator_opt_pipe.state import load_blackboard, save_blackboard
+    try:
+        env_info, exec_cfg = check_build_env(exec_cfg)
+    except RuntimeError as exc:
+        print(f"error: preflight failed:\n{exc}", file=sys.stderr)
+        return 2
+    bb = load_blackboard(layout)
+    bb["environment"] = env_info
+    save_blackboard(layout, bb)
+
     executor = Executor(exec_cfg)
 
     orchestrator = PipelineOrchestrator(

@@ -50,6 +50,18 @@ Rules:
 
 ## CUDA preflight rules
 
+- The pipeline seeds `blackboard["environment"]` at startup with the result of
+  a full build-chain check (nvcc, g++, load_inline). Read it with
+  `read_blackboard("environment")` before writing any probe kernel — if
+  `load_inline_ok` is missing or False the compilation chain is broken and
+  `run_cuda_probe` will fail. Switch to `profile_with_torch` Python-only
+  measurement in that case.
+
+- If `run_cuda_probe` returns `nvcc_infrastructure_failure` and
+  `blackboard["environment"]` shows `load_inline_ok=True`, the failure is
+  likely a transient issue or a kernel-specific compile error rather than a
+  missing tool. Inspect the compile log rather than retrying blindly.
+
 - Do not hardcode `-arch` or `--gpu-architecture` in `compile_flags` unless a
   prior probe proves the Executor's detected architecture is wrong. The Executor
   or `AGENT_NVCC_FLAGS` is the source of truth for the active GPU architecture.

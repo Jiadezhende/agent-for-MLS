@@ -705,6 +705,7 @@ def _autodetect_env(
             with tempfile.TemporaryDirectory() as d:
                 load_inline(
                     name="autodetect_nop",
+                    cpp_sources="",
                     cuda_sources=["__global__ void _nop_() {}"],
                     build_directory=d,
                     verbose=False,

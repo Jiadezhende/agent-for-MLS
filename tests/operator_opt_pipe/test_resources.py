@@ -194,7 +194,7 @@ def test_quick_script_uses_O0_for_fast_correctness_check(tmp_path):
     script = _build_quick_script(
         ops=ops, candidate_id="candidate_000",
         candidate_cu=tmp_path / "candidate.cu",
-        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        inputs_dir=tmp_path / "in",
         build_dir=tmp_path / "bld", shape_value=3584, shape_id="d3584",
     )
     assert '"-O0"' in script
@@ -212,19 +212,15 @@ def test_bench_script_keeps_O3_for_realistic_perf(tmp_path):
     script = _build_bench_script(
         ops=ops, candidate_id="candidate_000",
         candidate_cu=tmp_path / "candidate.cu",
-        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        inputs_dir=tmp_path / "in",
         build_dir=tmp_path / "bld", spec=spec,
     )
     assert '"-O3"' in script
     assert '"-O0"' not in script
 
 
-def test_quick_script_uses_online_reference_not_saved_oracle(tmp_path):
-    """Reference is recomputed in-process via ops.reference — mirrors Phase-2.
-
-    Loading the strict-FP32 saved oracle would reject candidates that match
-    Phase-2's in-process cuBLAS reference (which may have TF32 enabled).
-    """
+def test_quick_script_uses_online_reference(tmp_path):
+    """Reference is recomputed in-process via ops.reference — mirrors Phase-2."""
     from operator_opt_pipe.operators import load_ops
     from operator_opt_pipe.resources.evaluation import _build_quick_script
 
@@ -232,14 +228,15 @@ def test_quick_script_uses_online_reference_not_saved_oracle(tmp_path):
     script = _build_quick_script(
         ops=ops, candidate_id="candidate_000",
         candidate_cu=tmp_path / "candidate.cu",
-        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        inputs_dir=tmp_path / "in",
         build_dir=tmp_path / "bld", shape_value=3584, shape_id="d3584",
     )
     assert "ops.reference(inputs)" in script
+    assert "ORACLE_DIR" not in script
     assert "load_oracle" not in script
 
 
-def test_bench_script_uses_online_reference_not_saved_oracle(tmp_path):
+def test_bench_script_uses_online_reference(tmp_path):
     """Bench correctness must use the same in-process ref policy as quick."""
     from operator_opt_pipe.operators import load_ops
     from operator_opt_pipe.resources.benchmark import BenchmarkSpec
@@ -250,8 +247,9 @@ def test_bench_script_uses_online_reference_not_saved_oracle(tmp_path):
     script = _build_bench_script(
         ops=ops, candidate_id="candidate_000",
         candidate_cu=tmp_path / "candidate.cu",
-        inputs_dir=tmp_path / "in", oracle_dir=tmp_path / "or",
+        inputs_dir=tmp_path / "in",
         build_dir=tmp_path / "bld", spec=spec,
     )
     assert "ops.reference(inputs)" in script
+    assert "ORACLE_DIR" not in script
     assert "load_oracle" not in script

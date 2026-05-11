@@ -68,14 +68,14 @@ class RoundResult:
 
 # Type aliases
 BenchmarkRunner = Callable[..., Any]
-"""(ops, spec, candidate_id, candidate_cu, inputs_dir, oracle_dir,
-   baseline_per_shape, build_dir, executor) -> BenchmarkResult-like."""
+"""(ops, spec, candidate_id, candidate_cu, inputs_dir, baseline_per_shape,
+   build_dir, executor) -> BenchmarkResult-like."""
 
 BaselineLatencyRunner = Callable[..., Any]
 """(ops, spec, inputs_dir) -> BaselineResult-like (in-process; no executor)."""
 
 FixturesRunner = Callable[..., Any]
-"""(ops, spec, inputs_dir, oracle_dir) -> dict (in-process; no executor)."""
+"""(ops, spec, inputs_dir) -> dict (in-process; no executor)."""
 
 PromoteCallback = Callable[[str, float | None], None]
 AgentRunner = Callable[..., dict]
@@ -470,7 +470,6 @@ class PipelineOrchestrator:
             self.fixtures_runner(
                 ops=self.ops, spec=spec,
                 inputs_dir=self.layout.inputs_dir,
-                oracle_dir=self.layout.oracle_dir,
             )
             baseline = self.baseline_runner(
                 ops=self.ops, spec=spec,
@@ -773,7 +772,6 @@ def _run_candidate_benchmark(
             candidate_id=candidate_id,
             candidate_cu=cand_cu,
             inputs_dir=layout.inputs_dir,
-            oracle_dir=layout.oracle_dir,
             baseline_per_shape=baseline_per_shape,
             build_dir=layout.build_dir,
             executor=executor,

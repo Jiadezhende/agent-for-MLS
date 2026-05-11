@@ -25,6 +25,8 @@ from mls_agent import (
 )
 
 from operator_opt_pipe import agents
+from operator_opt_pipe.operators import load_ops
+from operator_opt_pipe.operators._base import OperatorOps
 from operator_opt_pipe.resources import OperatorContract, TensorSpec
 from operator_opt_pipe.state import RunLayout, Stage, load_blackboard
 
@@ -57,6 +59,11 @@ def layout(tmp_path: Path) -> RunLayout:
     lay = RunLayout(workspace_root=tmp_path, run_id="r")
     lay.mkdir()
     return lay
+
+
+@pytest.fixture
+def ops() -> OperatorOps:
+    return load_ops("lora_matmul")
 
 
 class _ScriptedBackend(LLMBackend):
@@ -102,10 +109,10 @@ class _NoopExecutor:
 # ---------------------------------------------------------------------------
 
 
-def test_run_hardware_profiler_terminate(layout: RunLayout, contract: OperatorContract):
+def test_run_hardware_profiler_terminate(layout: RunLayout, contract: OperatorContract, ops: OperatorOps):
     registry = agents.build_registry(
         "hardware_profiler",
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         executor=_NoopExecutor(), skills_dir=None,
     )
     backend = _ScriptedBackend([
@@ -134,10 +141,10 @@ def test_run_hardware_profiler_terminate(layout: RunLayout, contract: OperatorCo
 # ---------------------------------------------------------------------------
 
 
-def test_run_summary_terminate(layout: RunLayout, contract: OperatorContract):
+def test_run_summary_terminate(layout: RunLayout, contract: OperatorContract, ops: OperatorOps):
     registry = agents.build_registry(
         "summary",
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         executor=_NoopExecutor(), skills_dir=None,
     )
     backend = _ScriptedBackend([
@@ -168,7 +175,7 @@ def test_run_summary_terminate(layout: RunLayout, contract: OperatorContract):
 
 
 def test_run_optimizer_cold_completed_path(
-    layout: RunLayout, contract: OperatorContract, monkeypatch,
+    layout: RunLayout, contract: OperatorContract, ops: OperatorOps, monkeypatch,
 ):
     """Mock compile_and_check_quick so write_candidate doesn't spawn subprocesses,
     then verify the agent terminates COMPLETED via submit_candidate."""
@@ -192,7 +199,7 @@ def test_run_optimizer_cold_completed_path(
 
     registry = agents.build_registry(
         "optimizer_cold",
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         executor=_NoopExecutor(), skills_dir=None,
     )
     backend = _ScriptedBackend([
@@ -223,14 +230,14 @@ def test_run_optimizer_cold_completed_path(
 
 
 def test_no_terminate_call_surfaces_as_failure(
-    layout: RunLayout, contract: OperatorContract,
+    layout: RunLayout, contract: OperatorContract, ops: OperatorOps,
 ):
     """If the agent stops calling tools without invoking ``terminate``,
     the loop ends with reason=no_tool_call and the runner returns failed.
     """
     registry = agents.build_registry(
         "hardware_profiler",
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         executor=_NoopExecutor(), skills_dir=None,
     )
     backend = _ScriptedBackend([
@@ -257,17 +264,17 @@ def test_no_terminate_call_surfaces_as_failure(
 # ---------------------------------------------------------------------------
 
 
-def test_build_registry_unknown_role(layout: RunLayout, contract: OperatorContract):
+def test_build_registry_unknown_role(layout: RunLayout, contract: OperatorContract, ops: OperatorOps):
     with pytest.raises(ValueError, match="unknown role"):
         agents.build_registry(
-            "nope", layout=layout, contract=contract,
+            "nope", layout=layout, contract=contract, ops=ops,
             executor=_NoopExecutor(), skills_dir=None,
         )
 
 
-def test_build_registry_per_role_tool_set(layout: RunLayout, contract: OperatorContract):
+def test_build_registry_per_role_tool_set(layout: RunLayout, contract: OperatorContract, ops: OperatorOps):
     optimizer = agents.build_registry(
-        "optimizer", layout=layout, contract=contract,
+        "optimizer", layout=layout, contract=contract, ops=ops,
         executor=_NoopExecutor(), skills_dir=None,
     )
     names = optimizer.names()
@@ -282,7 +289,7 @@ def test_build_registry_per_role_tool_set(layout: RunLayout, contract: OperatorC
     assert "read_blackboard" in names
 
     analyst = agents.build_registry(
-        "analyst", layout=layout, contract=contract,
+        "analyst", layout=layout, contract=contract, ops=ops,
         executor=_NoopExecutor(), skills_dir=None,
     )
     a_names = analyst.names()
@@ -297,7 +304,7 @@ def test_build_registry_per_role_tool_set(layout: RunLayout, contract: OperatorC
     # hardware_profiler and summary also get terminate.
     for natural_exit_role in ("hardware_profiler", "summary"):
         reg = agents.build_registry(
-            natural_exit_role, layout=layout, contract=contract,
+            natural_exit_role, layout=layout, contract=contract, ops=ops,
             executor=_NoopExecutor(), skills_dir=None,
         )
         assert "terminate" in reg.names()

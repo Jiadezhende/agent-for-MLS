@@ -14,6 +14,8 @@ import pytest
 
 from mls_agent import AgentConfig
 
+from operator_opt_pipe.operators import load_ops
+from operator_opt_pipe.operators._base import OperatorOps
 from operator_opt_pipe.orchestrator import (
     PipelineOrchestrator,
     RoundRunner,
@@ -48,6 +50,11 @@ def contract() -> OperatorContract:
         shape_param="d",
         shape_param_range=(3584, 4608),
     )
+
+
+@pytest.fixture
+def ops() -> OperatorOps:
+    return load_ops("lora_matmul")
 
 
 @pytest.fixture
@@ -156,7 +163,7 @@ def _fake_baseline_runner(**kw):
                                 "ms_max": 110.0, "samples": 30}
                       for d in kw["spec"].shape_grid},
         "ms_median_overall": 100.0,
-        "reference_pytorch": kw["contract"].reference_pytorch,
+        "reference_pytorch": kw["ops"].reference_doc(),
     }
 
 
@@ -195,7 +202,7 @@ def _fake_benchmark_runner(*, speedup: float, all_correct: bool = True):
 # ---------------------------------------------------------------------------
 
 
-def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract: OperatorContract):
+def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract: OperatorContract, ops: OperatorOps):
     layout = RunLayout(workspace_root=workspace, run_id="r")
     layout.mkdir()
     save_blackboard(layout, {
@@ -208,7 +215,7 @@ def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract:
     promotions: list[tuple[str, float | None]] = []
 
     runner = RoundRunner(
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
         executor=_NoopExecutor(), skills_dir=None,
         benchmark_runner=_fake_benchmark_runner(speedup=1.2),
@@ -225,7 +232,7 @@ def test_round_runner_promotes_only_on_better_speedup(workspace: Path, contract:
     assert promotions == []
 
 
-def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: OperatorContract):
+def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: OperatorContract, ops: OperatorOps):
     layout = RunLayout(workspace_root=workspace, run_id="r")
     layout.mkdir()
     save_blackboard(layout, {
@@ -236,7 +243,7 @@ def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: Op
     promotions: list[tuple[str, float | None]] = []
 
     runner = RoundRunner(
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
         executor=_NoopExecutor(), skills_dir=None,
         benchmark_runner=_fake_benchmark_runner(speedup=2.3),
@@ -260,7 +267,7 @@ def test_round_runner_promotes_when_speedup_better(workspace: Path, contract: Op
     assert layout.benchmark_result_path("candidate_111").is_file()
 
 
-def test_round_runner_writes_history_steps(workspace: Path, contract: OperatorContract):
+def test_round_runner_writes_history_steps(workspace: Path, contract: OperatorContract, ops: OperatorOps):
     layout = RunLayout(workspace_root=workspace, run_id="r")
     layout.mkdir()
     save_blackboard(layout, {
@@ -269,7 +276,7 @@ def test_round_runner_writes_history_steps(workspace: Path, contract: OperatorCo
                       "warmup": 5, "seed": 0},
     })
     runner = RoundRunner(
-        layout=layout, contract=contract,
+        layout=layout, contract=contract, ops=ops,
         backend=_NullBackend(), agent_cfg=AgentConfig(max_iterations=2),
         executor=_NoopExecutor(), skills_dir=None,
         benchmark_runner=_fake_benchmark_runner(speedup=1.7),
@@ -292,7 +299,7 @@ def test_round_runner_writes_history_steps(workspace: Path, contract: OperatorCo
 # ---------------------------------------------------------------------------
 
 
-def _build_orch(workspace: Path, contract: OperatorContract, **overrides) -> PipelineOrchestrator:
+def _build_orch(workspace: Path, contract: OperatorContract, ops: OperatorOps, **overrides) -> PipelineOrchestrator:
     """Default orchestrator wiring with safe stubs everywhere."""
     output_path = workspace / "optimized_lora.cu"
     defaults = dict(
@@ -304,6 +311,7 @@ def _build_orch(workspace: Path, contract: OperatorContract, **overrides) -> Pip
         agent_cfg=AgentConfig(max_iterations=2),
         executor=_NoopExecutor(),
         contract=contract,
+        ops=ops,
         run_id=overrides.pop("run_id", "run_test"),
         verbose=False,
         fixtures_runner=_fake_fixtures,
@@ -320,10 +328,10 @@ def _build_orch(workspace: Path, contract: OperatorContract, **overrides) -> Pip
 
 
 def test_orchestrator_runs_full_pipeline_with_injected_mocks(
-    workspace: Path, contract: OperatorContract,
+    workspace: Path, contract: OperatorContract, ops: OperatorOps,
 ):
     output_path = workspace / "optimized_lora.cu"
-    orch = _build_orch(workspace, contract, output_path=output_path)
+    orch = _build_orch(workspace, contract, ops, output_path=output_path)
     summary = orch.run()
 
     state_blob = json.loads(orch.layout.state_path.read_text(encoding="utf-8"))
@@ -346,22 +354,22 @@ def test_orchestrator_runs_full_pipeline_with_injected_mocks(
 
 
 def test_orchestrator_finalize_reads_blackboard_summary(
-    workspace: Path, contract: OperatorContract,
+    workspace: Path, contract: OperatorContract, ops: OperatorOps,
 ):
     """FINALIZE renders narrative from blackboard["final_summary"], not from
     the summary agent's payload directly."""
-    orch = _build_orch(workspace, contract, run_id="run_finalize")
+    orch = _build_orch(workspace, contract, ops, run_id="run_finalize")
     orch.run()
     final_payload = json.loads(orch.layout.final_report_path.read_text(encoding="utf-8"))
     assert "narrative" in final_payload
     assert final_payload["narrative"]["narrative"] == "test summary"
 
 
-def test_orchestrator_resume_picks_existing_state(workspace: Path, contract: OperatorContract):
+def test_orchestrator_resume_picks_existing_state(workspace: Path, contract: OperatorContract, ops: OperatorOps):
     """First run completes hardware + baseline, fails INITIAL_CANDIDATE → finalize.
     Second orchestrator with same run_id picks up completed_stages."""
     orch1 = _build_orch(
-        workspace, contract,
+        workspace, contract, ops,
         run_id="run_resume",
         initial_candidate_runner=_canned_failing_initial,
     )
@@ -370,7 +378,7 @@ def test_orchestrator_resume_picks_existing_state(workspace: Path, contract: Ope
     assert orch1.layout.has_baseline()
 
     orch2 = _build_orch(
-        workspace, contract,
+        workspace, contract, ops,
         run_id="run_resume",
         initial_candidate_runner=_canned_failing_initial,
     )
@@ -379,7 +387,7 @@ def test_orchestrator_resume_picks_existing_state(workspace: Path, contract: Ope
 
 
 def test_orchestrator_benchmark_baseline_skips_llm(
-    workspace: Path, contract: OperatorContract,
+    workspace: Path, contract: OperatorContract, ops: OperatorOps,
 ):
     """BENCHMARK_BASELINE must call the deterministic runners, not any agent."""
     fixtures_calls: list[Any] = []
@@ -393,10 +401,10 @@ def test_orchestrator_benchmark_baseline_skips_llm(
         baseline_calls.append(kw["spec"])
         return {"spec": kw["spec"].to_dict(), "per_shape": {},
                 "ms_median_overall": 42.0,
-                "reference_pytorch": kw["contract"].reference_pytorch}
+                "reference_pytorch": kw["ops"].reference_doc()}
 
     orch = _build_orch(
-        workspace, contract,
+        workspace, contract, ops,
         run_id="run_bb",
         fixtures_runner=fake_fix,
         baseline_runner=fake_baseline,

@@ -172,11 +172,10 @@ def test_write_candidate_writes_file_and_returns_quick_result(
     """Valid source: file allocated, compile_and_check_quick called, dict returned."""
     captured = {}
 
-    def fake_quick(*, ops, candidate_id, candidate_cu, inputs_dir, oracle_dir, sample_shape, build_dir, executor):
+    def fake_quick(*, ops, candidate_id, candidate_cu, inputs_dir, sample_shape, build_dir, executor):
         captured["candidate_id"] = candidate_id
         captured["candidate_cu"] = candidate_cu
         captured["sample_shape"] = sample_shape
-        captured["oracle_dir"] = oracle_dir
         captured["build_dir"] = build_dir
         return QuickEvalResult(
             candidate_id=candidate_id,

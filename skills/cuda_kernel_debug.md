@@ -11,11 +11,21 @@ the checklist top-to-bottom; stop at the first confirmed root cause.
 ## Step 0 — Read the error magnitude first
 
 | `max_abs_err` magnitude | What it almost certainly means |
-|------------------------|-------------------------------|
+| ----------------------- | ------------------------------ |
 | > 100 | Logic bug — wrong index, unguarded OOB read, missing `__syncthreads__` |
 | 1e-1 – 100 | Accumulation bug — wrong sign, accumulated into wrong slot, partial sum |
 | 1e-4 – 1e-1 | Precision / algorithm error — wrong formula, B vs B^T transposition |
-| < 1e-4 | Fine (within rtol/atol=1e-4). `correctness_ok` should be True |
+| < 1e-4 | Comfortably inside the tolerance budget; `correctness_ok` is essentially always True |
+
+**`max_abs_err` is not the gate.** The gate is element-wise
+`torch.allclose(Y, Y_ref, rtol=1e-4, atol=1e-4)` — i.e. `|Δᵢ| ≤ atol + rtol·|y_refᵢ|`
+per element. For LoRA matmul at d=3584 the output magnitude is `~√d ≈ 60`, so
+the effective per-element budget on a large-magnitude element is
+`1e-4 + 1e-4 × 60 ≈ 6e-3`. A reported `max_abs_err = 7e-4` can already pass
+`allclose` — read `correctness_ok` from the tool response and treat the table
+above only as a *triage signal* for where to look. The reference `Y_ref` is
+recomputed online from `ops.reference(inputs)` in the candidate's own
+subprocess, so it inherits PyTorch's default `allow_tf32 = True`.
 
 **If error > 1**: do NOT tune tile sizes. Fix the logic first.
 
@@ -151,38 +161,48 @@ If all above checks pass and error is still > 1e-3:
 3. Reduce to d=32 (fits in one warp) and use a single-block, single-warp kernel
    with printf to trace the full computation path.
 
-## Special case: oracle precision mismatch (NOT a kernel logic bug)
+## Special case: reduction-order drift vs cuBLAS (NOT a kernel logic bug)
 
-**Symptom**: naive single-thread kernel and a complex tiled kernel have the
-**exact same** `max_abs_err`. A pure PyTorch forward implementation gives
-`max_abs_err=0.000`.
+**Symptom**: a naive single-thread kernel and a complex tiled kernel have the
+**exact same** `max_abs_err` against `Y_ref`, and changing accumulator
+precision (FP32 → FP64, with/without explicit TF32 toggles) moves
+`max_abs_err` by less than ~5%. A pure-PyTorch forward gives essentially zero
+error (since `Y_ref` *is* PyTorch).
 
-**Diagnosis**: This is a FP32 accumulation-order mismatch against the oracle,
-not a logic bug. The oracle is computed by cuBLAS FP32, which uses a parallel
-reduction tree (error ~ sqrt(d) × ε ≈ 7e-6 for d=3584). Any hand-written
-sequential FP32 accumulation has error ~ d × ε × scale ≈ 2.8e-3 for d=3584 —
-mathematically impossible to fix by changing kernel logic.
+**Diagnosis**: this is FP32 non-associativity — the custom kernel sums the K
+dimension in a different order than cuBLAS's parallel reduction tree, so the
+final FP32 rounding sequence differs. The drift is `O(d × ε × scale)` ≈
+`2–3e-3` at d=3584 regardless of kernel topology, and it cannot be removed
+by switching accumulator types. Note: this only causes `correctness_ok=False`
+when the offending elements are *small-magnitude* (so the per-element budget
+`atol + rtol·|y_refᵢ|` is dominated by `atol = 1e-4`) — see Step 0. For
+large-magnitude elements at d=3584 the budget is `~6e-3` and the same drift
+slips under the gate.
 
-**Why WMMA does NOT fix this**: On sm86 (RTX 3090), `wmma::mma_sync` with
-float32 fragments automatically uses TF32 (10-bit mantissa). The oracle is
-computed with TF32 disabled. WMMA error vs oracle ≈ 0.1, which is worse than
-sequential FP32.
+**TF32 / WMMA is not the bogeyman it used to be**: `Y_ref` is computed with
+PyTorch defaults (`allow_tf32 = True`), so the reference itself uses Tensor
+Core TF32 on Ampere. A TF32 WMMA candidate is reduction-ordered differently
+than cuBLAS TF32, but no longer carries an *automatic* ~0.1 error gap against
+the gate — measure rather than assume.
 
-**Why FP64 accumulation does NOT give speedup**: RTX 3090 FP64 throughput =
-FP32 / 64 = 556 GFLOPS. Using FP64 for the K-loop makes the kernel ~60× slower
-than cuBLAS, eliminating any speedup.
+**Why FP64 accumulation usually isn't worth it**: RTX 3090 FP64 throughput ≈
+FP32 / 64 ≈ 556 GFLOPS. Using FP64 for the K-loop makes the kernel ~60×
+slower than cuBLAS, eliminating any speedup. Only use it as a *correctness
+probe* (to confirm the drift is reduction-order, not a real bug), not as a
+final strategy.
 
 **Precision tradeoffs** — each path has a different cost:
 
-| Approach | Error vs oracle | Throughput cost |
-|----------|----------------|-----------------|
-| Sequential FP32 k-loop | ~2–3e-3 (fails atol=1e-4) | none |
-| FP64 accumulation, cast to FP32 | ~7e-6 (passes) | ~64× slower on RTX 3090 |
-| `at::mm` (via `<torch/extension.h>`) | ~0, bit-identical | cuBLAS speed, no custom fusion |
-| Tiled FP32 matching cuBLAS reduction order | ~1e-5 if correct | difficult to achieve |
+| Approach | Typical `max_abs_err` vs online `Y_ref` | Throughput cost |
+| -------- | --------------------------------------- | --------------- |
+| Sequential FP32 k-loop | ~2–3e-3 (may or may not pass `allclose` — see Step 0) | none |
+| FP64 accumulation, cast to FP32 | ~7e-6 | ~64× slower on RTX 3090 (probe only) |
+| `at::mm` via `<torch/extension.h>` | ~0 (cuBLAS-identical) | cuBLAS speed, no custom fusion of WX |
+| Tiled FP32 matching cuBLAS reduction order | ~1e-5 if correctly tuned | difficult to achieve |
+| TF32 WMMA (`wmma::mma_sync`, float fragments) | similar order to the TF32 cuBLAS path | Tensor Core speed; verify per-shape |
 
-Note: on sm86 (Ampere), WMMA mma_sync with float32 fragments uses TF32
-internally — error vs FP32 oracle ≈ 0.1, worse than sequential FP32.
-
-The right path depends on what you are optimizing for. Consider the speedup
-headroom available from each approach before deciding.
+The right path depends on what you are optimizing for. If `at::mm` plus a
+fused low-rank epilogue clears the gate, that is usually the cleanest
+correctness-by-construction starting point; only deviate from it when
+profiling shows the WX cuBLAS call is the bottleneck and TF32 WMMA / hand-tiled
+FP32 measurably beats it.

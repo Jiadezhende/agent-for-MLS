@@ -2,12 +2,17 @@
 
 Two responsibilities, two functions:
 
-* ``build_correctness_fixtures`` — generate per-shape input tensors AND
-  the PyTorch reference output (oracle). Used by both candidate
-  correctness checks and the latency measurement that follows.
+* ``build_correctness_fixtures`` — generate per-shape input tensors and
+  save them to disk. Candidate forward and the per-candidate online
+  reference both reload them from here.
 * ``measure_pytorch_latency`` — time the PyTorch reference implementation
   on the inputs already on disk; returns per-shape median ms + the
   speedup denominator.
+
+The reference output ("oracle") is NOT saved to disk — every
+correctness check in ``resources/evaluation.py`` recomputes it inside
+the candidate's own subprocess so the cuBLAS / TF32 state matches
+Phase-2's in-process harness exactly.
 
 Both run in-process via ``OperatorOps``: no string-template subprocess
 indirection. Baseline only invokes ``torch`` ops and never loads a
@@ -49,14 +54,14 @@ def build_correctness_fixtures(
     ops: OperatorOps,
     spec: BenchmarkSpec,
     inputs_dir: Path,
-    oracle_dir: Path,
 ) -> dict:
-    """Generate per-shape inputs + oracle outputs.
+    """Generate per-shape input tensors and persist them.
 
     For each shape in ``spec.shape_grid``: draw inputs via
     ``ops.make_inputs`` (single seeded generator advanced across shapes,
-    matching the old ``torch.manual_seed + randn`` sequencing), compute
-    the oracle via ``ops.reference``, save both to disk.
+    matching the old ``torch.manual_seed + randn`` sequencing) and save
+    them to disk. The reference output is not precomputed here; it is
+    rebuilt online by every candidate evaluation.
 
     Returns ``{"shape_ids": [...]}``.
     """
@@ -64,30 +69,17 @@ def build_correctness_fixtures(
         raise RuntimeError("build_correctness_fixtures: cuda_unavailable")
 
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    oracle_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device)
     generator.manual_seed(int(spec.seed))
 
-    # TF32 on Ampere truncates float32 mantissa to 10 bits, introducing
-    # max abs errors ~0.1 for d≥3584 matmuls — far above atol=1e-4.
-    # Disable for oracle generation so custom FP32 kernels can pass.
-    old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-
     shape_ids: list[str] = []
-    try:
-        for d in spec.shape_grid:
-            inputs = ops.make_inputs(int(d), device=device, generator=generator)
-            sid = ops.shape_id(int(d))
-            ops.save_inputs(inputs, inputs_dir, sid)
-            with torch.no_grad():
-                Y = ops.reference(inputs)
-            ops.save_oracle(Y, oracle_dir, sid)
-            shape_ids.append(sid)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+    for d in spec.shape_grid:
+        inputs = ops.make_inputs(int(d), device=device, generator=generator)
+        sid = ops.shape_id(int(d))
+        ops.save_inputs(inputs, inputs_dir, sid)
+        shape_ids.append(sid)
 
     return {"shape_ids": shape_ids}
 
@@ -99,8 +91,7 @@ def measure_pytorch_latency(
 ) -> BaselineResult:
     """Time the PyTorch reference implementation per shape.
 
-    Reads inputs already materialized by ``build_correctness_fixtures``;
-    does NOT recompute or save the oracle.
+    Reads inputs already materialized by ``build_correctness_fixtures``.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("measure_pytorch_latency: cuda_unavailable")
@@ -148,12 +139,9 @@ def run_pytorch_baseline(
     ops: OperatorOps,
     spec: BenchmarkSpec,
     inputs_dir: Path,
-    oracle_dir: Path,
 ) -> BaselineResult:
     """One-shot helper: build fixtures, then measure latency."""
-    build_correctness_fixtures(
-        ops=ops, spec=spec, inputs_dir=inputs_dir, oracle_dir=oracle_dir,
-    )
+    build_correctness_fixtures(ops=ops, spec=spec, inputs_dir=inputs_dir)
     return measure_pytorch_latency(ops=ops, spec=spec, inputs_dir=inputs_dir)
 
 

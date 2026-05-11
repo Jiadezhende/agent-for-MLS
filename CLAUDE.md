@@ -13,8 +13,10 @@ Given an operator name on the CLI, the pipeline goes through fixed stages:
 2. **HARDWARE_PROFILE** — `hardware_profiler` agent characterizes the GPU
    (DRAM bw, clock, SM, L2, latency) and writes `blackboard["hardware"]`
 3. **BENCHMARK_BASELINE** — pure code: generate W/X/A/B inputs across the
-   shape grid, compute PyTorch reference outputs (oracle), benchmark
-   PyTorch reference latency (the speedup denominator)
+   shape grid and benchmark PyTorch reference latency (the speedup
+   denominator). The reference output is NOT saved — every candidate
+   evaluation recomputes it online inside its own subprocess so the
+   cuBLAS / TF32 state matches Phase-2 exactly
 4. **INITIAL_CANDIDATE** — `optimizer_cold` agent produces the first
    compilable + correct candidate so `./optimized_lora.cu` always exists
    even if a later stage times out
@@ -57,9 +59,9 @@ python main.py --operator lora_matmul
   PipelineOrchestrator.run()        pure-code state machine
       │
       ├── stage = HARDWARE_PROFILE  agents.run_hardware_profiler → blackboard["hardware"]
-      ├── stage = BENCHMARK_BASELINE pure code: resources.benchmark.materialize_inputs +
-      │                                          resources.baseline.run_pytorch_baseline
-      │                                       → baseline/inputs/ + references/ + baseline.json
+      ├── stage = BENCHMARK_BASELINE pure code: resources.baseline.build_correctness_fixtures +
+      │                                          resources.baseline.measure_pytorch_latency
+      │                                       → inputs/ + baseline.json
       ├── stage = INITIAL_CANDIDATE agents.run_optimizer_cold → write_candidate → submit_candidate
       │                              → orchestrator: multi-shape benchmark → promote → sync root file
       ├── stage = TUNING_LOOP       RoundRunner: analyst → optimizer → benchmark → maybe-promote
@@ -141,13 +143,13 @@ workspace/runs/<run_id>/
     events.jsonl                     append-only audit (stage_enter, best_promoted, stage_failed, …)
     leaderboard.jsonl                append-only candidate records (id, speedup_geomean, speedup_worst, all_correct)
 
-    hardware/
-        hardware_profile.json        agent-written via write_blackboard("hardware") + mirrored to disk
+    hardware_profile.json            agent-written via write_blackboard("hardware") + mirrored to disk
+    baseline.json                    PyTorch reference latency — speedup denominator
+                                       {ms_median_overall, per_shape, reference_pytorch}
 
-    baseline/                        PyTorch reference — speedup denominator + correctness oracle
-        inputs/<name>_<shape_id>.pt  contract-driven (e.g. W_d3584.pt, X_d3584.pt, A_d3584.pt, B_d3584.pt)
-        references/<name>_<shape_id>.pt   PyTorch reference output Y
-        baseline.json                {ms_median_overall, per_shape, reference_pytorch}
+    inputs/<name>_<shape_id>.pt      contract-driven candidate inputs (e.g. W_d3584.pt, ...)
+                                       Reference Y is NOT cached: every candidate eval recomputes
+                                       ops.reference(inputs) online to match Phase-2's cuBLAS state.
 
     benchmark/                       Multi-shape candidate timings — orchestrator-only
         spec.json                    {shape_grid, samples=30, warmup=5, seed=0}
@@ -268,7 +270,7 @@ For any change to the orchestrator or its callers, these must hold:
 | [operator_opt_pipe/tools.py](operator_opt_pipe/tools.py) | `ReadBlackboardTool` / `WriteBlackboardTool` / `WriteCandidateTool` / `SubmitCandidateTool` |
 | [operator_opt_pipe/resources/contract.py](operator_opt_pipe/resources/contract.py) | `OperatorContract` + `load_contract()` + `eval_shape()` mini-DSL + render helpers |
 | [operator_opt_pipe/resources/benchmark.py](operator_opt_pipe/resources/benchmark.py) | `BenchmarkSpec` + `materialize_inputs()` (contract-driven synthetic input generation) |
-| [operator_opt_pipe/resources/baseline.py](operator_opt_pipe/resources/baseline.py) | `run_pytorch_baseline()` — PyTorch reference timing + oracle save |
+| [operator_opt_pipe/resources/baseline.py](operator_opt_pipe/resources/baseline.py) | `build_correctness_fixtures()` (save per-shape inputs) + `measure_pytorch_latency()` (PyTorch reference timing) |
 | [operator_opt_pipe/resources/evaluation.py](operator_opt_pipe/resources/evaluation.py) | `compile_and_check_quick()` (single-shape, used by write_candidate) + `benchmark_on_grid()` (multi-shape, orchestrator-only) |
 | [operator_opt_pipe/main.py](operator_opt_pipe/main.py) | CLI entry — reads `--operator` and constructs everything |
 | [main.py](main.py) | Root-level shim → `operator_opt_pipe.main:main` |

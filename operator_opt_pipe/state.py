@@ -93,8 +93,8 @@ class RunLayout:
 
     Predicates (``has_*``) are filesystem checks so resume can detect partial
     state without reloading json blobs. Single-file artifacts live directly
-    under ``run_dir``; multi-file groups (inputs/oracle/candidates/best) get
-    their own subdir.
+    under ``run_dir``; multi-file groups (inputs/candidates/best) get their
+    own subdir.
     """
 
     workspace_root: Path
@@ -154,11 +154,6 @@ class RunLayout:
         return self.run_dir / "inputs"
 
     @property
-    def oracle_dir(self) -> Path:
-        """Correctness oracle: PyTorch reference outputs, indexed by shape."""
-        return self.run_dir / "oracle"
-
-    @property
     def candidates_dir(self) -> Path:
         return self.run_dir / "candidates"
 
@@ -198,9 +193,6 @@ class RunLayout:
     def input_path(self, tensor_name: str, shape_id: str) -> Path:
         return self.inputs_dir / f"{tensor_name}_{shape_id}.pt"
 
-    def oracle_path(self, output_name: str, shape_id: str) -> Path:
-        return self.oracle_dir / f"{output_name}_{shape_id}.pt"
-
     # ------------------------------------------------------------------
     # Per-candidate paths
     # ------------------------------------------------------------------
@@ -235,7 +227,6 @@ class RunLayout:
             self.candidates_dir,
             self.best_dir,
             self.inputs_dir,
-            self.oracle_dir,
             self.benchmark_dir,
             self.build_dir,
             self.exec_dir,

@@ -9,17 +9,21 @@ Two entry points:
 
 * ``benchmark_on_grid`` — orchestrator calls this after every accepted
   ``submit_candidate``. Runs the candidate on every shape in
-  ``spec.shape_grid``, checks correctness against the saved oracle, and
-  measures cudaEvent latency. The agent never sees this result; the
-  orchestrator owns promotion decisions.
+  ``spec.shape_grid``, checks correctness, and measures cudaEvent
+  latency. The agent never sees this result; the orchestrator owns
+  promotion decisions.
 
-Both use ``torch.utils.cpp_extension.load`` with ``extra_cuda_cflags=["-O3"]``
-to mirror the official Phase-2 evaluation harness — local "best" matches
-scoring "best".
+Both rebuild the PyTorch reference output online via ``ops.reference``
+inside the candidate's own subprocess so the cuBLAS / TF32 state matches
+Phase-2's in-process evaluation harness exactly. There is no on-disk
+oracle.
+
+Both use ``torch.utils.cpp_extension.load`` to mirror the official
+Phase-2 evaluation harness — local "best" matches scoring "best".
 
 The subprocess script is a fixed template that imports the operator
 ``OPS`` instance via ``operator_opt_pipe.operators.load_ops`` at runtime;
-all operator-specific behaviour (input load, forward call, oracle load)
+all operator-specific behaviour (input load, forward call, reference)
 goes through ``OPS`` methods. No string-template rendering of operator
 formulae.
 """
@@ -126,7 +130,6 @@ def compile_and_check_quick(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    oracle_dir: Path,
     sample_shape: int,
     build_dir: Path,
     *,
@@ -146,7 +149,6 @@ def compile_and_check_quick(
         candidate_id=candidate_id,
         candidate_cu=candidate_cu,
         inputs_dir=inputs_dir,
-        oracle_dir=oracle_dir,
         build_dir=build_dir,
         shape_value=int(sample_shape),
         shape_id=shape_id_str,
@@ -180,7 +182,6 @@ def benchmark_on_grid(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    oracle_dir: Path,
     baseline_per_shape: dict[str, dict[str, Any]],
     build_dir: Path,
     *,
@@ -188,17 +189,16 @@ def benchmark_on_grid(
 ) -> BenchmarkResult:
     """Full benchmark across ``spec.shape_grid``.
 
-    For each shape: load inputs + oracle, call candidate forward, validate
-    allclose, time with cudaEvent (samples + warmup from spec). Speedup is
-    ``baseline_ms / candidate_ms`` per shape; geomean / worst / best
-    summarize across shapes.
+    For each shape: load inputs, recompute the PyTorch reference online,
+    call candidate forward, validate allclose, time with cudaEvent
+    (samples + warmup from spec). Speedup is ``baseline_ms / candidate_ms``
+    per shape; geomean / worst / best summarize across shapes.
     """
     script = _build_bench_script(
         ops=ops,
         candidate_id=candidate_id,
         candidate_cu=candidate_cu,
         inputs_dir=inputs_dir,
-        oracle_dir=oracle_dir,
         build_dir=build_dir,
         spec=spec,
     )
@@ -284,14 +284,12 @@ def _build_quick_script(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    oracle_dir: Path,
     build_dir: Path,
     shape_value: int,
     shape_id: str,
 ) -> str:
     cu_path_s = str(candidate_cu.resolve()).replace("\\", "/")
     inp_dir_s = inputs_dir.resolve().as_posix()
-    ora_dir_s = oracle_dir.resolve().as_posix()
     bld_dir_s = build_dir.resolve().as_posix()
     project_root_s = _PROJECT_ROOT.as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
@@ -309,7 +307,6 @@ from operator_opt_pipe.operators import load_ops
 
 CU_PATH    = r"{cu_path_s}"
 INPUT_DIR  = r"{inp_dir_s}"
-ORACLE_DIR = r"{ora_dir_s}"
 BUILD_DIR  = r"{bld_dir_s}"
 SHORT_NAME = "{ops.short_name}"
 SHAPE_VAL  = {int(shape_value)}
@@ -357,10 +354,8 @@ try:
     device = torch.device("cuda")
     inputs = ops.load_inputs(INPUT_DIR, SHAPE_ID, device=device)
     # Recompute reference online in the same process / cuBLAS state as the
-    # candidate, mirroring the Phase-2 evaluation harness exactly. The
-    # pre-saved oracle is strict-FP32 (TF32 disabled in baseline.py) which
-    # is *stricter* than what Phase-2 will compare against — using it here
-    # rejects candidates that Phase-2 would actually accept.
+    # candidate, mirroring Phase-2's in-process harness exactly. There is
+    # no on-disk oracle to load.
     with torch.no_grad():
         Y_ref = ops.reference(inputs)
         Y = ops.forward_call(mod, inputs)
@@ -384,13 +379,11 @@ def _build_bench_script(
     candidate_id: str,
     candidate_cu: Path,
     inputs_dir: Path,
-    oracle_dir: Path,
     build_dir: Path,
     spec: BenchmarkSpec,
 ) -> str:
     cu_path_s = str(candidate_cu.resolve()).replace("\\", "/")
     inp_dir_s = inputs_dir.resolve().as_posix()
-    ora_dir_s = oracle_dir.resolve().as_posix()
     bld_dir_s = build_dir.resolve().as_posix()
     project_root_s = _PROJECT_ROOT.as_posix()
     cand_name = f"cand_{candidate_id}".replace("-", "_")
@@ -410,7 +403,6 @@ from operator_opt_pipe.operators import load_ops
 
 CU_PATH    = r"{cu_path_s}"
 INPUT_DIR  = r"{inp_dir_s}"
-ORACLE_DIR = r"{ora_dir_s}"
 BUILD_DIR  = r"{bld_dir_s}"
 SHORT_NAME = "{ops.short_name}"
 SHAPE_GRID = {grid_repr}
@@ -464,8 +456,7 @@ for d in SHAPE_GRID:
     }}
     try:
         inputs = ops.load_inputs(INPUT_DIR, shape_id, device=device)
-        # Online reference, mirroring Phase-2 in-process semantics. See note
-        # in _build_quick_script for why we don't use the strict-FP32 oracle.
+        # Online reference, mirroring Phase-2 in-process semantics.
         with torch.no_grad():
             Y_ref = ops.reference(inputs)
             Y = ops.forward_call(mod, inputs)

@@ -94,16 +94,14 @@ def test_runlayout_paths_under_run_dir(tmp_path: Path):
     assert layout.summary_path == layout.run_dir / "summary.md"
     # Multi-file dirs use semantic names.
     assert layout.inputs_dir == layout.run_dir / "inputs"
-    assert layout.oracle_dir == layout.run_dir / "oracle"
     # Per-run build / exec roots so artifacts don't escape the run.
     assert layout.build_dir == layout.run_dir / "build"
     assert layout.exec_dir == layout.run_dir / "exec"
 
 
-def test_runlayout_input_and_oracle_paths(tmp_path: Path):
+def test_runlayout_input_paths(tmp_path: Path):
     layout = RunLayout(workspace_root=tmp_path, run_id="r")
     assert layout.input_path("W", "d3584") == layout.inputs_dir / "W_d3584.pt"
-    assert layout.oracle_path("Y", "d3584") == layout.oracle_dir / "Y_d3584.pt"
 
 
 def test_runlayout_predicates_react_to_filesystem(tmp_path: Path):

@@ -270,7 +270,6 @@ class WriteCandidateTool(Tool):
                 candidate_id=cid,
                 candidate_cu=cu_path,
                 inputs_dir=self._layout.inputs_dir,
-                oracle_dir=self._layout.oracle_dir,
                 sample_shape=sample_shape,
                 build_dir=self._layout.build_dir,
                 executor=self._executor,
@@ -333,7 +332,7 @@ class WriteCandidateTool(Tool):
                     "hint: max_abs_err invariant across 3 attempts → likely "
                     "reduction-order (not precision). Stop tweaking accumulator "
                     "dtype; delegate matmul reduction to torch::mm and only fuse "
-                    "epilogue. See cuda_kernel_debug.md §oracle precision mismatch."
+                    "epilogue. See cuda_kernel_debug.md §reduction-order drift vs cuBLAS."
                 )
                 quick_dict["invariance_hint"] = True
 

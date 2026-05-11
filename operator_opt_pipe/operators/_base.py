@@ -46,7 +46,12 @@ class OperatorOps(ABC):
 
     @abstractmethod
     def reference(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute the PyTorch reference output (oracle) for the given inputs."""
+        """Compute the PyTorch reference output for the given inputs.
+
+        Recomputed online inside the candidate's own subprocess so the
+        cuBLAS/TF32 state matches Phase-2's in-process evaluation harness.
+        Never cached to disk — see resources/evaluation.py.
+        """
 
     @abstractmethod
     def forward_call(self, mod: Any, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -80,18 +85,5 @@ class OperatorOps(ABC):
                 Path(dir_) / f"{spec.name}_{shape_id}.pt", map_location=device,
             )
         return out
-
-    def save_oracle(self, Y: torch.Tensor, dir_: Path, shape_id: str) -> None:
-        out_name = self.contract.output.name
-        torch.save(Y.detach().cpu(), Path(dir_) / f"{out_name}_{shape_id}.pt")
-
-    def load_oracle(
-        self, dir_: Path, shape_id: str, *, device: torch.device,
-    ) -> torch.Tensor:
-        out_name = self.contract.output.name
-        return torch.load(
-            Path(dir_) / f"{out_name}_{shape_id}.pt", map_location=device,
-        )
-
 
 __all__ = ["OperatorOps"]

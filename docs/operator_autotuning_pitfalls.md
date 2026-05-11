@@ -10,7 +10,7 @@
 
 **根因**：[baseline.py:73-77](operator_opt_pipe/resources/baseline.py#L73-L77) 生成 oracle 时强制 `allow_tf32 = False`（strict FP32）；但 Phase-2 评测脚本里 `y_ref = W @ X + ...` 是**评测进程现场算**的，TF32 状态走 torch 默认。两边算 reference 的 cuBLAS 配置不对称，本地等于跟比 Phase-2 严的标准比较。一个调 `at::mm` 的正确 student 跟 strict-FP32 oracle 差 ~1e-3，跟现场 cuBLAS ref 几乎 bit-exact。
 
-**修复**：[evaluation.py 的 `_build_quick_script` / `_build_bench_script`](operator_opt_pipe/resources/evaluation.py) 改为现场调 `ops.reference(inputs)`，与 student 在同一 subprocess 同一 cuBLAS state 下比较，与 Phase-2 完全同构。oracle 文件保留给 analyst 离线诊断用，不再当 correctness gate。
+**修复**：[evaluation.py 的 `_build_quick_script` / `_build_bench_script`](operator_opt_pipe/resources/evaluation.py) 改为现场调 `ops.reference(inputs)`，与 student 在同一 subprocess 同一 cuBLAS state 下比较，与 Phase-2 完全同构。后续清理彻底移除了 oracle 落盘路径（`baseline.py` 不再保存 reference，`RunLayout` 不再有 `oracle_dir`），消除"oracle 偷偷被当成 gate"的复发可能。
 
 **提交**：`58a6044` — fix: 用现场重算 ref 替代 strict-FP32 oracle
 

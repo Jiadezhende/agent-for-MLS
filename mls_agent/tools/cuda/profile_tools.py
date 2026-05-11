@@ -168,10 +168,12 @@ class RunCudaProbeTool(Tool):
 class ProfileWithNcuTool(Tool):
     NAME = "profile_with_ncu"
     DESCRIPTION = (
-        "Run a kernel under NVIDIA Nsight Compute and collect the metrics "
-        "specified by ``metrics``. Auto-injects ``-lineinfo`` for source-line "
-        "correlation and saves a .ncu-rep report. Use ``source_type='cuda_source'`` "
-        "to compile-and-profile, or 'binary' to profile an existing workspace binary."
+        "Run a CUDA kernel under NVIDIA Nsight Compute and collect the metrics "
+        "in `metrics`. Saves a .ncu-rep report. Specify exactly ONE of cuda_source "
+        "(tool compiles with -O3 -lineinfo) or binary_path (you control compile "
+        "flags). ncu CANNOT profile Python scripts — to profile a kernel exposed "
+        "via torch.utils.cpp_extension.load (no main()), use profile_with_nsys "
+        "with python_source instead."
     )
 
     def __init__(self, executor: Any) -> None:
@@ -181,15 +183,20 @@ class ProfileWithNcuTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "source_type": {
-                    "type": "string",
-                    "enum": ["cuda_source", "binary"],
-                },
-                "source_or_path": {
+                "cuda_source": {
                     "type": "string",
                     "description": (
-                        "Full CUDA source string when source_type='cuda_source'; "
-                        "workspace-relative binary path when source_type='binary'."
+                        "Inline CUDA C++ source. Tool compiles with -O3 -lineinfo "
+                        "automatically. Source must include a main() that launches "
+                        "the kernel. Mutually exclusive with binary_path."
+                    ),
+                },
+                "binary_path": {
+                    "type": "string",
+                    "description": (
+                        "Workspace-relative path to a pre-compiled binary. You "
+                        "must compile with -lineinfo yourself for source-line "
+                        "correlation. Mutually exclusive with cuda_source."
                     ),
                 },
                 "kernel_name": {
@@ -200,7 +207,7 @@ class ProfileWithNcuTool(Tool):
                     "type": "array",
                     "items": {"type": "string"},
                     "default": [],
-                    "description": "Specific ncu metric names; empty defaults to a small built-in set.",
+                    "description": "ncu metric names; at least one required by the executor.",
                 },
                 "compile_flags": {
                     "type": "array",
@@ -217,11 +224,41 @@ class ProfileWithNcuTool(Tool):
                     "default": 600,
                 },
             },
-            "required": ["source_type", "source_or_path", "kernel_name"],
+            "required": ["kernel_name"],
+            "oneOf": [
+                {"required": ["cuda_source"]},
+                {"required": ["binary_path"]},
+            ],
         }
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
-        result = self._executor.profile_with_ncu(**parameters)
+        cuda = parameters.get("cuda_source")
+        bn = parameters.get("binary_path")
+        given = [
+            (k, v) for k, v in (
+                ("cuda_source", cuda),
+                ("binary_path", bn),
+            ) if v is not None
+        ]
+        if len(given) != 1:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_ARGS,
+                message=(
+                    f"Exactly one of cuda_source / binary_path required "
+                    f"(got {len(given)}: {[k for k, _ in given]})."
+                ),
+            )
+        field, value = given[0]
+        source_type = "cuda_source" if field == "cuda_source" else "binary"
+        result = self._executor.profile_with_ncu(
+            source_type=source_type,
+            source_or_path=value,
+            kernel_name=parameters["kernel_name"],
+            metrics=parameters.get("metrics", []),
+            compile_flags=parameters.get("compile_flags", []),
+            args=parameters.get("args", []),
+            timeout_s=parameters.get("timeout_s", 600),
+        )
         return _exec_result_to_response(result, label="ncu profile")
 
 
@@ -233,9 +270,12 @@ class ProfileWithNcuTool(Tool):
 class ProfileWithNsysTool(Tool):
     NAME = "profile_with_nsys"
     DESCRIPTION = (
-        "Run a program under NVIDIA Nsight Systems to capture the CPU-GPU "
-        "timeline. Useful for kernel launch overhead, stream ordering, and "
-        "host-device synchronization patterns."
+        "Run a target program under NVIDIA Nsight Systems and capture the CPU-GPU "
+        "timeline + per-kernel summary (via `nsys stats --report cuda_gpu_kern_sum`). "
+        "Specify exactly ONE of: cuda_source (inline .cu with main()), python_source "
+        "(inline .py to run), binary_path (workspace-relative pre-compiled artifact). "
+        "For PyBind11 kernels loaded via torch.utils.cpp_extension.load, use "
+        "python_source — that's the only path that reproduces the real call stack."
     )
 
     def __init__(self, executor: Any) -> None:
@@ -245,29 +285,92 @@ class ProfileWithNsysTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "source_type": {
+                "cuda_source": {
                     "type": "string",
-                    "enum": ["cuda_source", "python_script", "binary"],
+                    "description": (
+                        "Inline CUDA C++ source to compile and profile. Source must "
+                        "include a main() that launches the kernel. "
+                        "Mutually exclusive with python_source / binary_path."
+                    ),
                 },
-                "source_or_path": {"type": "string"},
+                "python_source": {
+                    "type": "string",
+                    "description": (
+                        "Inline Python source (typically importing torch + "
+                        "cpp_extension.load) to run under nsys. Use this to profile "
+                        "kernels exposed via PyBind11 that have no main() of their "
+                        "own. Mutually exclusive with cuda_source / binary_path."
+                    ),
+                },
+                "binary_path": {
+                    "type": "string",
+                    "description": (
+                        "Workspace-relative path to a pre-compiled executable. "
+                        "Mutually exclusive with cuda_source / python_source."
+                    ),
+                },
                 "compile_flags": {
                     "type": "array",
                     "items": {"type": "string"},
                     "default": [],
+                    "description": "Extra nvcc flags (only used with cuda_source).",
                 },
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
                     "default": [],
+                    "description": "Command-line args appended to the target program.",
                 },
                 "duration_s": {"type": "integer", "default": 10},
-                "timeout_s": {"type": "integer", "default": 300},
+                "timeout_s": {
+                    "type": "integer",
+                    "default": 300,
+                    "description": (
+                        "Wall-clock cap. Raise to 600+ when python_source triggers "
+                        "a first-time cpp_extension.load build (30-60s)."
+                    ),
+                },
             },
-            "required": ["source_type", "source_or_path"],
+            "oneOf": [
+                {"required": ["cuda_source"]},
+                {"required": ["python_source"]},
+                {"required": ["binary_path"]},
+            ],
         }
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
-        result = self._executor.profile_with_nsys(**parameters)
+        cuda = parameters.get("cuda_source")
+        py = parameters.get("python_source")
+        bn = parameters.get("binary_path")
+        given = [
+            (k, v) for k, v in (
+                ("cuda_source", cuda),
+                ("python_source", py),
+                ("binary_path", bn),
+            ) if v is not None
+        ]
+        if len(given) != 1:
+            return ToolResponse.error(
+                code=ToolErrorCode.INVALID_ARGS,
+                message=(
+                    f"Exactly one of cuda_source / python_source / binary_path "
+                    f"required (got {len(given)}: {[k for k, _ in given]})."
+                ),
+            )
+        field, value = given[0]
+        source_type = {
+            "cuda_source": "cuda_source",
+            "python_source": "python_script",
+            "binary_path": "binary",
+        }[field]
+        result = self._executor.profile_with_nsys(
+            source_type=source_type,
+            source_or_path=value,
+            compile_flags=parameters.get("compile_flags", []),
+            args=parameters.get("args", []),
+            duration_s=parameters.get("duration_s", 10),
+            timeout_s=parameters.get("timeout_s", 300),
+        )
         return _exec_result_to_response(result, label="nsys profile")
 
 
@@ -285,7 +388,10 @@ class ProfileWithTorchTool(Tool):
         "script's CWD is the workspace root, so relative writes stay sandboxed. "
         "Also use as a fallback when ncu/nsys are unavailable (e.g. permission "
         "denied): write a timing loop using torch.cuda.Event or torch.profiler "
-        "and capture the printed output."
+        "and capture the printed output. "
+        "Note: timeout_s defaults to 600s. cpp_extension.load on first call "
+        "rebuilds the extension and can take 30-60s; budget for that before "
+        "wrapping the timing loop."
     )
 
     def __init__(self, executor: Any) -> None:
@@ -303,13 +409,25 @@ class ProfileWithTorchTool(Tool):
                     "type": "string",
                     "description": "Short identifier used as filename and cache key.",
                 },
-                "timeout_s": {"type": "integer", "default": 120},
+                "timeout_s": {
+                    "type": "integer",
+                    "default": 600,
+                    "description": (
+                        "Wall-clock cap. Default 600s covers first-time "
+                        "cpp_extension.load (30-60s build) + warmup + several "
+                        "timed iterations. Bump to 900-1200 for multi-shape sweeps."
+                    ),
+                },
             },
             "required": ["python_code", "op_name"],
         }
 
     def run(self, parameters: dict[str, Any]) -> ToolResponse:
-        result = self._executor.profile_with_torch(**parameters)
+        result = self._executor.profile_with_torch(
+            python_code=parameters["python_code"],
+            op_name=parameters["op_name"],
+            timeout_s=parameters.get("timeout_s", 600),
+        )
         return _exec_result_to_response(result, label=f"torch {parameters.get('op_name', '')!r}")
 
 

@@ -1109,7 +1109,7 @@ class Executor:
         self,
         python_code: str,
         op_name: str,
-        timeout_s: int = 120,
+        timeout_s: int = 600,
     ) -> dict:
         """Run a Python script (with torch) and capture stdout."""
         spec = JobSpec(

@@ -420,3 +420,49 @@ def test_orchestrator_benchmark_baseline_skips_llm(
     # benchmark spec is no longer pre-seeded into the blackboard — it is
     # derived from the contract on demand.
     assert "benchmark" not in bb
+
+
+# ---------------------------------------------------------------------------
+# agent_trace.log + output.md (Phase-2 reasoning artifacts)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_trace_log_always_on(workspace: Path, contract: OperatorContract, ops: OperatorOps):
+    """agent_trace.log must be produced regardless of --verbose so that
+    output.md can be derived from it after the run."""
+    orch = _build_orch(workspace, contract, ops, run_id="run_trace", verbose=False)
+    orch.run()
+    assert orch.layout.trace_path.is_file()
+    # File should contain at least the orchestrator stage transitions.
+    body = orch.layout.trace_path.read_text(encoding="utf-8")
+    assert "[orch]" in body
+    assert "stage=HARDWARE_PROFILE" in body
+
+
+def test_output_md_emitted_and_mirrored(workspace: Path, contract: OperatorContract, ops: OperatorOps):
+    """FINALIZE produces output.md inside run_dir and mirrors it next to
+    optimized_lora.cu so the Phase-2 harness finds both artifacts."""
+    output_path = workspace / "optimized_lora.cu"
+    orch = _build_orch(workspace, contract, ops,
+                       run_id="run_output", output_path=output_path)
+    orch.run()
+
+    canonical = orch.layout.output_log_path
+    mirror = output_path.parent / "output.md"
+    assert canonical.is_file()
+    assert mirror.is_file()
+    assert canonical.read_text(encoding="utf-8") == mirror.read_text(encoding="utf-8")
+
+    body = canonical.read_text(encoding="utf-8")
+    for header in (
+        "# Phase-2 Run Report",
+        "## Run directory",
+        "## Agent trace",
+    ):
+        assert header in body, f"missing section: {header}"
+    # Header references the run id + operator.
+    assert "run_output" in body
+    assert "lora_matmul" in body
+    # Layout legend describes the run dir contents.
+    assert "candidates/candidate_NNN" in body
+    assert "agent_trace.log" in body

@@ -98,9 +98,12 @@ class StdoutObserver:
         return json.dumps(compacted, separators=(",", ":"), default=str)
 
     def _clip(self, text: str, limit: int) -> str:
-        if self._truncate_response is None:
+        effective = self._truncate_response if self._truncate_response is not None else limit
+        if effective is None or effective <= 0:
             return text
-        return text[:limit]
+        if len(text) <= effective:
+            return text
+        return text[:effective] + f" …<+{len(text) - effective} chars>"
 
     def _summarize_response(self, response: ToolResponse) -> str:
         if response.status == ToolStatus.ERROR:

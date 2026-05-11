@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import mls_agent
-from mls_agent import AgentConfig, CompositeObserver, NullObserver, StdoutObserver
+from mls_agent import AgentConfig, CompositeObserver, StdoutObserver
 
 from operator_opt_pipe import agents as agents_mod
 from operator_opt_pipe.operators._base import OperatorOps
@@ -290,20 +290,19 @@ class PipelineOrchestrator:
         self.run_id = run_id or make_run_id()
         self.layout = RunLayout(workspace_root=self.workspace_root, run_id=self.run_id)
         self.verbose = verbose
-        self._trace_log = None
+        self.layout.mkdir()
+        self._trace_log = self.layout.trace_path.open("a", encoding="utf-8")
+        file_obs = StdoutObserver(
+            prefix="",
+            stream=self._trace_log,
+            truncate_arg_log_at=400,
+            truncate_response_at=2000,
+        )
         if verbose:
-            self.layout.mkdir()
-            self._trace_log = self.layout.trace_path.open("a", encoding="utf-8")
             console_obs = StdoutObserver(prefix="", stream=sys.stderr)
-            file_obs = StdoutObserver(
-                prefix="",
-                stream=self._trace_log,
-                truncate_arg_log_at=None,
-                truncate_response_at=None,
-            )
             self.observer = CompositeObserver(console_obs, file_obs)
         else:
-            self.observer = NullObserver()
+            self.observer = file_obs
 
         # Default deterministic resource runners
         self.baseline_runner = baseline_runner or measure_pytorch_latency
@@ -390,12 +389,11 @@ class PipelineOrchestrator:
                 stage = next_stage(self.run_state, self.layout)
                 self.run_state.current_stage = stage.value
                 _emit_event(self.layout, {"type": "stage_enter", "stage": stage.value, "ts": _utcnow_iso()})
-                if self.verbose:
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    self._emit_orch(
-                        f"[{ts}] [orch] stage={stage.value} elapsed={self.run_state.elapsed_s:.1f}s "
-                        f"remaining={self.run_state.remaining_budget_s():.1f}s"
-                    )
+                ts = datetime.now().strftime("%H:%M:%S")
+                self._emit_orch(
+                    f"[{ts}] [orch] stage={stage.value} elapsed={self.run_state.elapsed_s:.1f}s "
+                    f"remaining={self.run_state.remaining_budget_s():.1f}s"
+                )
 
                 if stage is Stage.FINALIZE:
                     self._run_finalize()
@@ -426,11 +424,12 @@ class PipelineOrchestrator:
                 self._trace_log = None
 
     def _emit_orch(self, msg: str) -> None:
-        """Print an orchestrator-level line to stderr and the trace log."""
-        print(msg, file=sys.stderr, flush=True)
+        """Always log to trace; mirror to stderr only when verbose."""
         if self._trace_log is not None:
             self._trace_log.write(msg + "\n")
             self._trace_log.flush()
+        if self.verbose:
+            print(msg, file=sys.stderr, flush=True)
 
     # ------------------------------------------------------------------
     # Stage runners
@@ -690,6 +689,35 @@ class PipelineOrchestrator:
         self.layout.summary_path.write_text(summary_md, encoding="utf-8")
         # Final best-effort sync — preserve whatever optimized_lora.cu we have.
         self._sync_output()
+        # Phase-2 reasoning artifact — machine-built from real run state.
+        self._write_output_log()
+
+    def _write_output_log(self) -> None:
+        """Assemble ``output.md`` from on-disk artifacts. No LLM calls.
+
+        Mirrors the file next to ``optimized_lora.cu`` so the Phase-2
+        harness finds it adjacent to the kernel.
+        """
+        # Flush trace log so the inlined trace captures everything emitted
+        # up to this moment (including the FINALIZE agent's calls).
+        if self._trace_log is not None:
+            try:
+                self._trace_log.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        text = _build_output_md(
+            state=self.run_state,
+            layout=self.layout,
+        )
+        self.layout.output_log_path.write_text(text, encoding="utf-8")
+        # Mirror next to optimized_lora.cu for Phase-2 evaluator.
+        try:
+            mirror = self.output_path.parent / "output.md"
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.layout.output_log_path, mirror)
+        except Exception:  # noqa: BLE001
+            # Mirror is best-effort; the canonical copy in run_dir always exists.
+            pass
 
     def _collect_summary(self) -> dict:
         return {
@@ -820,6 +848,70 @@ def _format_summary_md(state: RunState, final_payload: dict) -> str:
         "```",
     ]
     return "\n".join(lines) + "\n"
+
+
+_RUN_DIR_LAYOUT = """\
+<run_dir>/
+    state.json              pipeline state (current_stage, best_candidate_id, elapsed_s)
+    blackboard.json         shared store: hardware, baseline, best, history, final_summary
+    events.jsonl            stage_enter / best_promoted / stage_failed timeline
+    leaderboard.jsonl       per-candidate speedup_geomean / speedup_worst / all_correct
+    hardware_profile.json   GPU characterization (dram_bw, sm, l2, clock)
+    baseline.json           PyTorch reference latency (speedup denominator)
+    inputs/                 per-shape candidate inputs (W/X/A/B tensors)
+    candidates/candidate_NNN/
+        candidate.cu        agent-written CUDA source
+        compile.json        nvcc compile_ok + log
+        correctness_quick.json  single-shape correctness pre-check
+    benchmark/candidate_NNN.json  multi-shape ms / speedup / correctness
+    best/
+        best.cu             current best kernel
+        best_result.json    candidate_id, speedup, promoted_at
+    final_report.json       machine-readable run summary
+    summary.md              LLM narrative (unverified)
+    agent_trace.log         full ReAct trace — inlined below
+    output.md               this file
+"""
+
+
+def _build_output_md(
+    *,
+    state: RunState,
+    layout: RunLayout,
+) -> str:
+    """Render Phase-2 ``output.md``: run header + run dir + static
+    layout legend + full ``agent_trace.log``.
+    """
+    run_dir = layout.run_dir.resolve()
+    out: list[str] = [
+        f"# Phase-2 Run Report — {state.run_id}",
+        "",
+        f"- **Operator**: {state.operator}",
+        f"- **Elapsed**: {state.elapsed_s:.1f}s / {state.time_budget_s:.0f}s budget",
+        f"- **Completed stages**: {', '.join(state.completed_stages) or '(none)'}",
+        f"- **Best candidate**: {state.best_candidate_id or '(none)'}",
+        f"- **Best speedup (geomean)**: "
+        f"{state.best_speedup if state.best_speedup is not None else '(none)'}",
+        "",
+        "## Run directory",
+        "",
+        f"`{run_dir}`",
+        "",
+        "```",
+        _RUN_DIR_LAYOUT.rstrip(),
+        "```",
+        "",
+        "## Agent trace",
+        "",
+        "```",
+    ]
+    try:
+        trace_text = layout.trace_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        trace_text = ""
+    out.append(trace_text if trace_text else "(trace log empty)")
+    out += ["```", ""]
+    return "\n".join(out)
 
 
 __all__ = [

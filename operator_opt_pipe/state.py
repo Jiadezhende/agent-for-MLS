@@ -144,6 +144,10 @@ class RunLayout:
     def summary_path(self) -> Path:
         return self.run_dir / "summary.md"
 
+    @property
+    def output_log_path(self) -> Path:
+        return self.run_dir / "output.md"
+
     # ------------------------------------------------------------------
     # Multi-file groups
     # ------------------------------------------------------------------

@@ -124,6 +124,34 @@ load_inline(
 
 ---
 
+## 8. 共享 build 目录的 stale lock 把 agent 拖死 30+ 分钟
+
+**症状**：candidate_001 落地后，analyst 跑了多次 `profile_with_torch` 微基准（3 次因 60–120s 超时被 SIGKILL）。之后 optimizer round 2 每次 `write_candidate` 都在 600s 处撞墙，连 `return W + X` 这种空壳候选都 hang。3 次失败后熔断器跳闸，后续 9 次调用瞬间 `circuit_open`，整轮 TUNING_LOOP 报废。表面看是 13+ 条 error，实际只有 1 个根因。
+
+**根因**：
+
+1. `RunLayout.build_dir` 是**全 run 单一共享目录** `runs/<id>/build/`，所有 candidate 和 analyst 的 `cpp_extension.load` 都往这里写。
+2. analyst 的子进程超时被 kill 时未释放 `<build_dir>/lock`（torch 的文件锁）/ `.so` 句柄。后续任何 `cpp_extension.load` 抢同一把锁就 hang，撞到上层 `timeout_s=600` 才返回。
+3. [tools.py:WriteCandidateTool](operator_opt_pipe/tools.py) 的 `except Exception` 把所有失败统一映射到 `EXECUTION_ERROR`，agent 看到 "quick eval crashed: subprocess timed out..." 误判为**自己代码的问题**，反复简化 kernel；每次再付 600s。
+4. 熔断器按 `(tool, code)` 分键计数——3 次 `execution_error` 累积后开断，但因为 timeout 和真正的 compile fail 共用一个 `execution_error` 键，**两种本质不同的错误被绑在同一个计数器上**，agent 无法通过"换个真编译错"恢复。
+
+**修复**：
+
+- **隔离 build 目录**：`RunLayout` 新增 [`candidate_build_dir(cid)`](operator_opt_pipe/state.py) 指向 `candidates/<cid>/build/`；`WriteCandidateTool.run` 与 `_run_candidate_benchmark` 都改用 per-candidate 路径。每个新候选拿到全新干净的 build dir，跨候选的 lock/`.so` 不再互相污染。子进程模板（`_build_quick_script` / `_build_bench_script`）已经把 build_dir 作为 f-string 参数嵌入，所以**模板无需改**。
+- **错误码细分**：`ToolErrorCode` 新增 `INFRASTRUCTURE_TIMEOUT`；`WriteCandidateTool` 的 `except` 分支识别 `"timed out before emitting"` 关键字，返回该专用码 + 明确文字提示 "**这不是你代码的问题**——连空壳 `return W + X` 也会同样 hang。不要继续简化 kernel，调 `flag_event(severity='error', type='infrastructure')` 后 terminate"。orchestrator 的 benchmark 路径 diagnostics 同步带 `reason="infrastructure_timeout"`。
+- 熔断器天然按 `(tool, code)` 分键，因此 infra timeout 和 real compile fail 各自独立 3 次才 trip，互不污染。
+
+**提交**：（本次）build-dir 隔离 + 反馈精准化
+
+**衍生教训**：
+
+- **跨调用方的共享 mutable 状态是隐性耦合**。`RunLayout.build_dir` 看似只是个路径属性，实质是把 N 个 agent 调用的 cpp_extension 状态搅在一起。沿用 per-candidate 隔离的设计就能从源头消除整类故障。
+- **错误码是给 LLM 看的诊断信号**——一个 `EXECUTION_ERROR` 吞掉了 hang 和 compile fail 两种完全不同的失败模式，让 agent 推理方向严重偏离。错误码细分本质是给"agent 的下一步决策"提供分类先验。
+- **熔断器跳闸不是终态而是放大器**。单一根因 + 熔断器 = 错误数量乘以 N，定位时要注意先区分"真错误"和"熔断回声"。这次 13 条 error 里只有 4 条是真超时，其余 9 条是 `circuit_open` 回声。
+- analyst 的 `profile_with_torch` 仍然走默认 `~/.cache/torch_extensions/` 路径——本次未处理，留作后续 prompt 规范或 executor 注入 tmp build_dir。
+
+---
+
 ## 总览：iter 预算流向
 
 | 时段 | 主要消耗 | 状态 |

@@ -207,6 +207,15 @@ class RunLayout:
     def candidate_file(self, candidate_id: str, name: str) -> Path:
         return self.candidate_dir(candidate_id) / name
 
+    def candidate_build_dir(self, candidate_id: str) -> Path:
+        """Per-candidate cpp_extension build dir.
+
+        Isolates each candidate's .so + lock file under its own folder so a
+        hung or killed subprocess on one candidate cannot block a later
+        candidate's ``cpp_extension.load`` call via a stale build lock.
+        """
+        return self.candidate_dir(candidate_id) / "build"
+
     # ------------------------------------------------------------------
     # Predicates (filesystem-backed, used by transitions.next_stage)
     # ------------------------------------------------------------------

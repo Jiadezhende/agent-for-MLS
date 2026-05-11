@@ -264,6 +264,9 @@ class WriteCandidateTool(Tool):
         # the full forward path.
         sample_shape = self._contract.default_shape_grid()[0]
 
+        cand_build_dir = self._layout.candidate_build_dir(cid)
+        cand_build_dir.mkdir(parents=True, exist_ok=True)
+
         try:
             quick = compile_and_check_quick(
                 ops=self._ops,
@@ -271,12 +274,26 @@ class WriteCandidateTool(Tool):
                 candidate_cu=cu_path,
                 inputs_dir=self._layout.inputs_dir,
                 sample_shape=sample_shape,
-                build_dir=self._layout.build_dir,
+                build_dir=cand_build_dir,
                 executor=self._executor,
             )
         except Exception as exc:  # noqa: BLE001
-            # Surface infrastructure failures so the agent doesn't burn iterations
-            # spinning on an unrecoverable error.
+            msg = str(exc)
+            if "timed out before emitting" in msg:
+                return ToolResponse.error(
+                    code=ToolErrorCode.INFRASTRUCTURE_TIMEOUT,
+                    message=(
+                        "Infrastructure hang: cpp_extension.load did not emit "
+                        "QUICK_RESULT within the subprocess timeout. This is NOT a "
+                        "bug in your candidate source — even a minimal "
+                        "`return W + X` wrapper hangs the same way when this fires. "
+                        "Most likely cause: a stale build lock from a prior "
+                        "subprocess, or a held GPU/file handle. Do NOT keep "
+                        "simplifying the kernel. Call flag_event(severity='error', "
+                        "type='infrastructure') and terminate so the orchestrator "
+                        "can take over."
+                    ),
+                )
             return ToolResponse.error(
                 code=ToolErrorCode.EXECUTION_ERROR,
                 message=f"quick eval crashed: {type(exc).__name__}: {exc}",

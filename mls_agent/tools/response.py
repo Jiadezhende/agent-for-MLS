@@ -36,6 +36,7 @@ class ToolErrorCode:
     INVALID_ARGS = "invalid_args"
     CIRCUIT_OPEN = "circuit_open"
     EXECUTION_ERROR = "execution_error"
+    INFRASTRUCTURE_TIMEOUT = "infrastructure_timeout"
     INTERNAL_ERROR = "internal_error"
 
 

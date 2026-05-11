@@ -208,12 +208,57 @@ def test_write_candidate_writes_file_and_returns_quick_result(
     assert captured["candidate_cu"].read_text(encoding="utf-8") == source
     # Quick eval should target the smallest shape in the default grid.
     assert captured["sample_shape"] == ops.contract.default_shape_grid()[0]
+    # build_dir is per-candidate and pre-created so cpp_extension can write into it.
+    assert captured["build_dir"] == layout.candidate_build_dir("candidate_000")
+    assert captured["build_dir"].is_dir()
     assert resp.data["compile_ok"] is True
     assert resp.data["correctness_ok"] is True
     # Artifacts persisted
     cdir = layout.candidate_dir("candidate_000")
     assert (cdir / "compile.json").is_file()
     assert (cdir / "correctness_quick.json").is_file()
+
+
+def test_write_candidate_classifies_subprocess_timeout_as_infrastructure(
+    layout: RunLayout,
+    ops: OperatorOps,
+    monkeypatch,
+):
+    """A `RuntimeError("subprocess timed out before emitting ...")` is a hang,
+    not a code bug — surface it as INFRASTRUCTURE_TIMEOUT so the agent stops
+    iterating on a healthy kernel and the circuit breaker tracks it separately."""
+    def fake_quick(**kw):
+        raise RuntimeError("subprocess timed out before emitting '=== QUICK_RESULT ==='")
+
+    import operator_opt_pipe.tools as tools_mod
+    monkeypatch.setattr(tools_mod, "compile_and_check_quick", fake_quick)
+
+    tool = WriteCandidateTool(layout, ops, _StubExecutor())
+    resp = tool.run({"source": _candidate_source()})
+
+    assert resp.status is ToolStatus.ERROR
+    assert resp.error_info["code"] == "infrastructure_timeout"
+    assert "NOT a bug in your candidate" in resp.error_info["message"]
+
+
+def test_write_candidate_classifies_generic_exception_as_execution_error(
+    layout: RunLayout,
+    ops: OperatorOps,
+    monkeypatch,
+):
+    """A non-timeout RuntimeError still maps to EXECUTION_ERROR — only the
+    'timed out before emitting' marker triggers the infrastructure path."""
+    def fake_quick(**kw):
+        raise RuntimeError("nvcc returned non-zero exit code")
+
+    import operator_opt_pipe.tools as tools_mod
+    monkeypatch.setattr(tools_mod, "compile_and_check_quick", fake_quick)
+
+    tool = WriteCandidateTool(layout, ops, _StubExecutor())
+    resp = tool.run({"source": _candidate_source()})
+
+    assert resp.status is ToolStatus.ERROR
+    assert resp.error_info["code"] == "execution_error"
 
 
 def test_write_candidate_allocates_fresh_slots(

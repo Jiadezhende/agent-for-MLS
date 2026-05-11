@@ -125,6 +125,16 @@ def test_runlayout_mkdir_is_idempotent(tmp_path: Path):
     assert layout.exec_dir.is_dir()
 
 
+def test_candidate_build_dir_is_per_candidate(tmp_path: Path):
+    layout = RunLayout(workspace_root=tmp_path, run_id="run_abc")
+    assert layout.candidate_build_dir("candidate_001") == (
+        layout.candidate_dir("candidate_001") / "build"
+    )
+    assert layout.candidate_build_dir("candidate_001") != layout.candidate_build_dir(
+        "candidate_002"
+    )
+
+
 def test_candidate_id_formatting():
     assert RunLayout.candidate_id(0) == "candidate_000"
     assert RunLayout.candidate_id(42) == "candidate_042"

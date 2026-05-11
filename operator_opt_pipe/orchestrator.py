@@ -761,6 +761,8 @@ def _run_candidate_benchmark(
 ) -> dict:
     """Run the multi-shape benchmark for a candidate and persist the result."""
     cand_cu = layout.candidate_file(candidate_id, "candidate.cu")
+    cand_build_dir = layout.candidate_build_dir(candidate_id)
+    cand_build_dir.mkdir(parents=True, exist_ok=True)
     spec = BenchmarkSpec.for_contract(ops.contract)
     bb = load_blackboard(layout)
     baseline_per_shape = (bb.get("baseline") or {}).get("per_shape") or {}
@@ -773,15 +775,24 @@ def _run_candidate_benchmark(
             candidate_cu=cand_cu,
             inputs_dir=layout.inputs_dir,
             baseline_per_shape=baseline_per_shape,
-            build_dir=layout.build_dir,
+            build_dir=cand_build_dir,
             executor=executor,
         )
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        reason = (
+            "infrastructure_timeout"
+            if "timed out before emitting" in msg
+            else "benchmark_failed"
+        )
         return {
             "candidate_id": candidate_id,
             "compile_ok": False,
             "all_correct": False,
-            "diagnostics": {"error": f"{type(exc).__name__}: {exc}"},
+            "diagnostics": {
+                "error": f"{type(exc).__name__}: {exc}",
+                "reason": reason,
+            },
         }
 
     bench_dict = _coerce_dict(bench)

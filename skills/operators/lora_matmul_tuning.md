@@ -15,6 +15,53 @@ drive every decision rather than following a fixed recipe.
 > cuBLAS/cuDNN calls, Thrust, or any header not in the CUDA 12 toolkit. No
 > extra source files beyond `optimized_lora.cu`. No `extra_ldflags`.
 
+## ⚠️ Hard Rule — K-dimension decomposition (read first)
+
+This is the single most important constraint and the source of most failed
+iterations. Honor it before any other guidance in this document.
+
+The reference goes through cuBLAS TF32. Your candidate's `Y` is compared
+element-wise against that reference at `rtol=atol=1e-4`. Custom FP32 / FP64
+accumulation over a large K dimension produces a reduction order different
+from cuBLAS, with drift in the `5e-4 – 3e-3` range — which **stably fails**
+the gate on the low-magnitude tail elements no matter how careful the
+arithmetic is.
+
+Split the operator by K and route each GEMM accordingly:
+
+| Sub-op | K | Route through |
+| --- | --- | --- |
+| `W @ X` | d = 3584–4608 | cuBLAS (`torch::matmul` / `at::mm`) — **mandatory** |
+| `B^T @ X` | d = 3584–4608 | cuBLAS — **mandatory** |
+| `A @ T` (T = B^T X) | **16** | custom kernel — **this is where fusion lives** |
+| element-wise add | — | custom kernel — fuse into the K=16 epilogue |
+
+**Why `B^T` needs `.t().contiguous()`**: the reference is
+`B.transpose(0,1).contiguous() @ X`. Passing a non-contiguous
+`B.t()` directly to `torch::matmul` routes cuBLAS through its strided path
+with a different reduction order, producing ~8e-4 drift that fails the gate.
+Always materialize: `auto BT = B.t().contiguous();` before `torch::matmul(BT, X)`.
+
+### Recommended starting recipe (the only fusion form known to pass)
+
+```cpp
+// 1) cuBLAS for both K=d GEMMs
+auto WX  = torch::matmul(W, X);                       // d × d
+auto BT  = B.transpose(0, 1).contiguous();             // 16 × d (must be contiguous!)
+auto BTX = torch::matmul(BT, X);                       // 16 × d
+
+// 2) One custom kernel fuses the K=16 epilogue + add:
+//    Y[i,j] = WX[i,j] + Σ_{k=0..15} A[i,k] * BTX[k,j]
+// Wins: eliminates A@BTX intermediate (d²·4 B write+read), eliminates
+//       WX read-back-for-add, saves one cuBLAS launch.
+fused_k16_addmm<<<grid, block>>>(WX, A, BTX, Y);
+```
+
+Speedup ceiling for this form is roughly **1.05–1.30×**, sourced from DRAM
+round-trip elimination on the LoRA path. Anything beyond that requires
+touching `W @ X` itself (TF32 WMMA replacement), which is a separate path
+that must be verified per-shape against the gate.
+
 ## Realistic Performance Ceiling
 
 The PyTorch baseline calls cuBLAS for both GEMM terms — cuBLAS is already
@@ -27,9 +74,12 @@ on this term alone. Savings come from kernel-launch fusion and shared memory
 reuse, not raw FLOP throughput.
 
 **A(B^T X) term** (low-rank, r=16): arithmetic intensity ≈ 0.5 FLOP/Byte.
-This term is **strongly memory-bound**. Fusing it into the WX tile loop
-eliminates one DRAM round-trip for the intermediate T = B^T X — this is where
-the real gain comes from.
+This term is **strongly memory-bound**. Per the Hard Rule the GEMMs themselves
+stay in cuBLAS, but the gain comes from the K=16 epilogue: a single custom
+kernel that reads `WX`, `A`, `BTX = B^T X` (the latter is only 16×d) and
+writes `Y = WX + A·BTX` directly. This eliminates the d²·4B materialization
+of the `A @ BTX` intermediate and the separate `Y = WX + intermediate` add
+pass — the real DRAM saving.
 
 **Practical speedup range**: correctness is judged against a reference
 recomputed *online* by `ops.reference(inputs)` inside the same subprocess /
@@ -44,11 +94,15 @@ benefit from the available headroom rather than assuming the higher end.
 Anything above 2× warrants timing verification; above 3× is almost certainly
 a measurement artifact.
 
-**Starting point warning**: a kernel that calls `torch::matmul` for all GEMMs
-and adds a custom elementwise kernel will often be *slower* than the PyTorch
-baseline due to the extra tensor allocation and the custom kernel replacing
-PyTorch's fused `+`. Verify that the very first candidate is at least at parity
-before spending iterations on further tuning.
+**Starting point warning**: the "all `torch::matmul` + custom elementwise add"
+form (candidate_005 shape: three `torch::matmul` calls then a custom add
+kernel) is *slower* than the PyTorch baseline because it pays an extra kernel
+launch, an extra intermediate allocation, and replaces PyTorch's fused `+`.
+This warning does **not** apply to the Recommended Recipe above (cuBLAS for
+the two K=d GEMMs + one custom kernel that fuses `A @ BTX + WX` over K=16):
+that form eliminates the d²·4B intermediate write-and-read for `A @ BTX` and
+is a legitimate starting point. Verify the first candidate is at least at
+parity before further tuning.
 
 ## Step 0 — Read Hardware Before Writing Any Kernel
 
@@ -80,11 +134,16 @@ bottleneck.
   X load from DRAM. Preferred direction once correctness is confirmed.
 
 **Low-rank path** (r = 16, fixed)
-- `sequential`: compute T = B^T X to a temporary DRAM buffer, then A @ T.
-  Two extra DRAM writes/reads for the 16×d intermediate.
-- `smem_side`: accumulate the low-rank contribution inside the WX k-tile loop.
-  T lives in registers (or smem if BM > 32). Eliminates all intermediate DRAM.
-  This is almost always the better choice; explore it early.
+- `sequential`: compute T = B^T X via `torch::matmul`, then a custom K=16
+  kernel does `A @ T + WX` in one pass. **This is the default per the Hard
+  Rule above.**
+- `smem_side`: accumulate the low-rank contribution inside a hand-written
+  WX k-tile loop — T lives in registers, no intermediate DRAM. **Warning**:
+  this requires the K=d accumulation (B^T @ X) to be done in the custom
+  kernel, with a reduction order different from cuBLAS. Empirically this
+  produces 5e-4 – 3e-3 drift and **almost never passes the 1e-4 atol gate**.
+  Only consider after replacing every K=d GEMM with TF32 WMMA and verifying
+  precision per shape. Do not choose this as a starting point.
 
 **Memory access pattern**
 - `naive`: one float per thread per load.
@@ -150,7 +209,8 @@ Treat it as something to *measure*, not as an a priori veto.
 
 | Approach | Typical max_abs_err | Throughput implication |
 | -------- | ------------------- | ---------------------- |
-| Sequential FP32 k-loop | ~2–3e-3 (may or may not pass `allclose`) | Full FP32 speed |
+| Sequential FP32 k-loop, K=d | 5e-4 – 3e-3, **stably fails 1e-4 atol gate** | Full FP32 speed (but unusable per Hard Rule) |
+| Sequential FP32 k-loop, K=16 | < 1e-6, equivalent to cuBLAS | Full FP32 speed; this is the supported custom-kernel slot |
 | FP64 accumulation, cast to FP32 | ~7e-6 | ~1/64 of FP32 on RTX 3090 (rarely worth it) |
 | `at::mm` via `<torch/extension.h>` | ~0 (cuBLAS-identical) | cuBLAS speed, no custom fusion |
 | Tiled FP32 with parallel reduction matching cuBLAS | ~1e-5 if correctly tuned | Hard to implement |
@@ -160,8 +220,10 @@ Treat it as something to *measure*, not as an a priori veto.
 precision/accumulator strategies (e.g. FP32 → FP64) produce `max_abs_err`
 within 5% of each other *and both fail the gate*, the residual mismatch is
 **reduction order** against `Y_ref`'s cuBLAS path, not raw precision. Don't
-try a third precision tweak — switch the matmul reduction to `at::mm` /
-`torch::mm` and only fuse the LoRA epilogue. `write_candidate` prints a
+try a third precision tweak — fall back to the **Recommended Starting Recipe**
+in the Hard Rule section at the top of this document: cuBLAS via
+`torch::matmul` for both K=d GEMMs (with `B.t().contiguous()`), and a single
+custom kernel for the K=16 epilogue + add. `write_candidate` prints a
 `hint:` line on the third such attempt, but recognizing the pattern after
 two iterations saves a wasted round.
 
